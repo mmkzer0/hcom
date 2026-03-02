@@ -1,0 +1,376 @@
+//! Codex launch preprocessing.
+//!
+//!
+//! Transforms Codex CLI arguments before launch to enable hcom functionality
+//! within Codex's sandboxed environment.
+//!
+//! Preprocessing steps:
+//!   1. Sandbox flags: --full-auto (or per mode)
+//!   2. DB access: --add-dir ~/.hcom (allows hcom writes from sandbox)
+//!   3. Bootstrap: -c developer_instructions=<bootstrap text>
+
+use crate::paths;
+
+use super::codex_args::resolve_codex_args;
+
+/// Sandbox modes aligned with Codex TUI presets.
+///
+/// - `workspace`: Default — --full-auto (workspace-write + on-request approvals)
+/// - `untrusted`: Workspace writes, approval before untrusted commands
+/// - `danger-full-access`: Full Access — --dangerously-bypass-approvals-and-sandbox
+/// - `none`: Raw codex, user's own settings (hcom may not work)
+pub fn get_sandbox_flags(mode: &str) -> Vec<String> {
+    // Seatbelt blocks Unix sockets by default, breaking tmux/kitty terminal launches.
+    // network_access=true adds (allow system-socket) to the seatbelt profile.
+    let net = vec![
+        "-c".to_string(),
+        "sandbox_workspace_write.network_access=true".to_string(),
+    ];
+
+    match mode {
+        "workspace" => {
+            let mut flags = vec!["--full-auto".to_string()];
+            flags.extend(net);
+            flags
+        }
+        "untrusted" => {
+            let mut flags = vec![
+                "--sandbox".to_string(),
+                "workspace-write".to_string(),
+                "-a".to_string(),
+                "untrusted".to_string(),
+            ];
+            flags.extend(net);
+            flags
+        }
+        "danger-full-access" => {
+            vec!["--dangerously-bypass-approvals-and-sandbox".to_string()]
+        }
+        "none" => vec![],
+        // Default to workspace
+        _ => {
+            let mut flags = vec!["--full-auto".to_string()];
+            flags.extend(net);
+            flags
+        }
+    }
+}
+
+/// Ensure --add-dir ~/.hcom is present so hcom can write to its DB.
+///
+/// Codex's --add-dir flag is IGNORED in read-only sandbox mode, but required
+/// for workspace-write mode to allow hcom DB writes.
+///
+/// If no sandbox flags are present (mode="none"), skip adding --add-dir
+/// since user is using codex's own folder settings.
+pub fn ensure_hcom_writable(tokens: &[String]) -> Vec<String> {
+    let spec = resolve_codex_args(Some(tokens), None);
+
+    // If no sandbox flags, assume mode="none" — skip --add-dir
+    let has_sandbox = spec.has_flag(
+        &[
+            "--sandbox",
+            "-s",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--full-auto",
+        ],
+        &["--sandbox=", "-s="],
+    );
+    if !has_sandbox {
+        return tokens.to_vec();
+    }
+
+    let hcom_dir = paths::hcom_dir().to_string_lossy().to_string();
+
+    // Check if --add-dir with hcom path already exists
+    for (i, token) in spec.clean_tokens.iter().enumerate() {
+        if token == "--add-dir" && i + 1 < spec.clean_tokens.len()
+            && spec.clean_tokens[i + 1] == hcom_dir
+        {
+            return tokens.to_vec(); // Already present
+        }
+    }
+
+    // Prepend --add-dir at the beginning
+    let mut result = vec!["--add-dir".to_string(), hcom_dir];
+    result.extend(tokens.iter().cloned());
+    result
+}
+
+/// Add hcom bootstrap to codex developer_instructions.
+///
+/// Builds full bootstrap and adds via `-c developer_instructions=...` flag.
+/// If user also provided developer_instructions, bootstrap comes first,
+/// then separator, then user content.
+///
+/// Skip for resume/review subcommands (not interactive launch).
+pub fn add_codex_developer_instructions(
+    codex_args: &[String],
+    bootstrap_text: &str,
+) -> Vec<String> {
+    let spec = resolve_codex_args(Some(codex_args), None);
+
+    // Skip non-interactive modes and resume/fork (already has bootstrap)
+    if let Some(ref sub) = spec.subcommand {
+        if matches!(sub.as_str(), "exec" | "e" | "resume" | "fork" | "review") {
+            return codex_args.to_vec();
+        }
+    }
+
+    // Check if developer_instructions already exists in -c flags
+    let mut existing_dev_instructions: Option<String> = None;
+    let mut tokens: Vec<String> = spec.clean_tokens.clone();
+    let mut dev_instr_idx: Option<usize> = None;
+
+    let mut i = 0;
+    while i < tokens.len() {
+        let token = &tokens[i];
+        // Handle -c=developer_instructions=value or --config=developer_instructions=value
+        if token.starts_with("-c=developer_instructions=")
+            || token.starts_with("--config=developer_instructions=")
+        {
+            let eq_count = token.matches('=').count();
+            existing_dev_instructions = Some(if eq_count >= 2 {
+                token.splitn(3, '=').nth(2).unwrap_or("").to_string()
+            } else {
+                String::new()
+            });
+            dev_instr_idx = Some(i);
+            break;
+        }
+        // Handle -c developer_instructions=value (space syntax)
+        if (token == "-c" || token == "--config") && i + 1 < tokens.len() {
+            let next = &tokens[i + 1];
+            if next.starts_with("developer_instructions=") {
+                existing_dev_instructions =
+                    Some(next.split_once('=').map_or("", |(_, v)| v).to_string());
+                dev_instr_idx = Some(i);
+                break;
+            }
+        }
+        i += 1;
+    }
+
+    // Build combined developer instructions
+    let combined = if let Some(existing) = existing_dev_instructions {
+        // Bootstrap first, then user content below separator
+        let combined_text = format!("{}\n---\n{}", bootstrap_text, existing);
+        // Remove existing developer_instructions from tokens
+        if let Some(idx) = dev_instr_idx {
+            if tokens[idx] == "-c" || tokens[idx] == "--config" {
+                // Remove both -c and the value
+                tokens.remove(idx);
+                if idx < tokens.len() {
+                    tokens.remove(idx);
+                }
+            } else {
+                // Remove single equals-style token
+                tokens.remove(idx);
+            }
+        }
+        combined_text
+    } else {
+        bootstrap_text.to_string()
+    };
+
+    // Prepend -c developer_instructions=... to tokens
+    let mut result = vec!["-c".to_string(), format!("developer_instructions={}", combined)];
+    result.extend(tokens);
+
+    // Prepend subcommand if present
+    if let Some(ref sub) = spec.subcommand {
+        result.insert(0, sub.clone());
+    }
+
+    result
+}
+
+/// Preprocess Codex CLI arguments for hcom integration.
+///
+/// Applies:
+/// 1. Sandbox flags based on mode
+/// 2. --add-dir ~/.hcom for hcom DB writes
+/// 3. Bootstrap injection via developer_instructions
+///
+/// `bootstrap_text` should be pre-generated by the caller via `bootstrap::get_bootstrap()`.
+pub fn preprocess_codex_args(
+    codex_args: &[String],
+    bootstrap_text: &str,
+    sandbox_mode: &str,
+) -> Vec<String> {
+    // 1. Inject sandbox flags based on mode
+    let sandbox_flags = get_sandbox_flags(sandbox_mode);
+    let mut args: Vec<String> = if !sandbox_flags.is_empty() {
+        let mut a = sandbox_flags;
+        a.extend(codex_args.iter().cloned());
+        a
+    } else {
+        codex_args.to_vec()
+    };
+
+    // Warn if mode is "none"
+    if sandbox_mode == "none" {
+        eprintln!("[hcom] Warning: Sandbox mode is 'none' - --add-dir ~/.hcom disabled.");
+        eprintln!("[hcom] hcom commands may fail unless HCOM_DIR is within workspace.");
+    }
+
+    // 2. Ensure --add-dir ~/.hcom is present (skips if mode="none")
+    args = ensure_hcom_writable(&args);
+
+    // 3. Add bootstrap to developer_instructions
+    args = add_codex_developer_instructions(&args, bootstrap_text);
+
+    args
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+
+    fn s(items: &[&str]) -> Vec<String> {
+        items.iter().map(|i| i.to_string()).collect()
+    }
+
+    fn init_config() {
+        // Config::init is idempotent-ish but needs to be called before paths::hcom_dir()
+        crate::config::Config::init();
+    }
+
+    #[test]
+    fn test_sandbox_flags_workspace() {
+        let flags = get_sandbox_flags("workspace");
+        assert!(flags.contains(&"--full-auto".to_string()));
+        assert!(flags.contains(&"sandbox_workspace_write.network_access=true".to_string()));
+    }
+
+    #[test]
+    fn test_sandbox_flags_untrusted() {
+        let flags = get_sandbox_flags("untrusted");
+        assert!(flags.contains(&"--sandbox".to_string()));
+        assert!(flags.contains(&"workspace-write".to_string()));
+        assert!(flags.contains(&"-a".to_string()));
+        assert!(flags.contains(&"untrusted".to_string()));
+    }
+
+    #[test]
+    fn test_sandbox_flags_danger() {
+        let flags = get_sandbox_flags("danger-full-access");
+        assert_eq!(
+            flags,
+            vec!["--dangerously-bypass-approvals-and-sandbox".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_sandbox_flags_none() {
+        let flags = get_sandbox_flags("none");
+        assert!(flags.is_empty());
+    }
+
+    #[test]
+    fn test_sandbox_flags_unknown_defaults_to_workspace() {
+        let flags = get_sandbox_flags("bogus");
+        assert!(flags.contains(&"--full-auto".to_string()));
+    }
+
+    #[test]
+    #[serial]
+    fn test_ensure_hcom_writable_adds_dir() {
+        init_config();
+        // With --full-auto, sandbox is active → should add --add-dir
+        let tokens = s(&["--full-auto"]);
+        let result = ensure_hcom_writable(&tokens);
+        assert_eq!(result[0], "--add-dir");
+        assert!(result.len() > 2);
+    }
+
+    #[test]
+    fn test_ensure_hcom_writable_skips_no_sandbox() {
+        // No sandbox flags → mode="none" → skip (doesn't use paths)
+        let tokens = s(&["-m", "o3"]);
+        let result = ensure_hcom_writable(&tokens);
+        assert_eq!(result, tokens);
+    }
+
+    #[test]
+    #[serial]
+    fn test_ensure_hcom_writable_no_duplicate() {
+        init_config();
+        let hcom_dir = paths::hcom_dir().to_string_lossy().to_string();
+        let tokens = vec![
+            "--full-auto".to_string(),
+            "--add-dir".to_string(),
+            hcom_dir,
+        ];
+        let result = ensure_hcom_writable(&tokens);
+        let add_dir_count = result.iter().filter(|t| *t == "--add-dir").count();
+        assert_eq!(add_dir_count, 1);
+    }
+
+    #[test]
+    fn test_add_developer_instructions_basic() {
+        let args = s(&["-m", "o3"]);
+        let result = add_codex_developer_instructions(&args, "BOOTSTRAP");
+        assert_eq!(result[0], "-c");
+        assert_eq!(result[1], "developer_instructions=BOOTSTRAP");
+        assert!(result.contains(&"-m".to_string()));
+    }
+
+    #[test]
+    fn test_add_developer_instructions_skip_exec() {
+        let args = s(&["exec", "echo", "hi"]);
+        let result = add_codex_developer_instructions(&args, "BOOTSTRAP");
+        assert_eq!(result, args);
+    }
+
+    #[test]
+    fn test_add_developer_instructions_skip_resume() {
+        let args = s(&["resume"]);
+        let result = add_codex_developer_instructions(&args, "BOOTSTRAP");
+        assert_eq!(result, args);
+    }
+
+    #[test]
+    fn test_add_developer_instructions_merge_existing() {
+        let args = s(&["-c", "developer_instructions=USER_NOTES", "-m", "o3"]);
+        let result = add_codex_developer_instructions(&args, "BOOTSTRAP");
+        assert!(result[1].contains("BOOTSTRAP"));
+        assert!(result[1].contains("USER_NOTES"));
+        assert!(result[1].contains("---"));
+        let di_count = result
+            .iter()
+            .filter(|t| t.starts_with("developer_instructions="))
+            .count();
+        assert_eq!(di_count, 1);
+    }
+
+    #[test]
+    fn test_add_developer_instructions_preserves_subcommand() {
+        let args = s(&["mcp", "-m", "o3"]);
+        let result = add_codex_developer_instructions(&args, "BOOTSTRAP");
+        // mcp subcommand should be first
+        assert_eq!(result[0], "mcp");
+        assert_eq!(result[1], "-c");
+    }
+
+    #[test]
+    #[serial]
+    fn test_preprocess_codex_args_full_pipeline() {
+        init_config();
+        let args = s(&["-m", "o3"]);
+        let result = preprocess_codex_args(&args, "BOOTSTRAP", "workspace");
+        assert!(result.contains(&"--full-auto".to_string()));
+        assert!(result.contains(&"--add-dir".to_string()));
+        assert!(result.iter().any(|t| t.contains("developer_instructions=")));
+    }
+
+    #[test]
+    fn test_preprocess_codex_args_none_mode() {
+        let args = s(&["-m", "o3"]);
+        let result = preprocess_codex_args(&args, "BOOTSTRAP", "none");
+        assert!(!result.contains(&"--full-auto".to_string()));
+        assert!(!result.contains(&"--add-dir".to_string()));
+        assert!(result.iter().any(|t| t.contains("developer_instructions=")));
+    }
+}

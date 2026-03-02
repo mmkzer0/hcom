@@ -1,0 +1,838 @@
+//! Start command: `hcom start [--as <name>] [--orphan <name|pid>]`
+//!
+//!
+//! Three main paths:
+//! - Bare start: detect vanilla tool or create adhoc instance
+//! - `--orphan`: recover orphaned PTY process
+//! - `--as`: rebind session identity
+
+use std::collections::HashSet;
+
+use anyhow::{Result, bail};
+use serde_json::json;
+
+use crate::bootstrap;
+use crate::config::HcomConfig;
+use crate::db::HcomDb;
+use crate::identity;
+use crate::instances;
+use crate::log::log_info;
+use crate::paths;
+use crate::pidtrack;
+use crate::relay;
+use crate::router::GlobalFlags;
+use crate::shared::context::HcomContext;
+use crate::shared::constants::ST_ACTIVE;
+
+/// Parsed arguments for `hcom start`.
+#[derive(clap::Parser, Debug)]
+#[command(name = "start", about = "Start hcom participation")]
+pub struct StartArgs {
+    /// Rebind to a different instance name
+    #[arg(long = "as")]
+    pub as_name: Option<String>,
+    /// Recover orphaned PTY process by name or PID
+    #[arg(long)]
+    pub orphan: Option<String>,
+}
+
+/// Run the start command.
+pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
+    // Filter out global flags already consumed by the router (start, --name X, --go)
+    let mut filtered = vec!["start".to_string()];
+    let mut skip_next = false;
+    for arg in argv {
+        if skip_next { skip_next = false; continue; }
+        match arg.as_str() {
+            "start" | "--go" => continue,
+            "--name" => { skip_next = true; continue; }
+            _ => filtered.push(arg.clone()),
+        }
+    }
+
+    use clap::Parser;
+    let start_args = match StartArgs::try_parse_from(&filtered) {
+        Ok(a) => a,
+        Err(e) => { e.print().ok(); return Ok(if e.use_stderr() { 1 } else { 0 }); }
+    };
+
+    let orphan_target = start_args.orphan;
+    let rebind_target = start_args.as_name;
+
+    let db = HcomDb::open()?;
+    let hcom_dir = paths::hcom_dir();
+
+    let ctx = HcomContext::from_os();
+    let instance_name = flags.name.clone();
+
+    // BLOCK DURING ACTIVE TASKS: prevents subagents from corrupting parent/sibling instances.
+    // When a subagent runs --as or bare start, process_id resolves to the parent which has
+    // running_tasks.active=True. Only --name <agent_id> (explicit initiator) bypasses this gate.
+    if rebind_target.is_some() || orphan_target.is_some() || instance_name.is_none() {
+        if let Ok(ident) = identity::resolve_identity(
+            &db,
+            None,
+            None,
+            None,
+            ctx.process_id.as_deref(),
+            None,
+            None,
+        ) {
+            if let Some(inst_data) = &ident.instance_data {
+                let rt_str = inst_data
+                    .get("running_tasks")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let rt = instances::parse_running_tasks(Some(rt_str));
+                if rt.active {
+                    if rebind_target.is_some() {
+                        println!("[HCOM] Cannot use --as while Tasks are running.");
+                    } else if orphan_target.is_some() {
+                        println!("[HCOM] Cannot use --orphan while Tasks are running.");
+                    } else {
+                        println!(
+                            "[HCOM] Cannot run 'hcom start' from within a Task subagent.\n\
+                             Subagents must use: hcom start --name <your-agent-id>"
+                        );
+                    }
+                    return Ok(1);
+                }
+            }
+        }
+    }
+
+    // SUBAGENT DETECTION: check BOTH --name and --as for agent_id matches in running_tasks.
+    // Must happen BEFORE --as handling to block subagents from picking new identities.
+    // Check both independently: --as matching a subagent agent_id must be blocked,
+    // --name matching triggers subagent registration.
+    let subagent_via_name = instance_name.as_deref().and_then(|id| detect_subagent(&db, id));
+    let subagent_via_as = rebind_target.as_deref().and_then(|id| detect_subagent(&db, id));
+
+    if subagent_via_as.is_some() || (subagent_via_name.is_some() && rebind_target.is_some()) {
+        println!("[HCOM] Subagents cannot change identity. End your turn.");
+        return Ok(1);
+    }
+    let subagent_info = subagent_via_name;
+
+    if let Some(orphan) = orphan_target {
+        return start_from_orphan(&db, &hcom_dir, &orphan, &ctx);
+    }
+
+    if let Some(rebind) = rebind_target {
+        return start_rebind(&db, &rebind, &ctx, instance_name.as_deref());
+    }
+
+    // Subagent registration path (--name <agent_id> that matched a parent's running_tasks)
+    if let Some(info) = subagent_info {
+        return start_subagent(&db, &info);
+    }
+
+    // Bare start: auto-detect tool or create adhoc instance
+    start_bare(&db, &hcom_dir, &ctx, instance_name.as_deref())
+}
+
+/// Info about a detected subagent from a parent's running_tasks.
+struct SubagentInfo {
+    agent_id: String,
+    agent_type: String,
+    parent_name: String,
+    parent_session_id: Option<String>,
+    parent_tag: Option<String>,
+}
+
+/// Check if `check_id` matches an agent_id in any parent's running_tasks.subagents.
+fn detect_subagent(db: &HcomDb, check_id: &str) -> Option<SubagentInfo> {
+    // Query instances that have subagents tracked
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT name, session_id, tag, running_tasks FROM instances \
+             WHERE running_tasks LIKE '%subagents%'",
+        )
+        .ok()?;
+
+    let rows: Vec<(String, Option<String>, Option<String>, String)> = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .ok()?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    for (name, session_id, tag, rt_json) in &rows {
+        let rt = instances::parse_running_tasks(Some(rt_json));
+        for task in &rt.subagents {
+            if task.get("agent_id").and_then(|v| v.as_str()) == Some(check_id) {
+                let agent_type = task
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("task")
+                    .to_string();
+                return Some(SubagentInfo {
+                    agent_id: check_id.to_string(),
+                    agent_type,
+                    parent_name: name.clone(),
+                    parent_session_id: session_id.clone(),
+                    parent_tag: tag.clone(),
+                });
+            }
+        }
+    }
+    None
+}
+
+/// Path S: Subagent registration — create structured parent_type_N name.
+fn start_subagent(db: &HcomDb, info: &SubagentInfo) -> Result<i32> {
+    // Gate: subagents get ONE start. Any stop = permanently dead.
+    let stopped_by: Option<String> = db
+        .conn()
+        .prepare(
+            "SELECT json_extract(data, '$.by') FROM events \
+             WHERE type = 'life' \
+             AND json_extract(data, '$.action') = 'stopped' \
+             AND json_extract(data, '$.snapshot.agent_id') = ? \
+             ORDER BY timestamp DESC LIMIT 1",
+        )?
+        .query_row(rusqlite::params![info.agent_id], |row| row.get(0))
+        .ok();
+
+    if let Some(by) = stopped_by {
+        let by = if by.is_empty() { "system".to_string() } else { by };
+        println!(
+            "[HCOM] Your session was stopped by {by}. Do not continue working. End your turn immediately."
+        );
+        return Ok(1);
+    }
+
+    // Check if instance already exists by agent_id (reuse name)
+    let existing_name: Option<String> = db
+        .conn()
+        .query_row(
+            "SELECT name FROM instances WHERE agent_id = ?",
+            rusqlite::params![info.agent_id],
+            |row| row.get(0),
+        )
+        .ok();
+
+    if let Some(name) = existing_name {
+        instances::set_status(db, &name, ST_ACTIVE, "start", "", "", None, None);
+        println!("hcom already started for {name}");
+        return Ok(0);
+    }
+
+    // Sanitize agent_type: keep only [a-z0-9_]
+    let sanitized_type: String = info
+        .agent_type
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .collect();
+    let sanitized_type = sanitized_type.trim_matches('_');
+    let sanitized_type = if sanitized_type.is_empty() {
+        "task"
+    } else {
+        sanitized_type
+    };
+
+    // Compute next suffix: query max(n) for parent_type_% pattern
+    let pattern = format!("{}_{}_", info.parent_name, sanitized_type);
+    let like_pattern = format!("{}%", pattern);
+    let mut stmt = db
+        .conn()
+        .prepare("SELECT name FROM instances WHERE name LIKE ?")?;
+    let names: Vec<String> = stmt
+        .query_map(rusqlite::params![like_pattern], |row| row.get(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let mut max_n: u32 = 0;
+    for name in &names {
+        if let Some(suffix) = name.strip_prefix(&pattern) {
+            if let Ok(n) = suffix.parse::<u32>() {
+                max_n = max_n.max(n);
+            }
+        }
+    }
+
+    // pattern = "parent_type_", so subagent_name = "parent_type_N"
+    let subagent_name = format!("{}{}", pattern, max_n + 1);
+
+    let initial_event_id = db.get_last_event_id();
+    let cwd = std::env::current_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let now = crate::shared::constants::now_epoch_f64();
+
+    // Direct DB insert with agent_id and parent fields
+    let insert_result = db.conn().execute(
+        "INSERT INTO instances \
+         (name, session_id, parent_session_id, parent_name, tag, agent_id, \
+          created_at, last_event_id, directory, last_stop, status) \
+         VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, 0, 'active')",
+        rusqlite::params![
+            subagent_name,
+            info.parent_session_id,
+            info.parent_name,
+            info.parent_tag,
+            info.agent_id,
+            now,
+            initial_event_id,
+            cwd,
+        ],
+    );
+
+    // On name collision (constraint violation), retry once with next suffix.
+    // Other DB errors propagate immediately.
+    let subagent_name = match insert_result {
+        Ok(_) => subagent_name,
+        Err(rusqlite::Error::SqliteFailure(err, _))
+            if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+        {
+            let retry_name = format!("{}{}", pattern, max_n + 2);
+            db.conn().execute(
+                "INSERT INTO instances \
+                 (name, session_id, parent_session_id, parent_name, tag, agent_id, \
+                  created_at, last_event_id, directory, last_stop, status) \
+                 VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, 0, 'active')",
+                rusqlite::params![
+                    retry_name,
+                    info.parent_session_id,
+                    info.parent_name,
+                    info.parent_tag,
+                    info.agent_id,
+                    now,
+                    initial_event_id,
+                    cwd,
+                ],
+            ).map_err(|e| anyhow::anyhow!("Failed to create unique subagent name after retry: {e}"))?;
+            retry_name
+        }
+        Err(e) => return Err(anyhow::anyhow!("Failed to insert subagent instance: {e}")),
+    };
+
+    // Capture launch context
+    instances::capture_and_store_launch_context(db, &subagent_name);
+
+    // Set active status (logs life event)
+    instances::set_status(db, &subagent_name, ST_ACTIVE, "tool:start", "", "", None, None);
+
+    log_info(
+        "lifecycle",
+        "start.subagent",
+        &format!(
+            "name={} parent={} agent_id={} agent_type={}",
+            subagent_name, info.parent_name, info.agent_id, info.agent_type
+        ),
+    );
+
+    // Print subagent bootstrap
+    let bootstrap = bootstrap::get_subagent_bootstrap(&subagent_name, &info.parent_name);
+    if !bootstrap.is_empty() {
+        println!("{bootstrap}");
+    }
+
+    Ok(0)
+}
+
+/// Path A: Recover orphaned PTY process.
+///
+/// Fixes vs initial port:
+/// 1. Uses .last() for preferred_name
+/// 2. Guards on process_id presence
+/// 3. Validates name with is_valid_base_name before reuse
+/// 4. Calls remove_pid after recovery
+/// 5. Logs life/started event with reason=orphan_recover
+/// 6. Disambiguates multiple name matches
+/// 7. Passes active PIDs to get_orphan_processes
+/// 8. Prints terse recovery message instead of full bootstrap
+fn start_from_orphan(db: &HcomDb, hcom_dir: &std::path::Path, target: &str, _ctx: &HcomContext) -> Result<i32> {
+    // [Fix 7] Build active PIDs set from instances, pass to get_orphan_processes
+    let active_pids: HashSet<u32> = db
+        .iter_instances_full()?
+        .iter()
+        .filter_map(|inst| inst.pid.map(|p| p as u32))
+        .collect();
+    let orphans = pidtrack::get_orphan_processes(hcom_dir, Some(&active_pids));
+
+    if orphans.is_empty() {
+        bail!("No orphan processes found.");
+    }
+
+    // Match by PID or name
+    let orphan = if let Ok(pid) = target.parse::<u32>() {
+        match orphans.iter().find(|o| o.pid == pid) {
+            Some(o) => o,
+            None => bail!("Orphan PID {} not found.", pid),
+        }
+    } else {
+        // [Fix 6] Collect all matches; error if ambiguous
+        let matches: Vec<_> = orphans
+            .iter()
+            .filter(|o| o.names.contains(&target.to_string()))
+            .collect();
+        match matches.len() {
+            0 => bail!("Orphan '{}' not found.", target),
+            1 => matches[0],
+            _ => {
+                let pids: Vec<String> = matches.iter().map(|m| m.pid.to_string()).collect();
+                bail!(
+                    "Multiple orphans match '{}' (PIDs: {}). Use --orphan <pid>.",
+                    target,
+                    pids.join(", ")
+                );
+            }
+        }
+    };
+
+    let pid = orphan.pid;
+
+    // [Fix 2] Guard: orphan must have process_id
+    if orphan.process_id.is_empty() {
+        bail!("Orphan PID {} has no process_id and cannot be recovered.", pid);
+    }
+
+    // [Fix 1] Use .last() for preferred name
+    // [Fix 3] Validate with is_valid_base_name before reuse
+    let preferred_name = orphan.names.last().cloned().unwrap_or_default();
+    let can_reuse = !preferred_name.is_empty()
+        && identity::is_valid_base_name(&preferred_name)
+        && db.get_instance_full(&preferred_name)?.is_none();
+    let name = if can_reuse {
+        preferred_name
+    } else {
+        instances::generate_unique_name(db)?
+    };
+
+    // Core DB registration
+    let _ = pidtrack::recover_single_orphan_to_db(db, orphan, &name);
+
+    // [Fix 5] Log life/started event with reason
+    db.log_event(
+        "life",
+        &name,
+        &json!({
+            "action": "started",
+            "by": "cli",
+            "reason": "orphan_recover",
+            "orphan_pid": pid,
+        }),
+    )
+    .ok();
+
+    // [Fix 4] Remove pidtrack entry after recovery
+    pidtrack::remove_pid(hcom_dir, pid);
+
+    // [Fix 8] Print terse recovery message instead of full bootstrap
+    println!("[hcom:{}]", name);
+    if can_reuse {
+        println!("Recovered orphan PID {} as '{}'.", pid, name);
+    } else {
+        println!(
+            "Recovered orphan PID {} as new identity '{}' (name conflict/unavailable).",
+            pid, name
+        );
+    }
+
+    log_info(
+        "start",
+        "orphan.recovered",
+        &format!("name={} pid={} tool={}", name, pid, orphan.tool),
+    );
+
+    Ok(0)
+}
+
+/// Path B: Rebind session identity (`--as <name>`).
+///
+///
+/// creates fresh instance preserving last_event_id, rebinds process.
+///
+/// Fixes vs initial port:
+/// 9. Resolves session_id from process binding or existing instance
+/// 10. Guards on origin_device_id before delete_instance
+/// 11. Calls migrate_notify_endpoints when identity changes
+/// 12. Calls notify_instance after rebind
+/// 13. stopped_snapshot fallback for last_event_id
+fn start_rebind(
+    db: &HcomDb,
+    rebind_target: &str,
+    ctx: &HcomContext,
+    explicit_name: Option<&str>,
+) -> Result<i32> {
+    let hcom_dir = paths::hcom_dir();
+
+    // Resolve the target name
+    let target_name = instances::resolve_display_name(db, rebind_target)
+        .unwrap_or_else(|| rebind_target.to_string());
+
+    let current_name = explicit_name.unwrap_or("");
+
+    // [Fix 9] Resolve session_id from process binding or existing instance
+    let mut session_id: Option<String> = None;
+    if let Some(ref process_id) = ctx.process_id {
+        if let Ok(Some((sid, _))) = db.get_process_binding_full(process_id) {
+            session_id = sid.filter(|s| !s.is_empty());
+        }
+    }
+    if session_id.is_none() && !current_name.is_empty() {
+        if let Ok(Some(current_data)) = db.get_instance_full(current_name) {
+            session_id = current_data.session_id.filter(|s| !s.is_empty());
+        }
+    }
+
+    // Preserve last_event_id from target (cursor preservation)
+    let mut last_event_id: Option<i64> = None;
+    let target_data = db.get_instance_full(&target_name)?;
+
+    if let Some(ref td) = target_data {
+        last_event_id = Some(td.last_event_id);
+    }
+
+    // [Fix 13] Fallback: read cursor from stopped snapshot if instance row missing/no event_id
+    if last_event_id.is_none() {
+        // Query stopped life event for last_event_id from snapshot
+        if let Ok(eid) = load_stopped_snapshot_event_id(db, &target_name) {
+            last_event_id = Some(eid);
+        }
+    }
+
+    // Final fallback: use current max to avoid re-delivering old messages
+    if last_event_id.is_none() {
+        last_event_id = Some(db.get_last_event_id());
+    }
+
+    // [Fix 10] Guard: skip delete for remote instances (origin_device_id)
+    if let Some(ref td) = target_data {
+        if td.origin_device_id.is_none() || td.origin_device_id.as_deref() == Some("") {
+            if let Err(e) = db.delete_instance(&target_name) {
+                eprintln!("[hcom] warn: delete_instance failed for {target_name}: {e}");
+            }
+        }
+    }
+
+    // Clean up target's bindings
+    if let Err(e) = db.delete_process_bindings_for_instance(&target_name) {
+        eprintln!("[hcom] warn: delete_process_bindings failed for {target_name}: {e}");
+    }
+    if let Err(e) = db.delete_session_bindings_for_instance(&target_name) {
+        eprintln!("[hcom] warn: delete_session_bindings failed for {target_name}: {e}");
+    }
+
+    // Delete old identity if different from target
+    if !current_name.is_empty() && current_name != target_name {
+        if let Err(e) = db.delete_instance(current_name) {
+            eprintln!("[hcom] warn: delete_instance failed for {current_name}: {e}");
+        }
+    }
+
+    // Create fresh instance with the target name
+    let tool = ctx.tool.as_str();
+    instances::initialize_instance_in_position_file(
+        db,
+        &target_name,
+        session_id.as_deref(), // [Fix 9] pass resolved session_id
+        None, // parent_session_id
+        None, // parent_name
+        None, // agent_id
+        None, // transcript_path
+        Some(tool),
+        false, // background
+        None,  // tag
+        None,  // wait_timeout
+        None,  // subagent_timeout
+        None,  // hints
+    );
+
+    // Restore cursor position + mark as announced
+    {
+        let mut updates = serde_json::Map::new();
+        if let Some(eid) = last_event_id {
+            updates.insert("last_event_id".into(), serde_json::json!(eid));
+        }
+        updates.insert("name_announced".into(), serde_json::json!(1));
+        if let Err(e) = db.update_instance_fields(&target_name, &updates) {
+            eprintln!("[hcom] warn: update_instance_fields failed for {target_name}: {e}");
+        }
+    }
+
+    // Create bindings
+    if let Some(ref sid) = session_id {
+        if let Err(e) = db.set_session_binding(sid, &target_name) {
+            eprintln!("[hcom] warn: set_session_binding failed for {target_name}: {e}");
+        }
+    }
+    if let Some(ref process_id) = ctx.process_id {
+        let sid = session_id.as_deref().unwrap_or("");
+        if let Err(e) = db.set_process_binding(process_id, sid, &target_name) {
+            eprintln!("[hcom] warn: set_process_binding failed for {target_name}: {e}");
+        }
+
+        // [Fix 11] Migrate notify endpoints before notify so wake reaches correct port
+        if !current_name.is_empty() && current_name != target_name {
+            if let Err(e) = db.migrate_notify_endpoints(current_name, &target_name) {
+                eprintln!("[hcom] warn: migrate_notify_endpoints failed: {e}");
+            }
+        }
+
+        // [Fix 12] Wake delivery loop to pick up restored binding
+        let _ = instances::notify_instance_with_db(db, &target_name);
+    }
+
+    // Print bootstrap
+    let hcom_config = HcomConfig::load(None).unwrap_or_else(|_| {
+        let mut c = HcomConfig::default();
+        c.normalize();
+        c
+    });
+
+    let bootstrap_text = bootstrap::get_bootstrap(
+        db,
+        &hcom_dir,
+        &target_name,
+        tool,
+        false,
+        false,
+        &ctx.notes,
+        &hcom_config.tag,
+        relay::is_relay_enabled(&hcom_config),
+        None,
+    );
+
+    println!("[hcom:{}]", target_name);
+    println!("{}", bootstrap_text);
+
+    log_info(
+        "start",
+        "rebind.complete",
+        &format!("from={} to={}", current_name, target_name),
+    );
+
+    Ok(0)
+}
+
+/// Extract last_event_id from a stopped life event snapshot.
+/// Used as fallback when the instance row is already deleted.
+fn load_stopped_snapshot_event_id(db: &HcomDb, name: &str) -> Result<i64> {
+    let mut stmt = db.conn().prepare(
+        "SELECT data FROM events WHERE type='life' AND instance=? ORDER BY id DESC LIMIT 10",
+    )?;
+
+    let rows: Vec<String> = stmt
+        .query_map(rusqlite::params![name], |row| row.get::<_, String>(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    for data_str in &rows {
+        if let Ok(data) = serde_json::from_str::<serde_json::Value>(data_str) {
+            if data.get("action").and_then(|v| v.as_str()) == Some("stopped") {
+                if let Some(snapshot) = data.get("snapshot") {
+                    if let Some(eid) = snapshot.get("last_event_id").and_then(|v| v.as_i64()) {
+                        return Ok(eid);
+                    }
+                }
+            }
+        }
+    }
+
+    bail!("No stopped snapshot found for '{}'", name)
+}
+
+/// Path C: Bare start — detect tool or create adhoc instance.
+fn start_bare(
+    db: &HcomDb,
+    hcom_dir: &std::path::Path,
+    ctx: &HcomContext,
+    explicit_name: Option<&str>,
+) -> Result<i32> {
+    // Skip vanilla detection if --name is provided with an existing instance
+    let has_valid_identity = explicit_name
+        .and_then(|n| db.get_instance_full(n).ok().flatten())
+        .is_some();
+
+    // Vanilla tool detection: auto-install hooks for unmanaged AI tools
+    if !has_valid_identity {
+        if let Some(vanilla_tool) = ctx.detect_vanilla_tool() {
+            // Auto-install hooks if missing
+            let hooks_installed = match vanilla_tool {
+                "claude" => crate::hooks::claude::verify_claude_hooks_installed(None, false),
+                "gemini" => crate::hooks::gemini::verify_gemini_hooks_installed(false),
+                "codex" => crate::hooks::codex::verify_codex_hooks_installed(false),
+                _ => true,
+            };
+            if !hooks_installed {
+                let tool_display = match vanilla_tool {
+                    "claude" => "Claude Code",
+                    "gemini" => "Gemini CLI",
+                    "codex" => "Codex",
+                    _ => vanilla_tool,
+                };
+                println!("Installing {} hooks...", vanilla_tool);
+                let include_perms = crate::config::load_config_snapshot().core.auto_approve;
+                let ok = match vanilla_tool {
+                    "claude" => crate::hooks::claude::setup_claude_hooks(include_perms),
+                    "gemini" => crate::hooks::gemini::setup_gemini_hooks(include_perms),
+                    "codex" => crate::hooks::codex::setup_codex_hooks(include_perms),
+                    _ => false,
+                };
+                if ok {
+                    println!("\nRestart {tool_display} to enable automatic message delivery.");
+                    println!("Then run: hcom start");
+                } else {
+                    eprintln!("Failed to install hooks. Run: hcom hooks add {vanilla_tool}");
+                }
+                return Ok(1);
+            }
+
+            // Gemini: ensure hooksConfig.enabled is set (self-heal for v0.26.0+)
+            if vanilla_tool == "gemini" {
+                let _ = crate::hooks::gemini::ensure_hooks_enabled();
+            }
+        }
+    }
+
+    let tool = ctx.tool.as_str();
+
+    // Resolve or generate name
+    let name = if let Some(n) = explicit_name {
+        n.to_string()
+    } else {
+        instances::generate_unique_name(db)?
+    };
+
+    // Remote instance — send control via relay
+    if let Ok(Some(ref existing)) = db.get_instance_full(&name) {
+        if crate::instances::is_remote_instance(existing) {
+            if name.contains(':') {
+                let (rname, device_short_id) = name.rsplit_once(':').unwrap();
+                let config = crate::config::HcomConfig::load(None).unwrap_or_default();
+                if crate::relay::control::send_control_ephemeral(&config, "start", rname, device_short_id) {
+                    println!("Start sent to {name}");
+                    return Ok(0);
+                } else {
+                    bail!("Failed to send start to {name} - relay unavailable");
+                }
+            }
+            bail!("Cannot start remote '{name}' - missing device suffix");
+        }
+    }
+
+    // Check if already exists and active
+    if let Ok(Some(existing)) = db.get_instance_full(&name) {
+        if existing.status != "stopped" {
+            // Already active — short message
+            println!("hcom already started for {}", name);
+            return Ok(0);
+        }
+    }
+
+    // Initialize new instance
+    instances::initialize_instance_in_position_file(
+        db,
+        &name,
+        None, // session_id
+        None, // parent_session_id
+        None, // parent_name
+        None, // agent_id
+        None, // transcript_path
+        Some(tool),
+        false, // background
+        None,  // tag
+        None,  // wait_timeout
+        None,  // subagent_timeout
+        None,  // hints
+    );
+
+    // Bind process if we have a process_id
+    if let Some(ref process_id) = ctx.process_id {
+        if let Err(e) = db.set_process_binding(process_id, "", &name) {
+            eprintln!("[hcom] warn: set_process_binding failed for {name}: {e}");
+        }
+    }
+
+    // Print bootstrap
+    let hcom_config = HcomConfig::load(None).unwrap_or_else(|e| {
+        eprintln!("[hcom] warn: config load failed, using defaults: {e}");
+        let mut c = HcomConfig::default();
+        c.normalize();
+        c
+    });
+
+    let bootstrap_text = bootstrap::get_bootstrap(
+        db,
+        hcom_dir,
+        &name,
+        tool,
+        false,
+        ctx.is_launched,
+        &ctx.notes,
+        &hcom_config.tag,
+        relay::is_relay_enabled(&hcom_config),
+        None,
+    );
+
+    println!("[hcom:{}]", name);
+    println!("{}", bootstrap_text);
+
+    // Log
+    db.log_event(
+        "life",
+        &name,
+        &json!({
+            "action": "started",
+            "tool": tool,
+            "name": name,
+        }),
+    ).ok();
+
+    Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn test_start_args_bare() {
+        let args = StartArgs::try_parse_from(["start"]).unwrap();
+        assert!(args.orphan.is_none());
+        assert!(args.as_name.is_none());
+    }
+
+    #[test]
+    fn test_start_args_orphan() {
+        let args = StartArgs::try_parse_from(["start", "--orphan", "1234"]).unwrap();
+        assert_eq!(args.orphan, Some("1234".to_string()));
+        assert!(args.as_name.is_none());
+    }
+
+    #[test]
+    fn test_start_args_rebind() {
+        let args = StartArgs::try_parse_from(["start", "--as", "luna"]).unwrap();
+        assert!(args.orphan.is_none());
+        assert_eq!(args.as_name, Some("luna".to_string()));
+    }
+
+    #[test]
+    fn test_start_args_bare_as_errors() {
+        let err = StartArgs::try_parse_from(["start", "--as"]);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_start_args_bare_orphan_errors() {
+        let err = StartArgs::try_parse_from(["start", "--orphan"]);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_start_args_unknown_flag_errors() {
+        let err = StartArgs::try_parse_from(["start", "--bogus"]);
+        assert!(err.is_err());
+    }
+}

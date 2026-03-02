@@ -1,0 +1,57 @@
+[package]
+name = "hcom"
+version = "0.7.0"
+edition = "2024"
+authors = ["hcom"]
+description = "Connect Claude Code, Gemini CLI, and Codex so agents can message, watch, and spawn each other across terminals"
+license = "MIT"
+rust-version = "1.86"
+
+[[bin]]
+name = "hcom"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+nix = { version = "0.30", features = ["term", "signal", "poll", "process", "fs", "ioctl"] }
+vt100 = "0.16"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+libc = "0.2"
+rusqlite = { version = "0.32", features = ["bundled"] }
+regex = "1"
+thiserror = "2"
+# Client mode dependencies
+dirs = "5"
+chrono = "0.4"
+# TUI dependencies
+ratatui = { version = "0.30", features = ["scrolling-regions"] }
+crossterm = "0.29"
+color-eyre = "0.6"
+unicode-width = "0.2"
+unicode-segmentation = "1.12.0"
+shell-words = "1"
+toml = "1"
+toml_edit = "0.25"
+tempfile = "3"
+rand = "0.9"
+glob = "0.3"
+signal-hook = "0.3"
+uuid = { version = "1", features = ["v4"] }
+# Relay (MQTT) dependencies
+rumqttc = { version = "0.24", default-features = false, features = ["use-rustls"] }
+base64 = "0.22"
+sha2 = "0.10"
+bytes = "1"
+rustls = "0.22"
+webpki-roots = "0.26"
+
+[dev-dependencies]
+serial_test = "3"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
