@@ -21,6 +21,7 @@ jobs:
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             manylinux: auto
+            docker-options: -e CFLAGS_aarch64_unknown_linux_gnu=-march=armv8-a
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             manylinux: musllinux_1_2
@@ -44,10 +45,7 @@ jobs:
           target: ${{ matrix.target }}
           args: --release --out dist
           manylinux: ${{ matrix.manylinux }}
-          before-script-linux: |
-            if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
-              export CFLAGS_aarch64_unknown_linux_gnu="-march=armv8-a"
-            fi
+          docker-options: ${{ matrix.docker-options || '' }}
 
       - name: Upload wheel
         uses: actions/upload-artifact@v4
