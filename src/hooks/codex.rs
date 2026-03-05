@@ -101,7 +101,6 @@ fn resolve_instance_codex(
         db,
         Some(thread_id).filter(|s| !s.is_empty()),
         ctx.process_id.as_deref(),
-        effective_path,
     )
 }
 

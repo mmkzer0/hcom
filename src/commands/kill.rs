@@ -58,7 +58,7 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
 
     let targets = kill_args.targets;
     if targets.is_empty() {
-        eprintln!("error: no target specified\n\nUsage: kill <TARGET>...\n\nFor more information, try '--help'.");
+        eprintln!("Error: no target specified\n\nUsage: kill <TARGET>...\n\nFor more information, try '--help'.");
         return Ok(1);
     }
     let explicit_name = flags.name.clone();
@@ -259,7 +259,7 @@ fn kill_by_tag(db: &HcomDb, hcom_dir: &std::path::Path, tag: &str, initiator: &s
     }
 
     if tagged.is_empty() && tagged_orphans.is_empty() {
-        eprintln!("No instances with tag '{}'", tag);
+        eprintln!("No agents with tag '{}'", tag);
         return Ok(1);
     }
 
@@ -305,7 +305,7 @@ fn kill_single(db: &HcomDb, hcom_dir: &std::path::Path, target: &str, initiator:
                 pidtrack::remove_pid(hcom_dir, orphan.pid);
                 return Ok(0);
             }
-            bail!("Instance '{}' not found", target);
+            bail!("Agent '{}' not found", target);
         }
     };
 

@@ -167,7 +167,6 @@ fn resolve_instance_gemini(db: &HcomDb, payload: &HookPayload) -> Option<Instanc
         db,
         payload.session_id_opt(),
         None,
-        payload.transcript_path_opt(),
     )
 }
 
@@ -680,16 +679,9 @@ pub fn dispatch_gemini_hook(hook_name: &str) -> i32 {
 
 // ==================== PATH Lookup ====================
 
-/// Find an executable in PATH (simple shutil.which equivalent).
+/// Find an executable in PATH.
 fn find_in_path(name: &str) -> Option<PathBuf> {
-    let path_var = env::var("PATH").ok()?;
-    for dir in path_var.split(':') {
-        let candidate = PathBuf::from(dir).join(name);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
+    crate::terminal::which_bin(name).map(PathBuf::from)
 }
 
 // ==================== Gemini Version Detection ====================

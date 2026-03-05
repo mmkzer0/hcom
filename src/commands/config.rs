@@ -300,13 +300,13 @@ fn config_instance(db: &HcomDb, instance_arg: &str, args: &[String], ctx: Option
                     match db.get_instance_full(&matched) {
                         Ok(Some(inst)) => inst,
                         _ => {
-                            eprintln!("Error: Instance '{name}' not found");
+                            eprintln!("Error: Agent '{name}' not found");
                             return 1;
                         }
                     }
                 }
                 Err(_) => {
-                    eprintln!("Error: Instance '{name}' not found");
+                    eprintln!("Error: Agent '{name}' not found");
                     return 1;
                 }
             }

@@ -168,9 +168,9 @@ impl ScreenTracker {
             self.output_buffer.drain(..excess);
         }
 
-        // Check for OSC9 approval notifications (fix #8: use simple contains check)
-        if contains_bytes(&self.output_buffer, OSC9_APPROVAL)
-            || contains_bytes(&self.output_buffer, OSC9_EDIT)
+        // Check for OSC9 approval notifications in new data only (one-way latch)
+        if !self.waiting_approval
+            && (contains_bytes(data, OSC9_APPROVAL) || contains_bytes(data, OSC9_EDIT))
         {
             self.waiting_approval = true;
         }

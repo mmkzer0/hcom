@@ -1137,8 +1137,9 @@ impl Proxy {
         if let Ok(mut state) = self.delivery_state.write() {
             state.ready = self.screen.is_ready();
             state.approval = self.screen.is_waiting_approval();
-            state.prompt_empty = self.screen.is_prompt_empty(&self.config.tool);
-            state.input_text = self.screen.get_input_box_text(&self.config.tool);
+            let input_text = self.screen.get_input_box_text(&self.config.tool);
+            state.prompt_empty = input_text.as_ref().map_or(false, |t| t.is_empty());
+            state.input_text = input_text;
             state.last_output = self.screen.last_output_instant();
             state.cols = self.screen.cols();
         }

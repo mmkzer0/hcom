@@ -75,6 +75,13 @@ RELEASE_MODE=false
 if ! command -v cargo &>/dev/null && [[ -f "$HOME/.cargo/env" ]]; then
     . "$HOME/.cargo/env"
 fi
+# On Termux, rustup shims may shadow pkg-installed cargo. Prefer working cargo.
+if command -v cargo &>/dev/null && ! cargo --version &>/dev/null 2>&1; then
+    TERMUX_CARGO="${PREFIX:-/data/data/com.termux/files/usr}/bin/cargo"
+    if [[ -x "$TERMUX_CARGO" ]]; then
+        export PATH="$(dirname "$TERMUX_CARGO"):$PATH"
+    fi
+fi
 
 # Cargo has its own file lock in target/ — safe to run alongside watch.sh's cargo-watch
 BUILD_FLAG=""
@@ -93,14 +100,12 @@ cargo test || { echo "[build] ERROR: cargo test failed"; exit 1; }
 
 copy_to_bundled
 
-# Check PATH symlink health
+# Deploy to PATH — on noexec filesystems (Android shared storage), copy directly
 hcom_path=$(command -v hcom 2>/dev/null || true)
-if [[ -z "$hcom_path" ]]; then
-    echo ""
-    echo "[build] hcom not found on PATH. To fix:"
-    echo "  ln -sf \"$BUNDLED_DIR/hcom\" ~/.local/bin/hcom"
-elif [[ -L "$hcom_path" ]] && [[ "$(readlink "$hcom_path")" != */bin/hcom ]]; then
-    echo ""
-    echo "[build] WARNING: $hcom_path → $(readlink "$hcom_path") (should point to bin/hcom)"
-    echo "  ln -sf \"$BUNDLED_DIR/hcom\" $hcom_path"
+if [[ -n "$hcom_path" ]] && [[ ! -L "$hcom_path" || "$(readlink "$hcom_path" 2>/dev/null)" == */bin/hcom* ]]; then
+    # Existing install — update in place
+    cp "$BINARY" "$hcom_path" && echo "Updated $hcom_path"
+elif [[ -z "$hcom_path" ]]; then
+    mkdir -p "$HOME/.local/bin"
+    cp "$BINARY" "$HOME/.local/bin/hcom" && echo "Installed to ~/.local/bin/hcom"
 fi

@@ -1113,18 +1113,7 @@ fn format_event_summary(data: &Value) -> String {
     "(no summary)".to_string()
 }
 
-/// Format age from seconds.
-fn format_age(secs: i64) -> String {
-    if secs < 60 {
-        format!("{secs}s")
-    } else if secs < 3600 {
-        format!("{}m", secs / 60)
-    } else if secs < 86400 {
-        format!("{}h", secs / 3600)
-    } else {
-        format!("{}d", secs / 86400)
-    }
-}
+use crate::instances::format_age;
 
 // ── Main Entry Point ─────────────────────────────────────────────────────
 

@@ -81,13 +81,18 @@ const LIST_HELP: &[HelpEntry] = &[
     ("  --json", "JSON array of all agents"),
     ("  --names", "Just names, one per line"),
     ("  --format TPL", "Template per agent: --format '{name} {status}'"),
+    ("", "  Fields: name, base_name, status, status_context, status_detail,"),
+    ("", "  status_age_seconds, description, unread_count, tool, tag, directory,"),
+    ("", "  session_id, parent_name, agent_id, headless, created_at,"),
+    ("", "  hooks_bound, process_bound, transcript_path, background_log_file,"),
+    ("", "  launch_context"),
     ("", ""),
     ("list [self|<name>]", "Single agent details"),
     ("  [field]", "Print specific field (status, directory, session_id, ...)"),
     ("  --json", "Output as JSON"),
     ("  --sh", "Shell exports: eval \"$(hcom list self --sh)\""),
     ("", ""),
-    ("list --stopped [name]", "Stopped instances (from events)"),
+    ("list --stopped [name]", "Stopped agents (from events)"),
     ("  --all", "All stopped (default: last 20)"),
     ("", ""),
     ("Status icons:", ""),
@@ -478,10 +483,7 @@ fn get_tool_spec(name: &str) -> Option<&'static ToolHelpSpec> {
 /// Generate tool launch help from spec. Returns formatted lines (not HelpEntry).
 fn generate_tool_help(spec: &ToolHelpSpec) -> String {
     let t = spec.name;
-    let inside_ai = env::var("CLAUDE_CODE_ENTRYPOINT").is_ok()
-        || env::var("GEMINI_CLI_ENTRYPOINT").is_ok()
-        || env::var("CODEX_CLI_ENTRYPOINT").is_ok()
-        || env::var("HCOM_SID").is_ok();
+    let inside_ai = crate::shared::is_inside_ai_tool();
     let term_desc = if inside_ai { "Opens new terminal" } else { "Runs in current terminal" };
     let args_env = format!("HCOM_{}_ARGS", t.to_uppercase());
 

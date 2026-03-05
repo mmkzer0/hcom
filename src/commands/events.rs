@@ -585,10 +585,7 @@ fn cmd_events_launch(db: &HcomDb, args: &EventsLaunchArgs, instance_name: Option
 
     // Resolve launcher
     let launcher = instance_name.map(|s| s.to_string()).or_else(|| {
-        if std::env::var("CLAUDE_CODE_ENTRYPOINT").is_ok()
-            || std::env::var("GEMINI_CLI_ENTRYPOINT").is_ok()
-            || std::env::var("CODEX_CLI_ENTRYPOINT").is_ok()
-        {
+        if crate::shared::is_inside_ai_tool() {
             crate::identity::resolve_identity(db, None, None, None, None, None, None)
                 .ok()
                 .map(|id| id.name)

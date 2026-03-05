@@ -583,10 +583,7 @@ fn launch_new_terminal() -> i32 {
         }
     }
 
-    let inside_ai = env::var("CLAUDE_CODE_ENTRYPOINT").is_ok()
-        || env::var("GEMINI_CLI_ENTRYPOINT").is_ok()
-        || env::var("CODEX_CLI_ENTRYPOINT").is_ok()
-        || env::var("HCOM_SID").is_ok();
+    let inside_ai = crate::shared::is_inside_ai_tool();
 
     match crate::terminal::launch_terminal(
         &exe,
@@ -675,10 +672,7 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
 
     // Identity gating: block unregistered sessions from gated commands
     let has_from_flag = cmd_argv.iter().any(|a| a == "--from" || a == "-b");
-    let is_inside_ai = std::env::var("CLAUDE_CODE_ENTRYPOINT").is_ok()
-        || std::env::var("GEMINI_CLI_ENTRYPOINT").is_ok()
-        || std::env::var("CODEX_CLI_ENTRYPOINT").is_ok()
-        || std::env::var("HCOM_SID").is_ok();
+    let is_inside_ai = crate::shared::is_inside_ai_tool();
     if let Err(e) = crate::cli_context::check_identity_gate(cmd, &ctx, has_from_flag, is_inside_ai) {
         eprintln!("Error: {e}");
         return 1;

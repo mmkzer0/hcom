@@ -10,29 +10,11 @@ use std::fs;
 
 use crate::db::HcomDb;
 use crate::paths::{hcom_dir, ARCHIVE_DIR, FLAGS_DIR, LOGS_DIR, LAUNCH_DIR};
-use crate::shared::CommandContext;
-
-/// Check if running inside an AI tool.
-fn is_inside_ai_tool() -> bool {
-    std::env::var("CLAUDE_CODE_ENTRYPOINT").is_ok()
-        || std::env::var("GEMINI_CLI_ENTRYPOINT").is_ok()
-        || std::env::var("CODEX_CLI_ENTRYPOINT").is_ok()
-        || std::env::var("HCOM_SID").is_ok()
-}
+use crate::shared::{CommandContext, is_inside_ai_tool, shorten_path};
 
 /// Get timestamp for archive directory names.
 fn get_archive_timestamp() -> String {
     chrono::Local::now().format("%Y-%m-%d_%H%M%S").to_string()
-}
-
-/// Shorten path for display.
-fn shorten_path(path: &str) -> String {
-    if let Ok(home) = std::env::var("HOME") {
-        if path.starts_with(&home) {
-            return format!("~{}", &path[home.len()..]);
-        }
-    }
-    path.to_string()
 }
 
 /// Archive the current database to ~/.hcom/archive/session-{timestamp}/.
@@ -106,10 +88,7 @@ fn clean_temp_files() {
                 if entry.path().is_file() {
                     if let Ok(meta) = entry.metadata() {
                         if let Ok(mtime) = meta.modified() {
-                            let secs = mtime
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_secs_f64())
-                                .unwrap_or(0.0);
+                            let secs = crate::shared::system_time_to_epoch_f64(mtime);
                             if secs < cutoff_24h {
                                 let _ = fs::remove_file(entry.path());
                             }
@@ -129,10 +108,7 @@ fn clean_temp_files() {
                 if path.extension().and_then(|e| e.to_str()) == Some("md") {
                     if let Ok(meta) = entry.metadata() {
                         if let Ok(mtime) = meta.modified() {
-                            let secs = mtime
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_secs_f64())
-                                .unwrap_or(0.0);
+                            let secs = crate::shared::system_time_to_epoch_f64(mtime);
                             if secs < cutoff_24h {
                                 let _ = fs::remove_file(path);
                             }
@@ -153,10 +129,7 @@ fn clean_temp_files() {
                 if name.starts_with("background_") && name.ends_with(".log") {
                     if let Ok(meta) = entry.metadata() {
                         if let Ok(mtime) = meta.modified() {
-                            let secs = mtime
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_secs_f64())
-                                .unwrap_or(0.0);
+                            let secs = crate::shared::system_time_to_epoch_f64(mtime);
                             if secs < cutoff_30d {
                                 let _ = fs::remove_file(path);
                             }

@@ -268,10 +268,6 @@ fn get_scripts(hcom_dir: &std::path::Path) -> String {
     format!("Scripts: {}", names.into_iter().collect::<Vec<_>>().join(", "))
 }
 
-/// Build the hcom command string (delegates to hooks/common canonical version).
-fn build_hcom_command() -> String {
-    hook_common::build_hcom_command()
-}
 
 // =============================================================================
 // CONTEXT BUILDER
@@ -329,7 +325,7 @@ fn build_context(
         display_name,
         tag: effective_tag,
         relay_enabled,
-        hcom_cmd: build_hcom_command(),
+        hcom_cmd: hook_common::build_hcom_command(),
         is_launched,
         is_headless,
         active_instances: get_active_instances(db, instance_name),
@@ -459,7 +455,7 @@ pub fn get_bootstrap(
 
 /// Build bootstrap text for a subagent instance.
 pub fn get_subagent_bootstrap(subagent_name: &str, parent_name: &str) -> String {
-    let hcom_cmd = build_hcom_command();
+    let hcom_cmd = hook_common::build_hcom_command();
 
     let result = SUBAGENT_BOOTSTRAP
         .replace("{subagent_name}", subagent_name)

@@ -1861,7 +1861,7 @@ pub fn cmd_transcript(db: &HcomDb, args: &TranscriptArgs, ctx: Option<&CommandCo
         match resolved {
             Some(r) => r,
             None => {
-                eprintln!("Error: Instance '{name}' not found or has no transcript");
+                eprintln!("Error: Agent '{name}' not found or has no transcript");
                 return 1;
             }
         }

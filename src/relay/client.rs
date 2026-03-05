@@ -86,6 +86,7 @@ impl MqttRelay {
         let mut mqttoptions = MqttOptions::new(&client_id, &host, port);
         mqttoptions.set_keep_alive(Duration::from_secs(30));
         mqttoptions.set_clean_start(true);
+        mqttoptions.set_max_packet_size(Some(128 * 1024));
 
         // TLS
         if use_tls {

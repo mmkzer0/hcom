@@ -103,13 +103,26 @@ pub fn run_pty(args: &[String]) -> Result<()> {
 
     let instance_name = config::Config::get().instance_name;
 
-    // Build command (use original string for execve)
-    let command = tool_str.as_str();
+    // Resolve tool to full path (PATH may be minimal in launched environments)
+    let resolved = terminal::which_bin(tool_str)
+        .unwrap_or_else(|| tool_str.to_string());
+
+    // On Termux, npm-installed tools need `node <path>` instead of direct exec
+    let (command, extra_args);
+    if shared::is_termux() && terminal::has_node_shebang(&resolved) {
+        command = terminal::which_bin("node")
+            .unwrap_or_else(|| shared::platform::TERMUX_NODE_PATH.to_string());
+        extra_args = vec![resolved.as_str()];
+    } else {
+        command = resolved;
+        extra_args = vec![];
+    };
+    let full_args: Vec<&str> = extra_args.iter().copied().chain(tool_args.iter().copied()).collect();
 
     // Create and run PTY
     let mut proxy = pty::Proxy::spawn(
-        command,
-        &tool_args,
+        &command,
+        &full_args,
         pty::ProxyConfig {
             ready_pattern,
             instance_name,

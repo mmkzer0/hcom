@@ -16,6 +16,13 @@ pub fn now_epoch_f64() -> f64 {
         .unwrap_or(0.0)
 }
 
+/// Convert a SystemTime to f64 seconds since epoch (for file mtimes, etc).
+pub fn system_time_to_epoch_f64(t: SystemTime) -> f64 {
+    t.duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
 /// Current time as i64 seconds since epoch (for INTEGER columns like last_stop, heartbeat).
 pub fn now_epoch_i64() -> i64 {
     SystemTime::now()

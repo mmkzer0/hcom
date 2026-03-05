@@ -12,7 +12,7 @@ use crate::instances::{
     parse_running_tasks, resolve_display_name,
 };
 use crate::log::log_info;
-use crate::shared::{CommandContext, SenderKind, SENDER};
+use crate::shared::{CommandContext, SenderKind, SENDER, is_inside_ai_tool};
 
 /// Parsed arguments for `hcom stop`.
 #[derive(clap::Parser, Debug)]
@@ -20,14 +20,6 @@ use crate::shared::{CommandContext, SenderKind, SENDER};
 pub struct StopArgs {
     /// Targets to stop (names, tag:X, or "all")
     pub targets: Vec<String>,
-}
-
-/// Check if running inside an AI tool (Claude/Gemini/Codex/OpenCode).
-fn is_inside_ai_tool() -> bool {
-    std::env::var("CLAUDE_CODE_ENTRYPOINT").is_ok()
-        || std::env::var("GEMINI_CLI_ENTRYPOINT").is_ok()
-        || std::env::var("CODEX_CLI_ENTRYPOINT").is_ok()
-        || std::env::var("HCOM_SID").is_ok()
 }
 
 /// Resolve the initiator name for event logging.
@@ -132,11 +124,11 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
             let tagged_orphans: Vec<_> = orphans.iter().filter(|o| o.tag == tag).collect();
             if !tagged_orphans.is_empty() {
                 let names: Vec<_> = tagged_orphans.iter().flat_map(|o| o.names.iter()).cloned().collect();
-                println!("No active instances with tag '{tag}' (already stopped: {})", names.join(", "));
+                println!("No active agents with tag '{tag}' (already stopped: {})", names.join(", "));
                 println!("Use 'hcom kill tag:{tag}' to terminate their processes.");
                 return 0;
             }
-            eprintln!("Error: No instances with tag '{tag}'");
+            eprintln!("Error: No agents with tag '{tag}'");
             return 1;
         }
 
@@ -191,7 +183,7 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
 
         if !not_found.is_empty() {
             let plural = if not_found.len() > 1 { "s" } else { "" };
-            eprintln!("Error: Instance{plural} not found: {}", not_found.join(", "));
+            eprintln!("Error: Agent{plural} not found: {}", not_found.join(", "));
             return 1;
         }
 

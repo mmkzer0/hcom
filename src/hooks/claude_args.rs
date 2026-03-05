@@ -831,18 +831,7 @@ use crate::tools::args_common::{
 };
 
 /// Simple shell-safe quoting for env string serialization.
-fn shell_quote(s: &str) -> String {
-    if s.is_empty() {
-        return "''".to_string();
-    }
-    if s.chars()
-        .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '/' || c == ':')
-    {
-        s.to_string()
-    } else {
-        format!("'{}'", s.replace('\'', "'\\''"))
-    }
-}
+use crate::tools::args_common::shell_quote;
 
 // ==================== Tests ====================
 

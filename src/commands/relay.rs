@@ -12,6 +12,7 @@ use crate::config;
 use crate::db::HcomDb;
 use crate::relay::{self, DEFAULT_BROKERS};
 use crate::shared::CommandContext;
+use crate::shared::constants::{FG_GREEN, FG_RED, FG_YELLOW, FG_GRAY, RESET};
 
 /// Parsed arguments for `hcom relay`.
 #[derive(clap::Parser, Debug)]
@@ -73,21 +74,11 @@ fn format_time(timestamp: f64) -> String {
         return "never".to_string();
     }
     let now = crate::shared::constants::now_epoch_f64();
-    let age = now - timestamp;
-    format!("{} ago", format_age(age))
-}
-
-/// Format seconds as human-readable age string.
-fn format_age(secs: f64) -> String {
-    if secs < 60.0 {
-        format!("{:.0}s", secs)
-    } else if secs < 3600.0 {
-        format!("{:.0}m", secs / 60.0)
-    } else if secs < 86400.0 {
-        format!("{:.0}h", secs / 3600.0)
-    } else {
-        format!("{:.0}d", secs / 86400.0)
+    let age = (now - timestamp) as i64;
+    if age <= 0 {
+        return "just now".to_string();
     }
+    format!("{} ago", crate::instances::format_age(age))
 }
 
 /// Get device short ID via FNV-1a hash
@@ -101,13 +92,13 @@ fn relay_status(db: &HcomDb) -> i32 {
     let config = config::load_config_snapshot().core;
 
     if config.relay_id.is_empty() {
-        println!("Relay: not configured");
+        println!("{FG_GRAY}Relay: not configured{RESET}");
         println!("Run: hcom relay new");
         return 0;
     }
 
     if !config.relay_enabled {
-        println!("Relay: disabled");
+        println!("{FG_YELLOW}Relay: disabled{RESET}");
         println!("\nRun: hcom relay connect");
         return 0;
     }
@@ -117,9 +108,9 @@ fn relay_status(db: &HcomDb) -> i32 {
     let relay_error = db.kv_get("relay_last_error").ok().flatten().unwrap_or_default();
 
     match relay_status_val.as_str() {
-        "ok" => println!("Status: connected"),
+        "ok" => println!("Status:    {FG_GREEN}connected{RESET}"),
         "error" => {
-            println!("Status: error — {}", if relay_error.is_empty() { "unknown" } else { &relay_error });
+            println!("Status:    {FG_RED}error{RESET} — {}", if relay_error.is_empty() { "unknown" } else { &relay_error });
             if relay_error.contains("password") || relay_error.contains("auth") || relay_error.contains("not authorized") {
                 let is_public = DEFAULT_BROKERS.iter().any(|&(h, p)| {
                     config.relay == format!("mqtts://{h}:{p}") || config.relay == format!("mqtt://{h}:{p}")
@@ -129,25 +120,25 @@ fn relay_status(db: &HcomDb) -> i32 {
                 }
             }
         }
-        _ => println!("Status: waiting (daemon may not be running)"),
+        _ => println!("Status:    {FG_YELLOW}waiting{RESET} (daemon may not be running)"),
     }
 
     // Broker info
     if !config.relay.is_empty() {
         if let Some((host, port, use_tls)) = relay::parse_broker_url(&config.relay) {
             if let Some(ms) = ping_broker(&host, port, use_tls) {
-                println!("Broker: {} ({ms}ms)", config.relay);
+                println!("Broker:    {} ({ms}ms)", config.relay);
             } else {
-                println!("Broker: {} (unreachable)", config.relay);
+                println!("Broker:    {} (unreachable)", config.relay);
             }
         } else {
-            println!("Broker: {}", config.relay);
+            println!("Broker:    {}", config.relay);
         }
     } else {
-        println!("Broker: auto (public fallback)");
+        println!("Broker:    auto (public fallback)");
     }
 
-    println!("Device ID: {}", get_device_short_id());
+    println!("Device:    {}", get_device_short_id());
 
     // Queued events
     let last_push_id: i64 = db
@@ -167,9 +158,9 @@ fn relay_status(db: &HcomDb) -> i32 {
         .unwrap_or(0);
 
     if queued > 0 {
-        println!("Queued: {queued} events pending");
+        println!("Queued:    {queued} events pending");
     } else {
-        println!("Queued: up to date");
+        println!("Queued:    up to date");
     }
 
     // Last push
@@ -298,7 +289,7 @@ fn relay_toggle(db: &HcomDb, enable: bool) -> i32 {
         println!("Relay enabled\n");
         relay_status(db)
     } else {
-        println!("Relay: disabled");
+        println!("{FG_YELLOW}Relay: disabled{RESET}");
         println!("\nRun 'hcom relay connect' to reconnect");
         0
     }
@@ -623,14 +614,6 @@ mod tests {
         let doc: toml_edit::DocumentMut = result.parse().unwrap();
         assert_eq!(doc["relay"]["enabled"].as_bool(), Some(true));
         assert_eq!(doc["other"]["foo"].as_integer(), Some(1));
-    }
-
-    #[test]
-    fn test_format_age() {
-        assert_eq!(format_age(30.0), "30s");
-        assert_eq!(format_age(120.0), "2m");
-        assert_eq!(format_age(7200.0), "2h");
-        assert_eq!(format_age(172800.0), "2d");
     }
 
     #[test]

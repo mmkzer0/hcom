@@ -184,6 +184,17 @@ pub fn which_bin(name: &str) -> Option<String> {
     None
 }
 
+/// Check if a file has a node shebang (#!/usr/bin/env node or similar).
+/// Used on Termux to detect npm-installed tools that need `node <path>` rewrite.
+pub fn has_node_shebang(path: &str) -> bool {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(path) else { return false };
+    let mut buf = [0u8; 64];
+    let Ok(n) = f.read(&mut buf) else { return false };
+    let header = String::from_utf8_lossy(&buf[..n]);
+    header.starts_with("#!") && header.contains("node")
+}
+
 // ==================== Preset Resolution ====================
 
 /// Resolve binary to full path via macOS app bundle fallback.
@@ -394,12 +405,12 @@ pub fn create_bash_script(
     }
 
     // Resolve tool path for full path execution.
-    // On Termux, npm-installed tools (claude, gemini, codex) have shebangs
-    // like #!/usr/bin/env node which fail. Rewrite to: node /path/to/tool args
+    // On Termux, npm-installed tools have shebangs like #!/usr/bin/env node which
+    // fail (no /usr/bin/env). Detect node shebangs and rewrite to: node /path/to/tool args
     let mut final_command = command_str.to_string();
     if !tool_cmd.is_empty() {
         if let Some(tool_path) = which_bin(tool_cmd) {
-            if platform::is_termux() {
+            if platform::is_termux() && has_node_shebang(&tool_path) {
                 let node = which_bin("node")
                     .unwrap_or_else(|| platform::TERMUX_NODE_PATH.to_string());
                 final_command = final_command.replacen(
@@ -819,7 +830,8 @@ pub fn launch_terminal(
         }
         // Use execve to replace this process entirely
         use std::ffi::CString;
-        let bash = CString::new("/bin/bash").unwrap();
+        let bash_path = which_bin("bash").unwrap_or_else(|| "/bin/bash".to_string());
+        let bash = CString::new(bash_path).unwrap();
         let arg0 = CString::new("bash").unwrap();
         let arg1 = CString::new(script_file.to_string_lossy().as_ref()).unwrap();
         let argv_ptrs: Vec<*const libc::c_char> =
@@ -1237,5 +1249,34 @@ mod tests {
         let presets = get_available_presets();
         assert_eq!(presets.first().unwrap().0, "default");
         assert_eq!(presets.last().unwrap().0, "custom");
+    }
+
+    #[test]
+    fn test_has_node_shebang_with_node_script() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tool.js");
+        std::fs::write(&path, "#!/usr/bin/env node\nconsole.log('hi');\n").unwrap();
+        assert!(has_node_shebang(path.to_str().unwrap()));
+    }
+
+    #[test]
+    fn test_has_node_shebang_with_bash_script() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tool.sh");
+        std::fs::write(&path, "#!/bin/bash\necho hello\n").unwrap();
+        assert!(!has_node_shebang(path.to_str().unwrap()));
+    }
+
+    #[test]
+    fn test_has_node_shebang_with_elf_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tool");
+        std::fs::write(&path, b"\x7fELF\x02\x01\x01\x00").unwrap();
+        assert!(!has_node_shebang(path.to_str().unwrap()));
+    }
+
+    #[test]
+    fn test_has_node_shebang_nonexistent() {
+        assert!(!has_node_shebang("/nonexistent/path/to/tool"));
     }
 }

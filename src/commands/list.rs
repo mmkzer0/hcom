@@ -15,18 +15,18 @@ use crate::instances::{
 };
 use crate::shared::{
     CommandContext, SENDER, ST_LISTENING,
-    status_icon,
+    shorten_path, shorten_path_max, status_icon,
 };
 
 /// Parsed arguments for `hcom list`.
 #[derive(clap::Parser, Debug)]
-#[command(name = "list", about = "List active instances")]
+#[command(name = "list", about = "List active agents")]
 pub struct ListArgs {
     /// Agent name or "self"
     pub name: Option<String>,
     /// Field to extract (used with name)
     pub field: Option<String>,
-    /// Show recently stopped instances
+    /// Show recently stopped agents
     #[arg(long)]
     pub stopped: bool,
     /// JSON output
@@ -50,16 +50,6 @@ pub struct ListArgs {
     /// Limit results (with --stopped)
     #[arg(long)]
     pub last: Option<usize>,
-}
-
-/// Shorten path for display (replace HOME with ~).
-fn shorten_path(path: &str) -> String {
-    if let Ok(home) = std::env::var("HOME") {
-        if let Some(rest) = path.strip_prefix(home.as_str()) {
-            return format!("~{rest}");
-        }
-    }
-    path.to_string()
 }
 
 /// Get unread message count for a single instance.
@@ -477,7 +467,7 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
 
         if verbose_output {
             let session_id = data.session_id.as_deref().unwrap_or("(none)");
-            let directory_display = if data.directory.is_empty() { "(none)".to_string() } else { shorten_path(&data.directory) };
+            let directory_display = if data.directory.is_empty() { "(none)".to_string() } else { shorten_path_max(&data.directory, 60) };
             let parent = data.parent_name.as_deref().unwrap_or("(none)");
             let tool_display = if data.tool == "adhoc" { "ad-hoc" } else { &data.tool };
 
@@ -519,9 +509,9 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
             };
             println!("    bindings:     {bind_str}");
 
-            let transcript = if data.transcript_path.is_empty() { "(none)".to_string() } else { shorten_path(&data.transcript_path) };
+            let transcript = if data.transcript_path.is_empty() { "(none)".to_string() } else { shorten_path_max(&data.transcript_path, 60) };
             if data.background != 0 && !data.background_log_file.is_empty() {
-                println!("    headless log: {}", shorten_path(&data.background_log_file));
+                println!("    headless log: {}", shorten_path_max(&data.background_log_file, 60));
             }
             println!("    transcript:   {transcript}");
 
@@ -535,6 +525,10 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
             }
             println!();
         }
+    }
+
+    if sorted_instances.is_empty() {
+        println!("No active agents. Launch one with: hcom claude");
     }
 
     // Recently stopped summary
@@ -594,16 +588,7 @@ fn print_sh_exports(payload: &serde_json::Value) {
     println!("export HCOM_DIRECTORY={}", shell_quote(directory));
 }
 
-/// Shell-quote a string (equivalent to shlex.quote).
-fn shell_quote(s: &str) -> String {
-    if s.is_empty() {
-        return "''".to_string();
-    }
-    if s.chars().all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':' | '+' | '@' | '%')) {
-        return s.to_string();
-    }
-    format!("'{}'", s.replace('\'', "'\"'\"'"))
-}
+use crate::tools::args_common::shell_quote;
 
 /// `hcom list --stopped [name] [--all] [--last N]` — show stopped instances from life events.
 /// Without a name: shows recent stopped (default last 20, use --all for unlimited).
@@ -674,7 +659,7 @@ fn cmd_list_stopped(db: &HcomDb, args: &ListArgs) -> i32 {
         if let Some(name) = filter_name {
             println!("No stopped events found for '{name}'");
         } else {
-            println!("No recently stopped instances (last 60m)");
+            println!("No recently stopped agents (last 60m)");
         }
         return 0;
     }
@@ -736,9 +721,9 @@ fn cmd_list_stopped(db: &HcomDb, args: &ListArgs) -> i32 {
     } else {
         // Summary table
         let header = if show_all {
-            format!("Stopped instances (all, showing {}):", entries.len())
+            format!("Stopped agents (all, showing {}):", entries.len())
         } else {
-            format!("Stopped instances (last {last_n}):")
+            format!("Stopped agents (last {last_n}):")
         };
         println!("{header}\n");
         for entry in &entries {

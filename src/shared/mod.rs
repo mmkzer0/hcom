@@ -32,8 +32,8 @@ pub use constants::{
     // Functions
     extract_mentions, status_icon, status_fg, status_bg, get_terminal_preset,
     // Time helpers
-    now_epoch_f64, now_epoch_i64,
+    now_epoch_f64, now_epoch_i64, system_time_to_epoch_f64,
 };
 pub use context::{HcomContext, ToolType};
 pub use errors::{CLIError, HcomError, HookError};
-pub use platform::{is_termux, is_wsl, platform_name};
+pub use platform::{detect_current_tool_from_env, is_inside_ai_tool, is_termux, is_wsl, platform_name, shorten_path, shorten_path_max};

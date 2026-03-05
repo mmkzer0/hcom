@@ -1280,13 +1280,7 @@ fn current_platform() -> &'static str {
 
 /// Check if a binary is on PATH.
 fn binary_available(name: &str) -> bool {
-    use std::env;
-    let path_var = env::var("PATH").unwrap_or_default();
-    let sep = if cfg!(windows) { ';' } else { ':' };
-    path_var.split(sep).any(|dir| {
-        let p = std::path::Path::new(dir).join(name);
-        p.is_file()
-    })
+    crate::terminal::which_bin(name).is_some()
 }
 
 /// Check if a macOS .app bundle exists in standard locations.

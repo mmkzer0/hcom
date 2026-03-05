@@ -1595,7 +1595,6 @@ pub fn resolve_instance_from_binding(
     db: &HcomDb,
     session_id: Option<&str>,
     process_id: Option<&str>,
-    _transcript_path: Option<&str>,
 ) -> Option<InstanceRow> {
     // Path 1: Process binding
     if let Some(pid) = process_id {
@@ -1614,9 +1613,6 @@ pub fn resolve_instance_from_binding(
             }
         }
     }
-
-    // Path 3: Transcript marker binding — deferred to Phase 1A
-    // (requires _try_bind_from_transcript which depends on hooks infrastructure)
 
     None
 }
@@ -2338,7 +2334,7 @@ mod tests {
         db.save_instance_named("luna", &data).unwrap();
         db.set_process_binding("pid-1", "sess-1", "luna").unwrap();
 
-        let result = resolve_instance_from_binding(&db, None, Some("pid-1"), None);
+        let result = resolve_instance_from_binding(&db, None, Some("pid-1"));
         assert!(result.is_some());
         assert_eq!(result.unwrap().name, "luna");
 
@@ -2359,7 +2355,7 @@ mod tests {
         db.save_instance_named("nova", &data).unwrap();
         db.rebind_session("sess-2", "nova").unwrap();
 
-        let result = resolve_instance_from_binding(&db, Some("sess-2"), None, None);
+        let result = resolve_instance_from_binding(&db, Some("sess-2"), None);
         assert!(result.is_some());
         assert_eq!(result.unwrap().name, "nova");
 
@@ -2388,7 +2384,7 @@ mod tests {
         db.save_instance_named("nova", &d2).unwrap();
         db.rebind_session("sess-2", "nova").unwrap();
 
-        let result = resolve_instance_from_binding(&db, Some("sess-2"), Some("pid-1"), None);
+        let result = resolve_instance_from_binding(&db, Some("sess-2"), Some("pid-1"));
         assert_eq!(result.unwrap().name, "luna"); // process wins
 
         cleanup(path);
@@ -2403,7 +2399,7 @@ mod tests {
         db.set_process_binding("pid-ghost", "", "ghost").unwrap();
         // No instance "ghost" exists
 
-        let result = resolve_instance_from_binding(&db, None, Some("pid-ghost"), None);
+        let result = resolve_instance_from_binding(&db, None, Some("pid-ghost"));
         assert!(result.is_none());
 
         cleanup(path);
@@ -2414,7 +2410,7 @@ mod tests {
         crate::config::Config::init();
         let (db, path) = setup_test_db();
 
-        let result = resolve_instance_from_binding(&db, Some("nonexistent"), Some("nope"), None);
+        let result = resolve_instance_from_binding(&db, Some("nonexistent"), Some("nope"));
         assert!(result.is_none());
 
         cleanup(path);

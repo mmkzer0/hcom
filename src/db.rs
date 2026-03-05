@@ -706,7 +706,7 @@ impl HcomDb {
     /// - Ok(None) if instance not found
     /// - Err if database error occurs
     pub fn get_instance_status(&self, name: &str) -> Result<Option<InstanceStatus>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT name, status, status_detail, last_event_id
              FROM instances WHERE name = ?",
         )?;
@@ -776,7 +776,7 @@ impl HcomDb {
             }
         };
 
-        let mut stmt = match self.conn.prepare(
+        let mut stmt = match self.conn.prepare_cached(
             "SELECT id, timestamp, data FROM events
              WHERE id > ? AND type = 'message'
              ORDER BY id",
@@ -1031,7 +1031,7 @@ impl HcomDb {
         }
 
         // Get instance names from this batch
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT DISTINCT instance FROM events
              WHERE type = 'life'
                AND json_extract(data, '$.action') = 'ready'
@@ -1123,7 +1123,7 @@ impl HcomDb {
     pub fn get_status(&self, name: &str) -> Result<Option<(String, String)>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT status, status_context FROM instances WHERE name = ?")?;
+            .prepare_cached("SELECT status, status_context FROM instances WHERE name = ?")?;
 
         match stmt.query_row(params![name], |row| {
             Ok((
@@ -1156,7 +1156,7 @@ impl HcomDb {
     pub fn get_process_binding(&self, process_id: &str) -> Result<Option<String>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT instance_name FROM process_bindings WHERE process_id = ?")?;
+            .prepare_cached("SELECT instance_name FROM process_bindings WHERE process_id = ?")?;
 
         match stmt.query_row(params![process_id], |row| row.get::<_, String>(0)) {
             Ok(name) => Ok(Some(name)),
@@ -1169,7 +1169,7 @@ impl HcomDb {
     pub fn get_process_binding_full(&self, process_id: &str) -> Result<Option<(Option<String>, String)>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT session_id, instance_name FROM process_bindings WHERE process_id = ?")?;
+            .prepare_cached("SELECT session_id, instance_name FROM process_bindings WHERE process_id = ?")?;
 
         match stmt.query_row(params![process_id], |row| {
             Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?))
@@ -1250,8 +1250,8 @@ impl HcomDb {
             }
         };
 
-        let mut stmt = match self.conn.prepare(
-            "SELECT data FROM events WHERE id > ? AND type = 'message' ORDER BY id",
+        let mut stmt = match self.conn.prepare_cached(
+            "SELECT data FROM events WHERE id > ? AND type = 'message'",
         ) {
             Ok(s) => s,
             Err(e) => {
@@ -1287,7 +1287,7 @@ impl HcomDb {
     pub fn get_transcript_path(&self, name: &str) -> Result<Option<String>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT transcript_path FROM instances WHERE name = ?")?;
+            .prepare_cached("SELECT transcript_path FROM instances WHERE name = ?")?;
 
         match stmt.query_row(params![name], |row| row.get::<_, String>(0)) {
             Ok(path) if !path.is_empty() => Ok(Some(path)),
@@ -1304,7 +1304,7 @@ impl HcomDb {
     /// - Ok(None) if instance not found
     /// - Err if database error occurs
     pub fn get_instance_snapshot(&self, name: &str) -> Result<Option<serde_json::Value>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT transcript_path, session_id, tool, directory, parent_name, tag,
                     wait_timeout, subagent_timeout, hints, pid, created_at, background,
                     agent_id, launch_args, origin_device_id, background_log_file, last_event_id
@@ -1462,7 +1462,7 @@ impl HcomDb {
         let pattern = format!("{}%", escaped);
         let mut stmt = self
             .conn
-            .prepare("SELECT key, value FROM kv WHERE key LIKE ? ESCAPE '\\'")?;
+            .prepare_cached("SELECT key, value FROM kv WHERE key LIKE ? ESCAPE '\\'")?;
         let rows = stmt
             .query_map(params![pattern], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -1840,7 +1840,7 @@ impl HcomDb {
         // Load all subscriptions
         let rows: Vec<(String, String)> = match self
             .conn
-            .prepare("SELECT key, value FROM kv WHERE key LIKE 'events_sub:%'")
+            .prepare_cached("SELECT key, value FROM kv WHERE key LIKE 'events_sub:%'")
         {
             Ok(mut stmt) => stmt
                 .query_map([], |row| {
@@ -2030,7 +2030,7 @@ impl HcomDb {
     fn load_reqwatch_subs(&self) -> Vec<(String, serde_json::Value, serde_json::Value)> {
         let rows: Vec<(String, String)> = match self
             .conn
-            .prepare("SELECT key, value FROM kv WHERE key LIKE 'events_sub:reqwatch-%'")
+            .prepare_cached("SELECT key, value FROM kv WHERE key LIKE 'events_sub:reqwatch-%'")
         {
             Ok(mut stmt) => stmt
                 .query_map([], |row| {
@@ -2282,7 +2282,7 @@ impl HcomDb {
     /// Parses @mentions, computes scope, inserts message event.
     pub fn send_system_message(&self, sender_name: &str, message: &str) -> Result<Vec<String>> {
         // Get all instances
-        let mut stmt = self.conn.prepare("SELECT name, tag FROM instances")?;
+        let mut stmt = self.conn.prepare_cached("SELECT name, tag FROM instances")?;
         let instances: Vec<(String, Option<String>)> = stmt
             .query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
@@ -2399,7 +2399,7 @@ impl HcomDb {
 
     pub fn get_instance(&self, name: &str) -> Result<Option<serde_json::Value>> {
         let sql = format!("SELECT {} FROM instances WHERE name = ?", Self::INSTANCE_COLUMNS);
-        let mut stmt = self.conn.prepare(&sql)?;
+        let mut stmt = self.conn.prepare_cached(&sql)?;
 
         match stmt.query_row(params![name], Self::instance_row_to_json) {
             Ok(inst) => Ok(Some(inst)),
@@ -2529,7 +2529,7 @@ impl HcomDb {
     /// Iterate all instances, returning Vec of JSON objects.
     pub fn iter_instances(&self) -> Result<Vec<serde_json::Value>> {
         let sql = format!("SELECT {} FROM instances ORDER BY created_at DESC", Self::INSTANCE_COLUMNS);
-        let mut stmt = self.conn.prepare(&sql)?;
+        let mut stmt = self.conn.prepare_cached(&sql)?;
 
         let rows: Vec<serde_json::Value> = stmt
             .query_map([], Self::instance_row_to_json)?
@@ -2617,7 +2617,7 @@ impl HcomDb {
 
     /// Get full instance row by name.
     pub fn get_instance_full(&self, name: &str) -> Result<Option<InstanceRow>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT * FROM instances WHERE name = ?",
         )?;
         match stmt.query_row(params![name], InstanceRow::from_row) {
@@ -2629,7 +2629,7 @@ impl HcomDb {
 
     /// Get all instance rows.
     pub fn iter_instances_full(&self) -> Result<Vec<InstanceRow>> {
-        let mut stmt = self.conn.prepare("SELECT * FROM instances ORDER BY created_at DESC")?;
+        let mut stmt = self.conn.prepare_cached("SELECT * FROM instances ORDER BY created_at DESC")?;
         let rows = stmt
             .query_map([], InstanceRow::from_row)?
             .filter_map(|r| r.ok())

@@ -89,9 +89,8 @@ fn list_archives(here_filter: bool) -> Vec<serde_json::Value> {
         let (size_bytes, created) = match std::fs::metadata(&db_path) {
             Ok(meta) => {
                 let size = meta.len() as i64;
-                let mtime = meta.modified().ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs_f64())
+                let mtime = meta.modified()
+                    .map(crate::shared::system_time_to_epoch_f64)
                     .unwrap_or(0.0);
                 (size, mtime)
             }
@@ -257,15 +256,7 @@ fn query_archive_instances(
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
 
-/// Shorten path for display (replace HOME with ~).
-fn shorten_path(path: &str) -> String {
-    if let Ok(home) = std::env::var("HOME") {
-        if path.starts_with(&home) {
-            return format!("~{}", &path[home.len()..]);
-        }
-    }
-    path.to_string()
-}
+use crate::shared::shorten_path;
 
 pub fn cmd_archive(_db: &HcomDb, args: &ArchiveArgs, _ctx: Option<&CommandContext>) -> i32 {
     let json_output = args.json;

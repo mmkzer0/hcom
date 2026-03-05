@@ -186,17 +186,7 @@ pub fn cmd_hooks_remove(argv: &[&str]) -> i32 {
 
 /// Detect current AI tool from environment.
 fn detect_current_tool() -> &'static str {
-    if std::env::var("CLAUDE_CODE_ENTRYPOINT").is_ok() {
-        "claude"
-    } else if std::env::var("GEMINI_CLI_ENTRYPOINT").is_ok() {
-        "gemini"
-    } else if std::env::var("CODEX_CLI_ENTRYPOINT").is_ok() {
-        "codex"
-    } else if std::env::var("OPENCODE").ok().as_deref() == Some("1") {
-        "opencode"
-    } else {
-        "adhoc"
-    }
+    crate::shared::detect_current_tool_from_env()
 }
 
 pub fn cmd_hooks(_db: &HcomDb, args: &HooksArgs, _ctx: Option<&CommandContext>) -> i32 {
