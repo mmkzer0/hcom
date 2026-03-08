@@ -35,7 +35,7 @@ impl Config {
     /// Initialize global config from environment variables (call once at startup).
     /// Can be called multiple times - subsequent calls are no-ops.
     pub fn init() {
-        let mut config = CONFIG.lock().unwrap();
+        let mut config = CONFIG.lock().unwrap_or_else(|e| e.into_inner());
         if config.is_none() {
             *config = Some(Self::from_env());
         }
@@ -55,7 +55,7 @@ impl Config {
     /// Allows tests to reinitialize config with different env vars.
     #[cfg(test)]
     pub fn reset() {
-        *CONFIG.lock().unwrap() = None;
+        *CONFIG.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     /// Load configuration from environment variables
