@@ -165,9 +165,10 @@ fn find_macos_app(name: &str) -> Option<PathBuf> {
 
 /// Replace `open -a <app>` app names with absolute `.app` bundle paths.
 ///
-/// macOS `open -a Name` resolution is brittle on some systems even when the
-/// bundle exists. Rewriting to an absolute app path keeps all launch paths
-/// consistent for built-in presets and the platform-default Terminal.app path.
+/// This is only safe for app-launch commands where `open` passes argv via
+/// `--args`. Plain file-open forms like `open -a Terminal {script}` must keep
+/// `-a`, otherwise `open` treats the app bundle and script as regular paths and
+/// falls back to file association for the script.
 fn rewrite_open_command_with_app_path(template: &str, app_path: &Path) -> Result<String> {
     let mut parts = shell_split(template)?;
     for idx in 0..parts.len().saturating_sub(1) {
@@ -177,6 +178,10 @@ fn rewrite_open_command_with_app_path(template: &str, app_path: &Path) -> Result
                 && !flag.starts_with("--")
                 && flag.chars().skip(1).any(|c| c == 'a'));
         if takes_app_arg {
+            let has_args_tail = parts.iter().skip(idx + 2).any(|part| part == "--args");
+            if !has_args_tail {
+                return Ok(template.to_string());
+            }
             if flag == "-a" {
                 parts.remove(idx);
                 parts[idx] = app_path.to_string_lossy().to_string();
@@ -213,6 +218,10 @@ fn rewrite_macos_open_app_command(template: &str, app_name: &str) -> String {
         return template.to_string();
     };
     rewrite_open_command_with_app_path(template, &app_path).unwrap_or_else(|_| template.to_string())
+}
+
+fn should_use_command_extension(background: bool, terminal_mode: &str) -> bool {
+    !background && cfg!(target_os = "macos") && (terminal_mode == "default" || terminal_mode == "Terminal.app")
 }
 
 /// Find kitten binary — PATH first, then macOS app bundle.
@@ -828,24 +837,6 @@ pub fn launch_terminal(
     // Determine terminal mode
     let mut terminal_mode = terminal.unwrap_or("default").to_string();
 
-    // Determine script extension
-    let use_command_ext = !background && cfg!(target_os = "macos") && terminal_mode == "default";
-    let extension = if use_command_ext { ".command" } else { ".sh" };
-    let script_file = paths::hcom_path(&[
-        paths::LAUNCH_DIR,
-        &format!(
-            "hcom_{}_{}{}",
-            std::process::id(),
-            rand::random::<u16>() % 9000 + 1000,
-            extension
-        ),
-    ]);
-
-    // Ensure launch dir exists
-    if let Some(parent) = script_file.parent() {
-        fs::create_dir_all(parent).ok();
-    }
-
     let opens_new_window = !background && !run_here;
 
     // Resolve smart terminal shortcuts
@@ -898,6 +889,28 @@ pub fn launch_terminal(
         if !kitty_socket.is_empty() {
             final_env.insert("KITTY_LISTEN_ON".to_string(), kitty_socket.clone());
         }
+    }
+
+    // Determine script extension after terminal mode resolution so explicit
+    // Terminal.app uses the macOS `.command` launcher just like auto-detect.
+    let extension = if should_use_command_extension(background, &terminal_mode) {
+        ".command"
+    } else {
+        ".sh"
+    };
+    let script_file = paths::hcom_path(&[
+        paths::LAUNCH_DIR,
+        &format!(
+            "hcom_{}_{}{}",
+            std::process::id(),
+            rand::random::<u16>() % 9000 + 1000,
+            extension
+        ),
+    ]);
+
+    // Ensure launch dir exists
+    if let Some(parent) = script_file.parent() {
+        fs::create_dir_all(parent).ok();
     }
 
     // Create script
@@ -1385,10 +1398,7 @@ mod tests {
             Path::new("/System/Applications/Utilities/Terminal.app"),
         )
         .unwrap();
-        assert_eq!(
-            rewritten,
-            "open /System/Applications/Utilities/Terminal.app '{script}'"
-        );
+        assert_eq!(rewritten, "open -a Terminal {script}");
     }
 
     #[test]
@@ -1402,6 +1412,27 @@ mod tests {
             rewritten,
             "open -n /Applications/Ghostty.app --args -e bash '{script}'"
         );
+    }
+
+    #[test]
+    fn test_rewrite_open_command_with_explicit_args() {
+        let rewritten = rewrite_open_command_with_app_path(
+            "open -a Terminal --args bash {script}",
+            Path::new("/System/Applications/Utilities/Terminal.app"),
+        )
+        .unwrap();
+        assert_eq!(
+            rewritten,
+            "open /System/Applications/Utilities/Terminal.app --args bash '{script}'"
+        );
+    }
+
+    #[test]
+    fn test_should_use_command_extension_for_terminal_app() {
+        assert!(should_use_command_extension(false, "default"));
+        assert!(should_use_command_extension(false, "Terminal.app"));
+        assert!(!should_use_command_extension(false, "iTerm"));
+        assert!(!should_use_command_extension(true, "Terminal.app"));
     }
 
     #[test]
