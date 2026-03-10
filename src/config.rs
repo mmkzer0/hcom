@@ -35,20 +35,18 @@ impl Config {
     /// Initialize global config from environment variables (call once at startup).
     /// Can be called multiple times - subsequent calls are no-ops.
     pub fn init() {
+        let _ = Self::get();
+    }
+
+    /// Get global config, initializing it from the current environment if needed.
+    pub fn get() -> Config {
         let mut config = CONFIG.lock().unwrap_or_else(|e| e.into_inner());
         if config.is_none() {
             *config = Some(Self::from_env());
         }
-    }
-
-    /// Get reference to global config (must call init() first).
-    /// Panics if init() was not called.
-    pub fn get() -> Config {
-        CONFIG
-            .lock()
-            .unwrap()
+        config
             .clone()
-            .expect("Config::init() must be called before Config::get()")
+            .expect("Config should be initialized before returning")
     }
 
     /// Reset global config (test-only).
