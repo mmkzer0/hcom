@@ -53,6 +53,10 @@ fn first_non_empty_line(text: &str) -> Option<&str> {
 ///   gemini: `-i "prompt"` (interactive only, headless not supported)
 ///   codex:  bare positional (interactive)
 ///   opencode: `--prompt "prompt"`
+///
+/// Always includes `--no-run-here` so the launcher opens a new terminal window/tab
+/// instead of running the agent in the TUI's own terminal (which would cause the
+/// agent to launch into a piped subprocess with no interactive I/O).
 pub fn build_launch_argv(
     tool: Tool,
     count: u8,
@@ -61,7 +65,7 @@ pub fn build_launch_argv(
     terminal: &str,
     prompt: &str,
 ) -> Vec<String> {
-    let mut argv: Vec<String> = vec![count.to_string(), tool.name().into()];
+    let mut argv: Vec<String> = vec![count.to_string(), tool.name().into(), "--no-run-here".into()];
     if !tag.is_empty() {
         argv.extend(["--tag".into(), tag.into()]);
     }
@@ -150,6 +154,7 @@ mod tests {
         let argv = build_launch_argv(Tool::Claude, 2, "review", true, "kitty", "hello");
         assert_eq!(argv[0], "2");
         assert_eq!(argv[1], "claude");
+        assert!(argv.contains(&"--no-run-here".into()));
         assert!(argv.contains(&"--tag".into()));
         assert!(argv.contains(&"review".into()));
         assert!(argv.contains(&"--terminal".into()));
@@ -159,9 +164,12 @@ mod tests {
     }
 
     #[test]
-    fn launch_argv_always_includes_terminal() {
+    fn launch_argv_always_includes_no_run_here() {
         let argv = build_launch_argv(Tool::Gemini, 1, "", false, "default", "");
-        assert_eq!(argv, vec!["1", "gemini", "--terminal", "default"]);
+        assert_eq!(
+            argv,
+            vec!["1", "gemini", "--no-run-here", "--terminal", "default"]
+        );
     }
 
     #[test]
@@ -169,13 +177,24 @@ mod tests {
         let argv = build_launch_argv(Tool::Gemini, 1, "", false, "kitty", "fix the bug");
         assert_eq!(
             argv,
-            vec!["1", "gemini", "--terminal", "kitty", "-i", "fix the bug"]
+            vec![
+                "1",
+                "gemini",
+                "--no-run-here",
+                "--terminal",
+                "kitty",
+                "-i",
+                "fix the bug"
+            ]
         );
     }
 
     #[test]
     fn launch_argv_codex_prompt_is_positional() {
         let argv = build_launch_argv(Tool::Codex, 1, "", false, "tmux", "do task");
-        assert_eq!(argv, vec!["1", "codex", "--terminal", "tmux", "do task"]);
+        assert_eq!(
+            argv,
+            vec!["1", "codex", "--no-run-here", "--terminal", "tmux", "do task"]
+        );
     }
 }

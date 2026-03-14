@@ -383,6 +383,10 @@ fn parse_launch_argv(argv: &[String]) -> Result<(usize, String, HcomLaunchFlags,
                 flags.run_here = Some(true);
                 i += 1;
             }
+            "--no-run-here" => {
+                flags.run_here = Some(false);
+                i += 1;
+            }
             // Skip global flags (--name/--go) that weren't at the start of argv
             "--name" if i + 1 < remaining.len() => {
                 i += 2;
@@ -506,6 +510,12 @@ mod tests {
     fn test_parse_launch_argv_headless() {
         let (_, _, flags, _) = parse_launch_argv(&s(&["claude", "--headless"])).unwrap();
         assert!(flags.headless);
+    }
+
+    #[test]
+    fn test_parse_launch_argv_no_run_here() {
+        let (_, _, flags, _) = parse_launch_argv(&s(&["claude", "--no-run-here"])).unwrap();
+        assert_eq!(flags.run_here, Some(false));
     }
 
     #[test]
