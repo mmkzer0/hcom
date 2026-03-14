@@ -94,19 +94,19 @@ pub fn run_pty(args: &[String]) -> Result<()> {
     // Resolve tool to full path (PATH may be minimal in launched environments)
     let resolved = terminal::which_bin(tool_str).unwrap_or_else(|| tool_str.to_string());
 
-    // On Termux, npm-installed tools need `node <path>` instead of direct exec
-    let (command, extra_args);
-    if shared::is_termux() && terminal::has_node_shebang(&resolved) {
-        command = terminal::which_bin("node")
-            .unwrap_or_else(|| shared::platform::TERMUX_NODE_PATH.to_string());
-        extra_args = vec![resolved.as_str()];
+    // On Termux, some wrapped tools need a launcher override instead of direct exec.
+    let (command, extra_args): (String, Vec<String>);
+    if let Some((launcher, prefix_args)) = terminal::resolve_termux_tool_launcher(tool_str, &resolved)
+    {
+        command = launcher;
+        extra_args = prefix_args;
     } else {
         command = resolved;
         extra_args = vec![];
-    };
+    }
     let full_args: Vec<&str> = extra_args
         .iter()
-        .copied()
+        .map(|s| s.as_str())
         .chain(tool_args.iter().copied())
         .collect();
 

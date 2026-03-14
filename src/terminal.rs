@@ -319,6 +319,38 @@ pub fn has_node_shebang(path: &str) -> bool {
     header.starts_with("#!") && header.contains("node")
 }
 
+const TERMUX_CODEX_WRAPPER_PATH: &str = "/data/data/com.termux/files/usr/bin/codex";
+const TERMUX_CODEX_INNER_WRAPPER_PATH: &str =
+    "/data/data/com.termux/files/usr/lib/node_modules/@mmmbuto/codex-cli-termux/bin/codex";
+const TERMUX_SH_PATH: &str = "/data/data/com.termux/files/usr/bin/sh";
+
+/// Resolve Termux-only tool launch quirks.
+///
+/// Most npm-installed tools can run as `node <wrapper.js> ...`, but the
+/// third-party `codex-cli-termux` wrapper breaks in stripped `RUN_COMMAND`
+/// environments when its JS wrapper tries to spawn the nested shell wrapper
+/// directly. Bypass that path by invoking the inner wrapper with `sh`.
+pub fn resolve_termux_tool_launcher(tool_name: &str, resolved: &str) -> Option<(String, Vec<String>)> {
+    if !platform::is_termux() {
+        return None;
+    }
+
+    if tool_name == "codex"
+        && resolved == TERMUX_CODEX_WRAPPER_PATH
+        && Path::new(TERMUX_CODEX_INNER_WRAPPER_PATH).exists()
+    {
+        let sh = which_bin("sh").unwrap_or_else(|| TERMUX_SH_PATH.to_string());
+        return Some((sh, vec![TERMUX_CODEX_INNER_WRAPPER_PATH.to_string()]));
+    }
+
+    if has_node_shebang(resolved) {
+        let node = which_bin("node").unwrap_or_else(|| platform::TERMUX_NODE_PATH.to_string());
+        return Some((node, vec![resolved.to_string()]));
+    }
+
+    None
+}
+
 /// Resolve binary to full path via macOS app bundle fallback.
 fn resolve_binary_path(binary: &str, app_name: Option<&str>, preset_name: &str) -> Option<String> {
     if which_bin(binary).is_some() {
@@ -545,12 +577,13 @@ pub fn create_bash_script(
     let mut final_command = command_str.to_string();
     if !tool_cmd.is_empty() {
         if let Some(tool_path) = which_bin(tool_cmd) {
-            if platform::is_termux() && has_node_shebang(&tool_path) {
-                let node =
-                    which_bin("node").unwrap_or_else(|| platform::TERMUX_NODE_PATH.to_string());
+            if let Some((launcher, prefix_args)) = resolve_termux_tool_launcher(tool_cmd, &tool_path)
+            {
+                let mut replacement_parts = vec![shell_quote(&launcher)];
+                replacement_parts.extend(prefix_args.iter().map(|arg| shell_quote(arg)));
                 final_command = final_command.replacen(
                     &format!("{} ", tool_cmd),
-                    &format!("{} {} ", shell_quote(&node), shell_quote(&tool_path)),
+                    &format!("{} ", replacement_parts.join(" ")),
                     1,
                 );
             } else {
@@ -1590,5 +1623,34 @@ mod tests {
     #[test]
     fn test_has_node_shebang_nonexistent() {
         assert!(!has_node_shebang("/nonexistent/path/to/tool"));
+    }
+
+    #[test]
+    fn test_resolve_termux_tool_launcher_codex_wrapper() {
+        let resolved = resolve_termux_tool_launcher("codex", TERMUX_CODEX_WRAPPER_PATH);
+        if crate::shared::platform::is_termux() && Path::new(TERMUX_CODEX_INNER_WRAPPER_PATH).exists()
+        {
+            let (command, args) = resolved.expect("expected termux codex wrapper override");
+            assert!(command.ends_with("/sh") || command == "sh");
+            assert_eq!(args, vec![TERMUX_CODEX_INNER_WRAPPER_PATH.to_string()]);
+        } else {
+            assert!(resolved.is_none());
+        }
+    }
+
+    #[test]
+    fn test_resolve_termux_tool_launcher_node_script() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tool");
+        std::fs::write(&path, "#!/usr/bin/env node\nconsole.log('ok');\n").unwrap();
+
+        let resolved = resolve_termux_tool_launcher("tool", path.to_str().unwrap());
+        if crate::shared::platform::is_termux() {
+            let (command, args) = resolved.expect("expected node wrapper on termux");
+            assert!(command.ends_with("/node") || command == "node");
+            assert_eq!(args, vec![path.to_string_lossy().to_string()]);
+        } else {
+            assert!(resolved.is_none());
+        }
     }
 }
