@@ -468,7 +468,9 @@ fn build_early_launch_context() -> String {
                 ctx.insert("pane_id".into(), Value::String(terminal_id_value));
             }
         }
-        let _ = std::fs::remove_file(&id_file);
+        // Don't delete the file here — capture_context in the SessionStart hook
+        // reads it to persist terminal_id into DB launch_context. If we delete
+        // early, the hook finds exists=false and terminal_id is lost from DB.
     }
 
     Value::Object(ctx).to_string()

@@ -604,8 +604,9 @@ impl HcomDb {
             ));
         }
 
-        // Column guard: verify critical column exists (catches partial schema)
-        let has_tool: bool = self
+        // Column guard: verify all expected columns exist (catches partial schema from
+        // version bump before migration was written)
+        let missing_col: Option<String> = self
             .conn
             .prepare("PRAGMA table_info(instances)")
             .and_then(|mut s| {
@@ -613,13 +614,14 @@ impl HcomDb {
                     .query_map([], |row| row.get::<_, String>(1))?
                     .filter_map(|r| r.ok())
                     .collect();
-                Ok(cols.contains(&"tool".to_string()))
+                let required = ["tool", "terminal_preset_requested", "terminal_preset_effective"];
+                Ok(required.iter().find(|c| !cols.contains(&c.to_string())).map(|s| s.to_string()))
             })
-            .unwrap_or(false);
-        if !has_tool {
+            .unwrap_or(None);
+        if let Some(col) = missing_col {
             return Ok(SchemaCompat::NeedsArchive(
-                "DB schema missing instances.tool".to_string(),
-                None,
+                format!("DB schema missing instances.{}", col),
+                Some(version),
             ));
         }
 
@@ -2890,6 +2892,8 @@ impl HcomDb {
             "name_announced",
             "running_tasks",
             "idle_since",
+            "terminal_preset_requested",
+            "terminal_preset_effective",
         ];
         if VALID_COLUMNS.contains(&key) {
             Ok(key)
