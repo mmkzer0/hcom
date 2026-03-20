@@ -18,10 +18,14 @@ fi
 
 ASSET="hcom-${OS}-${ARCH}"
 
-# Get latest release tag
-TAG=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" | grep '"tag_name"' | cut -d'"' -f4)
+# Get latest release tag. Prefer git ls-remote (no rate limits), fall back to GitHub API.
+# || true prevents set -e from aborting on failure before the fallback/error check.
+TAG=$(git ls-remote --tags --sort=version:refname "https://github.com/$REPO.git" 2>/dev/null | grep -v '\^{}' | tail -1 | sed 's|.*refs/tags/||' || true)
 if [ -z "$TAG" ]; then
-    echo "Error: could not determine latest release" >&2
+    TAG=$(curl -fsSL --max-time 10 "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null | grep '"tag_name"' | cut -d'"' -f4 || true)
+fi
+if [ -z "$TAG" ]; then
+    echo "Error: could not determine latest release. Check your network connection." >&2
     exit 1
 fi
 

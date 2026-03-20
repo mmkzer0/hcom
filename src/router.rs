@@ -433,11 +433,15 @@ pub fn dispatch() -> anyhow::Result<()> {
 
     let action = resolve_action(argv);
 
-    // Check for updates on CLI commands (not hooks/pty/relay — those need to be fast/silent)
-    if matches!(
-        action,
-        Action::Command { .. } | Action::Launch { .. } | Action::Version | Action::Help
-    ) {
+    // Check for updates on CLI commands (not hooks/pty/relay — those need to be fast/silent).
+    // Skip for `hcom update` itself — it handles its own output.
+    let is_update_cmd = matches!(&action, Action::Command { cmd, .. } if cmd == "update");
+    if !is_update_cmd
+        && matches!(
+            action,
+            Action::Command { .. } | Action::Launch { .. } | Action::Version | Action::Help
+        )
+    {
         if let Some(notice) = crate::update::get_update_notice() {
             eprintln!("{notice}");
         }

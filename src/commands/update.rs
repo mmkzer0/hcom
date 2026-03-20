@@ -35,23 +35,21 @@ pub fn cmd_update(_db: &HcomDb, args: &UpdateArgs, ctx: Option<&CommandContext>)
     println!("Update available: v{} → v{}", info.current, info.latest);
 
     if args.check {
-        println!("Run to update:  {}", info.cmd);
+        println!("Run `hcom update` to apply.");
         return 0;
     }
 
     let go = ctx.map(|c| c.go).unwrap_or(false);
     let inside_ai = is_inside_ai_tool();
 
-    // Inside AI tool without --go: show the command, don't prompt
+    // Inside AI tool without --go: suggest hcom update --go
     if inside_ai && !go {
-        println!("Run to update:  {}", info.cmd);
-        println!("(pass --go to apply automatically)");
+        println!("Run `hcom update --go` to apply automatically.");
         return 0;
     }
 
     // Interactive prompt when running in a terminal
     if !go && !inside_ai {
-        println!("Command:  {}", info.cmd);
         print!("Apply update? [y/N] ");
         use std::io::Write;
         std::io::stdout().flush().ok();

@@ -1,4 +1,5 @@
-//! Auto-update checker — checks GitHub Releases API once daily.
+//! Auto-update checker — checks latest release via git ls-remote once daily.
+//! Uses git ls-remote instead of the GitHub REST API to avoid rate limits.
 
 use std::path::Path;
 
@@ -33,11 +34,15 @@ fn spawn_background_check(flag: &Path, current: &str) {
     let flag_str = flag.to_string_lossy().to_string();
     let current = current.to_string();
 
-    // Shell script that: fetches GitHub API, extracts tag, compares versions, writes cache.
+    // Shell script: uses git ls-remote (no rate limits) to get latest tag, compares, writes cache.
     // Runs completely detached — parent doesn't wait.
     let script = format!(
         r#"
-TAG=$(curl -fsSL --max-time 5 https://api.github.com/repos/aannoo/hcom/releases/latest 2>/dev/null | grep '"tag_name"' | head -1 | cut -d'"' -f4)
+TAG=$(GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=5 git ls-remote --tags --sort=version:refname https://github.com/aannoo/hcom.git 2>/dev/null | grep -v '\^{{}}' | tail -1 | sed 's|.*refs/tags/||')
+# Fallback to GitHub API if git unavailable
+if [ -z "$TAG" ]; then
+    TAG=$(curl -fsSL --max-time 5 https://api.github.com/repos/aannoo/hcom/releases/latest 2>/dev/null | grep '"tag_name"' | head -1 | cut -d'"' -f4)
+fi
 VER="${{TAG#v}}"
 if [ -n "$VER" ]; then
     # Compare: if remote > current, write version; else write empty
@@ -63,14 +68,49 @@ fi
         .spawn();
 }
 
-/// Synchronously fetch the latest version from GitHub Releases API.
-/// Returns version string (without 'v' prefix) or None on failure/network error.
+/// Synchronously fetch the latest version. Tries git ls-remote first (no rate limits),
+/// falls back to GitHub API if git is unavailable.
 fn fetch_latest_version() -> Option<String> {
+    fetch_via_git().or_else(fetch_via_curl)
+}
+
+fn fetch_via_git() -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args([
+            "ls-remote",
+            "--tags",
+            "--sort=version:refname",
+            "https://github.com/aannoo/hcom.git",
+        ])
+        .env("GIT_HTTP_LOW_SPEED_LIMIT", "1000")
+        .env("GIT_HTTP_LOW_SPEED_TIME", "5")
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let body = String::from_utf8_lossy(&output.stdout);
+    let tag = body
+        .lines()
+        .filter(|l| !l.ends_with("^{}"))
+        .last()?
+        .split("refs/tags/")
+        .nth(1)?
+        .trim()
+        .to_string();
+
+    let ver = tag.trim_start_matches('v').to_string();
+    if ver.is_empty() { None } else { Some(ver) }
+}
+
+fn fetch_via_curl() -> Option<String> {
     let output = std::process::Command::new("curl")
         .args([
             "-fsSL",
             "--max-time",
-            "10",
+            "5",
             "https://api.github.com/repos/aannoo/hcom/releases/latest",
         ])
         .output()
@@ -131,7 +171,9 @@ fn get_update_cmd() -> &'static str {
         }
     };
 
-    let path_str = exe.to_string_lossy();
+    // Resolve symlink — build.sh copies binary and symlinks ~/.local/bin/hcom -> repo bin/
+    let resolved = std::fs::canonicalize(&exe).unwrap_or(exe.clone());
+    let path_str = resolved.to_string_lossy();
 
     // Dev build
     if path_str.contains("/hook-comms/")
@@ -200,8 +242,8 @@ pub fn get_update_info() -> Option<(String, &'static str)> {
 
 /// Return update notice string for stderr, or None if up to date.
 pub fn get_update_notice() -> Option<String> {
-    let (latest, cmd) = get_update_info()?;
-    Some(format!("→ Update available: hcom v{latest} ({cmd})"))
+    let (latest, _cmd) = get_update_info()?;
+    Some(format!("→ hcom v{latest} available — run `hcom update`"))
 }
 
 #[cfg(test)]
