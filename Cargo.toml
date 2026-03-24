@@ -45,6 +45,7 @@ sha2 = "0.10"
 bytes = "1"
 rustls = "0.22"
 webpki-roots = "0.26"
+rustls-native-certs = "0.7"
 
 [dev-dependencies]
 serial_test = "3"

@@ -740,6 +740,7 @@ dependencies = [
  "rumqttc",
  "rusqlite",
  "rustls",
+ "rustls-native-certs",
  "serde",
  "serde_json",
  "serial_test",

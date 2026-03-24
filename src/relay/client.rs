@@ -7,6 +7,9 @@
 use rumqttc::v5::mqttbytes::QoS;
 use rumqttc::v5::mqttbytes::v5::Packet;
 use rumqttc::v5::{Client, Connection, Event, MqttOptions};
+use rumqttc::TlsConfiguration;
+use rustls::RootCertStore;
+use rustls_native_certs::load_native_certs;
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -19,6 +22,29 @@ use super::{
     get_broker_from_config, is_relay_enabled, read_device_uuid, set_relay_status, state_topic,
     wildcard_topic,
 };
+
+/// Build a TLS config that combines webpki-roots (bundled Mozilla CAs for Android/Termux
+/// compatibility) with native system certs (for private broker support).
+/// This ensures public brokers work everywhere while preserving user-installed CA support.
+fn relay_tls_config() -> TlsConfiguration {
+    let mut root_store = RootCertStore::empty();
+
+    // Add webpki-roots as the base — fixes Android/Termux where rustls-native-certs fails
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+    // Also add native system certs if available, for private broker support
+    if let Ok(native_certs) = load_native_certs() {
+        for cert in native_certs {
+            let _ = root_store.add(cert);
+        }
+    }
+
+    let tls_config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+
+    TlsConfiguration::Rustls(Arc::new(tls_config))
+}
 
 /// Commands sent from the main thread to the relay event loop.
 pub enum RelayCommand {
@@ -92,7 +118,7 @@ impl MqttRelay {
 
         // TLS
         if use_tls {
-            mqttoptions.set_transport(rumqttc::Transport::tls_with_default_config());
+            mqttoptions.set_transport(rumqttc::Transport::tls_with_config(relay_tls_config()));
         }
 
         // Auth
@@ -465,7 +491,7 @@ pub fn create_ephemeral_client(config: &HcomConfig) -> Option<EphemeralClient> {
     mqttoptions.set_clean_start(true);
 
     if use_tls {
-        mqttoptions.set_transport(rumqttc::Transport::tls_with_default_config());
+        mqttoptions.set_transport(rumqttc::Transport::tls_with_config(relay_tls_config()));
     }
 
     if !config.relay_token.is_empty() {
