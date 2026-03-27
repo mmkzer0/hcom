@@ -250,10 +250,10 @@ fn truncate_str(s: &str, max: usize) -> &str {
 fn normalize_tool_name(name: &str) -> &str {
     match name {
         "run_shell_command" | "shell" | "shell_command" | "bash" => "Bash",
-        "read_file" | "read" => "Read",
+        "read_file" | "read" | "read_many_files" => "Read",
         "write_file" | "write" => "Write",
-        "edit_file" | "edit" | "apply_patch" => "Edit",
-        "search_files" | "grep" => "Grep",
+        "edit_file" | "edit" | "apply_patch" | "replace" => "Edit",
+        "search_files" | "grep" | "grep_search" => "Grep",
         "list_files" | "list_directory" | "glob" => "Glob",
         "fetch" => "WebFetch",
         "skill" => "Skill",
@@ -426,6 +426,125 @@ struct ToolUse {
     is_error: bool,
     file: Option<String>,
     command: Option<String>,
+}
+
+fn summarize_tool_names(tools: &[ToolUse]) -> String {
+    let mut names = Vec::new();
+    for tool in tools {
+        if !names.contains(&tool.name) {
+            names.push(tool.name.clone());
+        }
+    }
+
+    match names.len() {
+        0 => "tools".to_string(),
+        1..=3 => names.join(", "),
+        _ => format!("{}, +{} more", names[..3].join(", "), names.len() - 3),
+    }
+}
+
+fn finalize_action_text(
+    action: &str,
+    tools: &[ToolUse],
+    errors: &[Value],
+    ended_on_error: bool,
+) -> String {
+    let trimmed = action.trim();
+    if !trimmed.is_empty() {
+        return trimmed.to_string();
+    }
+
+    let _ = errors;
+    if ended_on_error {
+        if tools.is_empty() {
+            "(turn ended in error)".to_string()
+        } else {
+            format!(
+                "(turn ended in error after using {})",
+                summarize_tool_names(tools)
+            )
+        }
+    } else if !tools.is_empty() {
+        format!("(tool-only turn: {})", summarize_tool_names(tools))
+    } else {
+        "(no response)".to_string()
+    }
+}
+
+fn is_codex_system_injected_user_text(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    trimmed.starts_with("<environment_context>")
+        || trimmed.starts_with("<permissions")
+        || trimmed.starts_with("# AGENTS.md")
+}
+
+fn extract_codex_event_message_text(payload: &Value) -> String {
+    if let Some(text) = payload.get("message").and_then(|v| v.as_str()) {
+        return text.trim().to_string();
+    }
+    extract_text_content(payload)
+}
+
+fn same_trimmed_text(a: &str, b: &str) -> bool {
+    a.trim() == b.trim()
+}
+
+fn is_no_response_action(action: &str) -> bool {
+    action.trim() == "(no response)"
+}
+
+fn merge_exchange_metadata(dst: &mut Exchange, src: Exchange) {
+    for file in src.files {
+        if !dst.files.contains(&file) {
+            dst.files.push(file);
+        }
+    }
+    dst.files = dedup_sorted_capped(&dst.files, 5);
+
+    for tool in src.tools {
+        dst.tools.push(tool);
+    }
+    for edit in src.edits {
+        dst.edits.push(edit);
+    }
+    for error in src.errors {
+        dst.errors.push(error);
+    }
+    dst.ended_on_error = src.ended_on_error;
+}
+
+fn collapse_codex_duplicate_exchanges(exchanges: Vec<Exchange>) -> Vec<Exchange> {
+    let mut collapsed: Vec<Exchange> = Vec::new();
+
+    for ex in exchanges {
+        if let Some(last) = collapsed.last_mut() {
+            let same_user = same_trimmed_text(&last.user, &ex.user);
+            let same_action = same_trimmed_text(&last.action, &ex.action);
+
+            if same_user
+                && is_no_response_action(&last.action)
+                && !is_no_response_action(&ex.action)
+            {
+                last.action = ex.action.clone();
+                last.timestamp = ex.timestamp.clone();
+                merge_exchange_metadata(last, ex);
+                continue;
+            }
+
+            if same_user && same_action && !is_no_response_action(&last.action) {
+                merge_exchange_metadata(last, ex);
+                continue;
+            }
+        }
+
+        collapsed.push(ex);
+    }
+
+    for (idx, ex) in collapsed.iter_mut().enumerate() {
+        ex.position = idx + 1;
+    }
+
+    collapsed
 }
 
 /// Parse Claude JSONL transcript.
@@ -649,7 +768,12 @@ fn parse_claude_jsonl(path: &Path, last: usize, detailed: bool) -> Result<Vec<Ex
                     exchanges.push(Exchange {
                         position,
                         user: current_user.clone(),
-                        action: current_action.clone(),
+                        action: finalize_action_text(
+                            &current_action,
+                            &current_tools,
+                            &current_errors,
+                            current_last_was_error,
+                        ),
                         files: dedup_sorted_capped(&current_files, 5),
                         timestamp: current_ts.clone(),
                         tools: std::mem::take(&mut current_tools),
@@ -751,7 +875,12 @@ fn parse_claude_jsonl(path: &Path, last: usize, detailed: bool) -> Result<Vec<Ex
         exchanges.push(Exchange {
             position,
             user: current_user,
-            action: current_action,
+            action: finalize_action_text(
+                &current_action,
+                &current_tools,
+                &current_errors,
+                current_last_was_error,
+            ),
             files: dedup_sorted_capped(&current_files, 5),
             timestamp: current_ts,
             tools: current_tools,
@@ -762,6 +891,8 @@ fn parse_claude_jsonl(path: &Path, last: usize, detailed: bool) -> Result<Vec<Ex
     }
 
     // Apply last N
+    exchanges = collapse_codex_duplicate_exchanges(exchanges);
+
     if exchanges.len() > last {
         let start = exchanges.len() - last;
         exchanges = exchanges[start..].to_vec();
@@ -817,7 +948,7 @@ fn parse_gemini_json(path: &Path, last: usize) -> Result<Vec<Exchange>, String> 
                 exchanges.push(Exchange {
                     position,
                     user: current_user.clone(),
-                    action: current_action.clone(),
+                    action: finalize_action_text(&current_action, &current_tools, &[], false),
                     files: std::mem::take(&mut current_files),
                     timestamp: current_ts.clone(),
                     tools: std::mem::take(&mut current_tools),
@@ -847,6 +978,15 @@ fn parse_gemini_json(path: &Path, last: usize) -> Result<Vec<Exchange>, String> 
                     let raw_name = tc.get("name").and_then(|v| v.as_str()).unwrap_or("");
                     let tool_name = normalize_tool_name(raw_name);
                     let args = tc.get("args").cloned().unwrap_or(json!({}));
+                    let is_err = tc
+                        .get("status")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|status| {
+                            !matches!(
+                                status.to_ascii_lowercase().as_str(),
+                                "ok" | "success" | "completed"
+                            )
+                        });
 
                     // Extract file paths from tool args
                     if let Some(obj) = args.as_object() {
@@ -894,7 +1034,7 @@ fn parse_gemini_json(path: &Path, last: usize) -> Result<Vec<Exchange>, String> 
 
                     current_tools.push(ToolUse {
                         name: tool_name.to_string(),
-                        is_error: false,
+                        is_error: is_err,
                         file,
                         command,
                     });
@@ -909,7 +1049,7 @@ fn parse_gemini_json(path: &Path, last: usize) -> Result<Vec<Exchange>, String> 
         exchanges.push(Exchange {
             position,
             user: current_user,
-            action: current_action,
+            action: finalize_action_text(&current_action, &current_tools, &[], false),
             files: current_files,
             timestamp: current_ts,
             tools: current_tools,
@@ -969,6 +1109,7 @@ fn parse_codex_jsonl(path: &Path, last: usize, detailed: bool) -> Result<Vec<Exc
     let mut current_ts = String::new();
     let mut current_errors: Vec<Value> = Vec::new();
     let mut current_last_was_error = false;
+    let mut current_assistant_chunks: Vec<String> = Vec::new();
     let mut position = 0;
     let mut in_exchange = false; // track whether we have a real user entry
 
@@ -981,13 +1122,15 @@ fn parse_codex_jsonl(path: &Path, last: usize, detailed: bool) -> Result<Vec<Exc
                          ts: &mut String,
                          tools: &mut Vec<ToolUse>,
                          errors: &mut Vec<Value>,
+                         assistant_chunks: &mut Vec<String>,
                          last_was_error: &mut bool| {
         if !user.is_empty() || !action.is_empty() {
             *position += 1;
+            let final_action = finalize_action_text(action, tools, errors, *last_was_error);
             exchanges.push(Exchange {
                 position: *position,
                 user: std::mem::take(user),
-                action: std::mem::take(action),
+                action: final_action,
                 files: dedup_sorted_capped(files, 5),
                 timestamp: std::mem::take(ts),
                 tools: std::mem::take(tools),
@@ -995,7 +1138,9 @@ fn parse_codex_jsonl(path: &Path, last: usize, detailed: bool) -> Result<Vec<Exc
                 errors: std::mem::take(errors),
                 ended_on_error: *last_was_error,
             });
+            let _ = std::mem::take(action);
             files.clear();
+            assistant_chunks.clear();
             *last_was_error = false;
         }
         *in_exchange = false;
@@ -1027,7 +1172,14 @@ fn parse_codex_jsonl(path: &Path, last: usize, detailed: bool) -> Result<Vec<Exc
                     if role == "user" {
                         let text = extract_text_content(&payload);
                         // Only start exchange if user has actual text
-                        if text.is_empty() {
+                        if text.is_empty() || is_codex_system_injected_user_text(&text) {
+                            continue;
+                        }
+                        if in_exchange
+                            && current_action.is_empty()
+                            && same_trimmed_text(&current_user, &text)
+                        {
+                            current_ts = ts.clone();
                             continue;
                         }
                         save_exchange(
@@ -1040,6 +1192,7 @@ fn parse_codex_jsonl(path: &Path, last: usize, detailed: bool) -> Result<Vec<Exc
                             &mut current_ts,
                             &mut current_tools,
                             &mut current_errors,
+                            &mut current_assistant_chunks,
                             &mut current_last_was_error,
                         );
                         current_user = text;
@@ -1048,10 +1201,17 @@ fn parse_codex_jsonl(path: &Path, last: usize, detailed: bool) -> Result<Vec<Exc
                     } else if role == "assistant" {
                         let text = extract_text_content(&payload);
                         if !text.is_empty() {
+                            if current_assistant_chunks
+                                .iter()
+                                .any(|chunk| same_trimmed_text(chunk, &text))
+                            {
+                                continue;
+                            }
                             if !current_action.is_empty() {
                                 current_action.push('\n');
                             }
                             current_action.push_str(&text);
+                            current_assistant_chunks.push(text);
                         }
                     }
                 }
@@ -1148,8 +1308,14 @@ fn parse_codex_jsonl(path: &Path, last: usize, detailed: bool) -> Result<Vec<Exc
         else if entry_type == "event_msg" {
             match payload_type {
                 "user_message" => {
-                    let text = extract_text_content(&payload);
+                    let text = extract_codex_event_message_text(&payload);
                     if text.is_empty() {
+                        continue;
+                    }
+                    if in_exchange
+                        && current_action.is_empty()
+                        && same_trimmed_text(&current_user, &text)
+                    {
                         continue;
                     }
                     save_exchange(
@@ -1162,6 +1328,7 @@ fn parse_codex_jsonl(path: &Path, last: usize, detailed: bool) -> Result<Vec<Exc
                         &mut current_ts,
                         &mut current_tools,
                         &mut current_errors,
+                        &mut current_assistant_chunks,
                         &mut current_last_was_error,
                     );
                     current_user = text;
@@ -1169,12 +1336,19 @@ fn parse_codex_jsonl(path: &Path, last: usize, detailed: bool) -> Result<Vec<Exc
                     in_exchange = true;
                 }
                 "agent_message" => {
-                    let text = extract_text_content(&payload);
+                    let text = extract_codex_event_message_text(&payload);
                     if !text.is_empty() {
+                        if current_assistant_chunks
+                            .iter()
+                            .any(|chunk| same_trimmed_text(chunk, &text))
+                        {
+                            continue;
+                        }
                         if !current_action.is_empty() {
                             current_action.push('\n');
                         }
                         current_action.push_str(&text);
+                        current_assistant_chunks.push(text);
                     }
                 }
                 _ => {} // token_count, agent_reasoning, etc — skip
@@ -1193,8 +1367,11 @@ fn parse_codex_jsonl(path: &Path, last: usize, detailed: bool) -> Result<Vec<Exc
         &mut current_ts,
         &mut current_tools,
         &mut current_errors,
+        &mut current_assistant_chunks,
         &mut current_last_was_error,
     );
+
+    exchanges = collapse_codex_duplicate_exchanges(exchanges);
 
     if exchanges.len() > last {
         let start = exchanges.len() - last;
@@ -1450,6 +1627,12 @@ fn parse_opencode_sqlite(
                 let ptype = p.get("type").and_then(|v| v.as_str()).unwrap_or("");
                 match ptype {
                     "text" => {
+                        if p.get("synthetic")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false)
+                        {
+                            continue;
+                        }
                         if let Some(text) = p.get("text").and_then(|v| v.as_str()) {
                             if !text.is_empty() {
                                 action_parts.push(text.to_string());
@@ -1515,11 +1698,6 @@ fn parse_opencode_sqlite(
         }
 
         position += 1;
-        let action = if action_parts.is_empty() {
-            "(no response)".to_string()
-        } else {
-            action_parts.join("\n")
-        };
         files.truncate(5);
 
         // Collect errors from tools with is_error
@@ -1529,6 +1707,8 @@ fn parse_opencode_sqlite(
             .map(|t| json!({"tool": t.name, "content": ""}))
             .collect();
         let ended_on_error = tools.last().map(|t| t.is_error).unwrap_or(false);
+        let action =
+            finalize_action_text(&action_parts.join("\n"), &tools, &errors, ended_on_error);
 
         exchanges.push(Exchange {
             position,
@@ -1706,8 +1886,7 @@ fn correlate_paths_to_hcom(
         "SELECT name, transcript_path, session_id
          FROM instances
          WHERE transcript_path IS NOT NULL",
-    )
-    {
+    ) {
         if let Ok(rows) = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -2614,6 +2793,7 @@ pub fn format_exchanges_pub(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn test_normalize_tool_name() {
@@ -2622,6 +2802,10 @@ mod tests {
         assert_eq!(normalize_tool_name("write_file"), "Write");
         assert_eq!(normalize_tool_name("edit_file"), "Edit");
         assert_eq!(normalize_tool_name("search_files"), "Grep");
+        assert_eq!(normalize_tool_name("replace"), "Edit");
+        assert_eq!(normalize_tool_name("grep_search"), "Grep");
+        assert_eq!(normalize_tool_name("read_many_files"), "Read");
+        assert_eq!(normalize_tool_name("list_directory"), "Glob");
         assert_eq!(normalize_tool_name("Bash"), "Bash"); // Already canonical
     }
 
@@ -2806,6 +2990,292 @@ mod tests {
         assert_eq!(
             correlated.get(&transcript_search_key("/tmp/opencode.db", Some("ses_b"))),
             Some(&"nova".to_string())
+        );
+    }
+
+    #[test]
+    fn test_transcript_display_for_tool_only_and_error_turns() {
+        let tools = vec![ToolUse {
+            name: "Bash".to_string(),
+            is_error: false,
+            file: None,
+            command: Some("pwd".to_string()),
+        }];
+        assert_eq!(
+            finalize_action_text("", &tools, &[], false),
+            "(tool-only turn: Bash)"
+        );
+
+        let errors = vec![json!({"tool": "Bash", "content": "Exit code: 1"})];
+        assert_eq!(
+            finalize_action_text("", &tools, &errors, true),
+            "(turn ended in error after using Bash)"
+        );
+    }
+
+    #[test]
+    fn test_parse_codex_prefers_response_items_over_event_msgs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        let lines = [
+            json!({
+                "type": "event_msg",
+                "timestamp": "2026-03-27T10:00:00.100Z",
+                "payload": {"type": "user_message", "message": "response user"}
+            }),
+            json!({
+                "type": "event_msg",
+                "timestamp": "2026-03-27T10:00:01.100Z",
+                "payload": {"type": "agent_message", "message": "response assistant"}
+            }),
+            json!({
+                "type": "response_item",
+                "timestamp": "2026-03-27T10:00:00Z",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "response user"}]
+                }
+            }),
+            json!({
+                "type": "response_item",
+                "timestamp": "2026-03-27T10:00:01Z",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "response assistant"}]
+                }
+            }),
+            json!({
+                "type": "response_item",
+                "timestamp": "2026-03-27T10:00:02Z",
+                "payload": {
+                    "type": "function_call",
+                    "name": "shell",
+                    "call_id": "call_1",
+                    "arguments": "{\"command\":\"pwd\"}"
+                }
+            }),
+            json!({
+                "type": "event_msg",
+                "timestamp": "2026-03-27T10:01:00Z",
+                "payload": {"type": "user_message", "message": "event only user"}
+            }),
+            json!({
+                "type": "event_msg",
+                "timestamp": "2026-03-27T10:01:01Z",
+                "payload": {"type": "agent_message", "message": "event only assistant"}
+            }),
+        ];
+        fs::write(
+            &path,
+            lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let exchanges = parse_codex_jsonl(&path, 10, false).unwrap();
+        assert_eq!(exchanges.len(), 2);
+        assert_eq!(exchanges[0].user, "response user");
+        assert_eq!(exchanges[0].action, "response assistant");
+        assert_eq!(exchanges[0].tools.len(), 1);
+        assert_eq!(exchanges[0].tools[0].name, "Bash");
+        assert_eq!(exchanges[1].user, "event only user");
+        assert_eq!(exchanges[1].action, "event only assistant");
+    }
+
+    #[test]
+    fn test_parse_codex_dedupes_repeated_assistant_chunks_within_exchange() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        let lines = [
+            json!({
+                "type": "response_item",
+                "timestamp": "2026-03-27T10:00:00Z",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "analyze more code and write implementation plan"}]
+                }
+            }),
+            json!({
+                "type": "event_msg",
+                "timestamp": "2026-03-27T10:00:01Z",
+                "payload": {"type": "agent_message", "message": "first commentary"}
+            }),
+            json!({
+                "type": "response_item",
+                "timestamp": "2026-03-27T10:00:01Z",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "first commentary"}]
+                }
+            }),
+            json!({
+                "type": "event_msg",
+                "timestamp": "2026-03-27T10:00:02Z",
+                "payload": {"type": "agent_message", "message": "second answer"}
+            }),
+            json!({
+                "type": "response_item",
+                "timestamp": "2026-03-27T10:00:02Z",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "second answer"}]
+                }
+            }),
+        ];
+        fs::write(
+            &path,
+            lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let exchanges = parse_codex_jsonl(&path, 10, false).unwrap();
+        assert_eq!(exchanges.len(), 1);
+        assert_eq!(
+            exchanges[0].action,
+            "first commentary\nsecond answer"
+        );
+    }
+
+    #[test]
+    fn test_parse_gemini_keeps_tool_only_turns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        let transcript = json!({
+            "messages": [
+                {
+                    "type": "user",
+                    "timestamp": "2026-03-27T10:00:00Z",
+                    "displayContent": [{"text": "find the bug"}]
+                },
+                {
+                    "type": "gemini",
+                    "timestamp": "2026-03-27T10:00:01Z",
+                    "content": "",
+                    "toolCalls": [
+                        {
+                            "name": "replace",
+                            "status": "success",
+                            "args": {"file_path": "/tmp/main.rs"}
+                        }
+                    ]
+                }
+            ]
+        });
+        fs::write(&path, transcript.to_string()).unwrap();
+
+        let exchanges = parse_gemini_json(&path, 10).unwrap();
+        assert_eq!(exchanges.len(), 1);
+        assert_eq!(exchanges[0].user, "find the bug");
+        assert_eq!(exchanges[0].action, "(tool-only turn: Edit)");
+        assert_eq!(exchanges[0].files, vec!["main.rs".to_string()]);
+        assert_eq!(exchanges[0].tools[0].name, "Edit");
+    }
+
+    #[test]
+    fn test_parse_opencode_skips_synthetic_assistant_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("opencode.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE message (
+                 id text PRIMARY KEY,
+                 session_id text NOT NULL,
+                 time_created integer NOT NULL,
+                 data text NOT NULL
+             );
+             CREATE TABLE part (
+                 id text PRIMARY KEY,
+                 message_id text NOT NULL,
+                 session_id text NOT NULL,
+                 data text NOT NULL
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, data) VALUES (?, ?, ?, ?)",
+            rusqlite::params!["m1", "ses_1", 1_i64, json!({"role": "user"}).to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, data) VALUES (?, ?, ?, ?)",
+            rusqlite::params![
+                "m2",
+                "ses_1",
+                2_i64,
+                json!({"role": "assistant"}).to_string()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES (?, ?, ?, ?)",
+            rusqlite::params![
+                "p1",
+                "m1",
+                "ses_1",
+                json!({"type": "text", "text": "user prompt", "synthetic": false}).to_string()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES (?, ?, ?, ?)",
+            rusqlite::params![
+                "p2",
+                "m2",
+                "ses_1",
+                json!({"type": "text", "text": "synthetic note", "synthetic": true}).to_string()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES (?, ?, ?, ?)",
+            rusqlite::params![
+                "p3",
+                "m2",
+                "ses_1",
+                json!({"type": "text", "text": "real assistant answer", "synthetic": false})
+                    .to_string()
+            ],
+        )
+        .unwrap();
+
+        let exchanges = parse_opencode_sqlite(&db_path, "ses_1", 10).unwrap();
+        assert_eq!(exchanges.len(), 1);
+        assert_eq!(exchanges[0].user, "user prompt");
+        assert_eq!(exchanges[0].action, "real assistant answer");
+    }
+
+    #[test]
+    fn test_finalize_action_text_uses_final_error_state_only() {
+        let tools = vec![
+            ToolUse {
+                name: "Edit".to_string(),
+                is_error: true,
+                file: Some("a.rs".to_string()),
+                command: None,
+            },
+            ToolUse {
+                name: "Edit".to_string(),
+                is_error: false,
+                file: Some("a.rs".to_string()),
+                command: None,
+            },
+        ];
+        let errors = vec![json!({"tool": "Edit", "content": "old failure"})];
+        assert_eq!(
+            finalize_action_text("", &tools, &errors, false),
+            "(tool-only turn: Edit)"
         );
     }
 
