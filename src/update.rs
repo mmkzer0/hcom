@@ -94,8 +94,7 @@ fn fetch_via_git() -> Option<String> {
     let body = String::from_utf8_lossy(&output.stdout);
     let tag = body
         .lines()
-        .filter(|l| !l.ends_with("^{}"))
-        .last()?
+        .rfind(|l| !l.ends_with("^{}"))?
         .split("refs/tags/")
         .nth(1)?
         .trim()
@@ -146,8 +145,8 @@ pub struct UpdateInfo {
 /// Used by `hcom update` command for fresh checks.
 pub fn fetch_update_info() -> anyhow::Result<UpdateInfo> {
     let current = env!("CARGO_PKG_VERSION").to_string();
-    let latest = fetch_latest_version()
-        .ok_or_else(|| anyhow::anyhow!("Could not reach GitHub API"))?;
+    let latest =
+        fetch_latest_version().ok_or_else(|| anyhow::anyhow!("Could not reach GitHub API"))?;
 
     let current_parsed = parse_version(&current);
     let latest_parsed = parse_version(&latest);

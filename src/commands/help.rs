@@ -554,9 +554,15 @@ const STATUS_HELP: &[HelpEntry] = &[
 
 const UPDATE_HELP: &[HelpEntry] = &[
     ("update", "Check for and apply updates"),
-    ("update --check", "Only check — print status without applying"),
+    (
+        "update --check",
+        "Only check — print status without applying",
+    ),
     ("", ""),
-    ("", "Detects install method and runs the right update command:"),
+    (
+        "",
+        "Detects install method and runs the right update command:",
+    ),
     ("", "  uv tool install → uv tool upgrade hcom"),
     ("", "  pip install     → pip install -U hcom"),
     ("", "  curl installer  → re-run install.sh"),

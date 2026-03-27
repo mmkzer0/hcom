@@ -22,6 +22,12 @@ pub mod test_helpers {
         saved_home: Option<String>,
     }
 
+    impl Default for EnvGuard {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     impl EnvGuard {
         pub fn new() -> Self {
             Self {

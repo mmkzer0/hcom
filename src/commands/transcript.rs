@@ -3142,10 +3142,7 @@ mod tests {
 
         let exchanges = parse_codex_jsonl(&path, 10, false).unwrap();
         assert_eq!(exchanges.len(), 1);
-        assert_eq!(
-            exchanges[0].action,
-            "first commentary\nsecond answer"
-        );
+        assert_eq!(exchanges[0].action, "first commentary\nsecond answer");
     }
 
     #[test]

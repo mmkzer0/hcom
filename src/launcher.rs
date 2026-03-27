@@ -701,9 +701,9 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                 } else {
                     Some(effective_tag.as_str())
                 },
-                None, // wait_timeout
-                None, // subagent_timeout
-                None, // hints
+                None,              // wait_timeout
+                None,              // subagent_timeout
+                None,              // hints
                 Some(working_dir), // cwd_override: use launch params cwd, not current_dir()
             );
             db.set_process_binding(&process_id, "", &instance_name)?;

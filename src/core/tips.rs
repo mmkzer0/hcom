@@ -4,6 +4,16 @@
 
 use crate::db::HcomDb;
 
+pub struct LaunchTipsContext<'a> {
+    pub launched: usize,
+    pub tag: Option<&'a str>,
+    pub launcher_name: Option<&'a str>,
+    pub launcher_participating: bool,
+    pub background: bool,
+    pub terminal_mode: &'a str,
+    pub terminal_auto_detected: bool,
+}
+
 /// Centralized tip text.
 pub fn get_tip(key: &str) -> Option<&'static str> {
     match key {
@@ -76,17 +86,8 @@ pub fn maybe_show_tip(db: &HcomDb, instance_name: &str, command: &str, json_outp
 }
 
 /// Print contextual tips after launch. One-time tips tracked per launcher via kv.
-pub fn print_launch_tips(
-    db: &HcomDb,
-    launched: usize,
-    tag: Option<&str>,
-    launcher_name: Option<&str>,
-    launcher_participating: bool,
-    background: bool,
-    terminal_mode: &str,
-    terminal_auto_detected: bool,
-) {
-    if launched == 0 {
+pub fn print_launch_tips(db: &HcomDb, ctx: LaunchTipsContext<'_>) {
+    if ctx.launched == 0 {
         return;
     }
 
@@ -106,40 +107,47 @@ pub fn print_launch_tips(
     }
 
     // Terminal-mode awareness — built-in presets with close support
-    let has_close = terminal_mode == "kitty"
-        || terminal_mode == "wezterm"
-        || terminal_mode.starts_with("tmux")
+    let has_close = ctx.terminal_mode == "kitty"
+        || ctx.terminal_mode == "wezterm"
+        || ctx.terminal_mode.starts_with("tmux")
         || {
             // Check user-defined presets in config.toml for close command
             let config_path = crate::paths::config_toml_path();
             crate::config::load_toml_presets(&config_path)
                 .and_then(|presets| {
                     presets
-                        .get(terminal_mode)
+                        .get(ctx.terminal_mode)
                         .and_then(|p| p.get("close"))
                         .map(|_| true)
                 })
                 .unwrap_or(false)
         };
-    let is_tmux = terminal_mode.starts_with("tmux");
+    let is_tmux = ctx.terminal_mode.starts_with("tmux");
 
     let managed = if has_close { "managed" } else { "unmanaged" };
-    let auto = if terminal_auto_detected { ", auto-detected" } else { "" };
-    tips.push(format!("[info] Terminal: {terminal_mode} ({managed}{auto})"));
+    let auto = if ctx.terminal_auto_detected {
+        ", auto-detected"
+    } else {
+        ""
+    };
+    tips.push(format!(
+        "[info] Terminal: {} ({managed}{auto})",
+        ctx.terminal_mode
+    ));
 
     // --- Always-shown (batch-specific) ---
 
-    if let Some(t) = tag {
+    if let Some(t) = ctx.tag {
         tips.push(format!(
             "[tip] Tag prefix targets all agents with that tag: hcom send @{t}- <message>"
         ));
     }
 
-    if inside_tool && launcher_participating {
+    if inside_tool && ctx.launcher_participating {
         once(
             db,
             &mut tips,
-            launcher_name,
+            ctx.launcher_name,
             "launch:notify",
             "[tip] You'll be automatically notified when instances are launched & ready",
         );
@@ -148,11 +156,11 @@ pub fn print_launch_tips(
     // --- One-time (kv-tracked) ---
 
     if inside_tool {
-        if !launcher_participating {
+        if !ctx.launcher_participating {
             once(
                 db,
                 &mut tips,
-                launcher_name,
+                ctx.launcher_name,
                 "launch:start",
                 "[tip] Run 'hcom start' to receive notifications/messages from instances",
             );
@@ -162,17 +170,17 @@ pub fn print_launch_tips(
             once(
                 db,
                 &mut tips,
-                launcher_name,
+                ctx.launcher_name,
                 "launch:kill",
                 "[tip] Kill agents and close their panes: hcom kill <name1> <name2> ...",
             );
         }
 
-        if !background {
+        if !ctx.background {
             once(
                 db,
                 &mut tips,
-                launcher_name,
+                ctx.launcher_name,
                 "launch:term",
                 "[tip] View an agent's screen: hcom term <name> | Inject keystrokes: hcom term inject <name> [text] --enter",
             );
@@ -182,7 +190,7 @@ pub fn print_launch_tips(
             once(
                 db,
                 &mut tips,
-                launcher_name,
+                ctx.launcher_name,
                 "launch:sub-blocked",
                 "[tip] Get notified when an agent needs approval: hcom events sub --blocked <name>",
             );
@@ -190,7 +198,7 @@ pub fn print_launch_tips(
             once(
                 db,
                 &mut tips,
-                launcher_name,
+                ctx.launcher_name,
                 "launch:sub-idle",
                 "[tip] Get notified when an agent goes idle: hcom events sub --idle <name>",
             );
@@ -199,7 +207,7 @@ pub fn print_launch_tips(
         once(
             db,
             &mut tips,
-            launcher_name,
+            ctx.launcher_name,
             "list:status",
             get_tip("list:status").unwrap_or(""),
         );
@@ -207,14 +215,14 @@ pub fn print_launch_tips(
         once(
             db,
             &mut tips,
-            launcher_name,
+            ctx.launcher_name,
             "launch:send",
             "[tip] Send a message to an agent: hcom send @<name> <message>",
         );
         once(
             db,
             &mut tips,
-            launcher_name,
+            ctx.launcher_name,
             "launch:list",
             "[tip] Check status: hcom list",
         );

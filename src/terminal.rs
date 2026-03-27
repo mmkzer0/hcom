@@ -221,7 +221,9 @@ fn rewrite_macos_open_app_command(template: &str, app_name: &str) -> String {
 }
 
 fn should_use_command_extension(background: bool, terminal_mode: &str) -> bool {
-    !background && cfg!(target_os = "macos") && (terminal_mode == "default" || terminal_mode == "terminal.app")
+    !background
+        && cfg!(target_os = "macos")
+        && (terminal_mode == "default" || terminal_mode == "terminal.app")
 }
 
 /// Find kitten binary — PATH first, then macOS app bundle.
@@ -330,7 +332,10 @@ const TERMUX_SH_PATH: &str = "/data/data/com.termux/files/usr/bin/sh";
 /// third-party `codex-cli-termux` wrapper breaks in stripped `RUN_COMMAND`
 /// environments when its JS wrapper tries to spawn the nested shell wrapper
 /// directly. Bypass that path by invoking the inner wrapper with `sh`.
-pub fn resolve_termux_tool_launcher(tool_name: &str, resolved: &str) -> Option<(String, Vec<String>)> {
+pub fn resolve_termux_tool_launcher(
+    tool_name: &str,
+    resolved: &str,
+) -> Option<(String, Vec<String>)> {
     if !platform::is_termux() {
         return None;
     }
@@ -381,10 +386,8 @@ pub fn resolve_terminal_preset(preset_name: &str) -> Option<String> {
         if which_bin(binary).is_none() && cfg!(target_os = "macos") {
             // New-window presets have hardcoded fallbacks using `open -a`
             for &(name, fallback) in MACOS_APP_FALLBACKS {
-                if name == preset_name {
-                    if find_macos_app(app_name).is_some() {
-                        return Some(rewrite_macos_open_app_command(fallback, app_name));
-                    }
+                if name == preset_name && find_macos_app(app_name).is_some() {
+                    return Some(rewrite_macos_open_app_command(fallback, app_name));
                 }
             }
             // Tab/split presets: substitute leading binary with full path
@@ -577,7 +580,8 @@ pub fn create_bash_script(
     let mut final_command = command_str.to_string();
     if !tool_cmd.is_empty() {
         if let Some(tool_path) = which_bin(tool_cmd) {
-            if let Some((launcher, prefix_args)) = resolve_termux_tool_launcher(tool_cmd, &tool_path)
+            if let Some((launcher, prefix_args)) =
+                resolve_termux_tool_launcher(tool_cmd, &tool_path)
             {
                 let mut replacement_parts = vec![shell_quote(&launcher)];
                 replacement_parts.extend(prefix_args.iter().map(|arg| shell_quote(arg)));
@@ -1664,7 +1668,8 @@ mod tests {
     #[test]
     fn test_resolve_termux_tool_launcher_codex_wrapper() {
         let resolved = resolve_termux_tool_launcher("codex", TERMUX_CODEX_WRAPPER_PATH);
-        if crate::shared::platform::is_termux() && Path::new(TERMUX_CODEX_INNER_WRAPPER_PATH).exists()
+        if crate::shared::platform::is_termux()
+            && Path::new(TERMUX_CODEX_INNER_WRAPPER_PATH).exists()
         {
             let (command, args) = resolved.expect("expected termux codex wrapper override");
             assert!(command.ends_with("/sh") || command == "sh");

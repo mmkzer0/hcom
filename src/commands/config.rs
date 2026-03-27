@@ -1270,7 +1270,10 @@ pub fn terminal_help_text(show_current: bool) -> String {
     lines.push(String::new());
     lines.push("Placeholders:".to_string());
     lines.push("  {script}     = hcom-generated launch wrapper script path".to_string());
-    lines.push("  {pane_id}    = pane/window/workspace ID from pane_id_env; falls back to {id}".to_string());
+    lines.push(
+        "  {pane_id}    = pane/window/workspace ID from pane_id_env; falls back to {id}"
+            .to_string(),
+    );
     lines.push("  {process_id} = HCOM_PROCESS_ID for the launched agent".to_string());
     lines.push("  {pid}        = launched terminal process ID".to_string());
     lines.push("  {id}         = first line of stdout captured from the open command".to_string());
@@ -1389,7 +1392,7 @@ fn config_terminal(argv: &[String], setup_mode: bool) -> i32 {
     let valid = TERMINAL_PRESETS
         .iter()
         .any(|(name, _)| *name == preset_name.as_str())
-        || crate::config::is_user_defined_preset(&preset_name);
+        || crate::config::is_user_defined_preset(preset_name);
 
     if !valid {
         let mut available: Vec<&str> = TERMINAL_PRESETS.iter().map(|(name, _)| *name).collect();

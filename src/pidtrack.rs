@@ -358,7 +358,9 @@ pub fn recover_single_orphan_to_db(
     if !launch_context.is_empty() {
         updates.insert(
             "launch_context".into(),
-            serde_json::json!(serde_json::to_string(&launch_context).unwrap_or_else(|_| "{}".to_string())),
+            serde_json::json!(
+                serde_json::to_string(&launch_context).unwrap_or_else(|_| "{}".to_string())
+            ),
         );
     }
     instances::update_instance_position(db, instance_name, &updates);

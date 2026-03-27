@@ -1546,12 +1546,8 @@ mod tests {
             &std::collections::HashMap::new(),
             dir.path().to_path_buf(),
         );
-        let (instance_name, _updates, _matched_resume) = init_hook_context(
-            &db,
-            &ctx,
-            "sess-fresh",
-            transcript.to_str().unwrap(),
-        );
+        let (instance_name, _updates, _matched_resume) =
+            init_hook_context(&db, &ctx, "sess-fresh", transcript.to_str().unwrap());
 
         assert!(
             instance_name.is_none(),

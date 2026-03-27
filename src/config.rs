@@ -1346,16 +1346,18 @@ mod tests {
         assert_eq!(config.terminal, "default");
         assert_eq!(config.tag, "");
         assert_eq!(config.codex_sandbox_mode, "workspace");
-        assert_eq!(config.relay_enabled, true);
-        assert_eq!(config.auto_approve, true);
+        assert!(config.relay_enabled);
+        assert!(config.auto_approve);
         assert_eq!(config.auto_subscribe, "collision");
         assert!(config.collect_errors().is_empty());
     }
 
     #[test]
     fn test_hcom_config_validation_timeout() {
-        let mut config = HcomConfig::default();
-        config.timeout = 0;
+        let mut config = HcomConfig {
+            timeout: 0,
+            ..HcomConfig::default()
+        };
         let errors = config.collect_errors();
         assert!(errors.contains_key("timeout"));
 
@@ -1370,9 +1372,10 @@ mod tests {
 
     #[test]
     fn test_hcom_config_validation_tag() {
-        let mut config = HcomConfig::default();
-
-        config.tag = "valid-tag".to_string();
+        let mut config = HcomConfig {
+            tag: "valid-tag".to_string(),
+            ..HcomConfig::default()
+        };
         assert!(!config.collect_errors().contains_key("tag"));
 
         config.tag = "invalid tag!".to_string();
@@ -1400,9 +1403,10 @@ mod tests {
 
     #[test]
     fn test_hcom_config_validation_shell_args() {
-        let mut config = HcomConfig::default();
-
-        config.claude_args = "--model opus".to_string();
+        let mut config = HcomConfig {
+            claude_args: "--model opus".to_string(),
+            ..HcomConfig::default()
+        };
         assert!(!config.collect_errors().contains_key("claude_args"));
 
         config.claude_args = "unclosed 'quote".to_string();
@@ -1411,9 +1415,10 @@ mod tests {
 
     #[test]
     fn test_hcom_config_validation_auto_subscribe() {
-        let mut config = HcomConfig::default();
-
-        config.auto_subscribe = "collision,created".to_string();
+        let mut config = HcomConfig {
+            auto_subscribe: "collision,created".to_string(),
+            ..HcomConfig::default()
+        };
         assert!(!config.collect_errors().contains_key("auto_subscribe"));
 
         config.auto_subscribe = "bad preset!".to_string();
@@ -1422,8 +1427,10 @@ mod tests {
 
     #[test]
     fn test_terminal_case_normalization() {
-        let mut config = HcomConfig::default();
-        config.terminal = "WezTerm".to_string();
+        let mut config = HcomConfig {
+            terminal: "WezTerm".to_string(),
+            ..HcomConfig::default()
+        };
         let errors = config.collect_errors();
         assert!(!errors.contains_key("terminal"));
         assert_eq!(config.terminal, "wezterm"); // Normalized
@@ -1441,10 +1448,10 @@ mod tests {
 
     #[test]
     fn test_terminal_custom_command_requires_script() {
-        let mut config = HcomConfig::default();
-
-        // Custom command with {script} is valid
-        config.terminal = "my-terminal -e bash {script}".to_string();
+        let mut config = HcomConfig {
+            terminal: "my-terminal -e bash {script}".to_string(),
+            ..HcomConfig::default()
+        };
         assert!(!config.collect_errors().contains_key("terminal"));
 
         // Unknown name without {script} is rejected
@@ -1483,22 +1490,22 @@ mod tests {
         let mut config = HcomConfig::default();
 
         config.set_field("auto_approve", "0").unwrap();
-        assert_eq!(config.auto_approve, false);
+        assert!(!config.auto_approve);
 
         config.set_field("auto_approve", "1").unwrap();
-        assert_eq!(config.auto_approve, true);
+        assert!(config.auto_approve);
 
         config.set_field("auto_approve", "false").unwrap();
-        assert_eq!(config.auto_approve, false);
+        assert!(!config.auto_approve);
 
         config.set_field("auto_approve", "yes").unwrap();
-        assert_eq!(config.auto_approve, true);
+        assert!(config.auto_approve);
 
         config.set_field("relay_enabled", "off").unwrap();
-        assert_eq!(config.relay_enabled, false);
+        assert!(!config.relay_enabled);
 
         config.set_field("relay_enabled", "on").unwrap();
-        assert_eq!(config.relay_enabled, true);
+        assert!(config.relay_enabled);
     }
 
     #[test]
@@ -1549,7 +1556,7 @@ mod tests {
 
         assert_eq!(config.timeout, 3600);
         assert_eq!(config.tag, "test");
-        assert_eq!(config.relay_enabled, false);
+        assert!(!config.relay_enabled);
     }
 
     #[test]
@@ -1613,7 +1620,7 @@ mod tests {
 
         let env = HashMap::new();
         let config = HcomConfig::load_from_sources(&file_config, Some(&env)).unwrap();
-        assert_eq!(config.auto_approve, false);
+        assert!(!config.auto_approve);
     }
 
     #[test]

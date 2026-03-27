@@ -2433,7 +2433,7 @@ mod tests {
                 "additionalContext": "context1",
             }
         });
-        let combined = combine_posttooluse_outputs(&[output.clone()]);
+        let combined = combine_posttooluse_outputs(std::slice::from_ref(&output));
         assert_eq!(combined, output);
     }
 

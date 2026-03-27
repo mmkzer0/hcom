@@ -65,7 +65,11 @@ pub fn build_launch_argv(
     terminal: &str,
     prompt: &str,
 ) -> Vec<String> {
-    let mut argv: Vec<String> = vec![count.to_string(), tool.name().into(), "--no-run-here".into()];
+    let mut argv: Vec<String> = vec![
+        count.to_string(),
+        tool.name().into(),
+        "--no-run-here".into(),
+    ];
     if !tag.is_empty() {
         argv.extend(["--tag".into(), tag.into()]);
     }
@@ -194,7 +198,14 @@ mod tests {
         let argv = build_launch_argv(Tool::Codex, 1, "", false, "tmux", "do task");
         assert_eq!(
             argv,
-            vec!["1", "codex", "--no-run-here", "--terminal", "tmux", "do task"]
+            vec![
+                "1",
+                "codex",
+                "--no-run-here",
+                "--terminal",
+                "tmux",
+                "do task"
+            ]
         );
     }
 }

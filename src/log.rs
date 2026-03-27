@@ -375,7 +375,7 @@ mod tests {
 
         // Write some test log entries
         let ts = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-        let entries = vec![
+        let entries = [
             format!(
                 r#"{{"ts":"{}","level":"ERROR","subsystem":"test","event":"e1","msg":"err"}}"#,
                 ts

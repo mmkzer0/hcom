@@ -321,10 +321,10 @@ pub(crate) fn create_filter_subscription(
     // Validate and combine user-provided SQL parts
     if !sql_parts.is_empty() {
         let manual_sql = sql_parts.join(" ").replace("\\!", "!");
-        if let Err(e) = db
-            .conn()
-            .execute(&format!("SELECT 1 FROM events_v WHERE ({manual_sql}) LIMIT 0"), [])
-        {
+        if let Err(e) = db.conn().execute(
+            &format!("SELECT 1 FROM events_v WHERE ({manual_sql}) LIMIT 0"),
+            [],
+        ) {
             if !silent {
                 eprintln!("Error: Invalid SQL: {e}");
             }
@@ -487,10 +487,9 @@ fn cmd_events_sub(db: &HcomDb, args: &EventsSubArgs, caller_name: Option<&str>) 
     resolve_filter_names(&mut filters, db);
 
     let once = args.once;
-    let target_instance = args
-        .for_agent
-        .as_deref()
-        .map(|name| crate::instances::resolve_display_name(db, name).unwrap_or_else(|| name.to_string()));
+    let target_instance = args.for_agent.as_deref().map(|name| {
+        crate::instances::resolve_display_name(db, name).unwrap_or_else(|| name.to_string())
+    });
     let sql_parts: Vec<String> = args.rest.clone();
 
     // Resolve caller

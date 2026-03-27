@@ -132,13 +132,8 @@ fn kill_all(db: &HcomDb, hcom_dir: &std::path::Path, initiator: &str) -> Result<
         if let Some(pid) = inst.pid {
             active_pids.insert(pid as u32);
             let is_headless = inst.background != 0;
-            let (result, pane_closed, preset_name, pane_id) = kill_instance(
-                db,
-                &inst.name,
-                pid as u32,
-                inst,
-                is_headless,
-            );
+            let (result, pane_closed, preset_name, pane_id) =
+                kill_instance(db, &inst.name, pid as u32, inst, is_headless);
             let pane_info = pane_info_str(pane_closed, &preset_name, &pane_id);
             match result {
                 terminal::KillResult::Sent => {
@@ -239,13 +234,8 @@ fn kill_by_tag(db: &HcomDb, hcom_dir: &std::path::Path, tag: &str, initiator: &s
     for inst in &tagged {
         if let Some(pid) = inst.pid {
             let is_headless = inst.background != 0;
-            let (result, pane_closed, preset_name, pane_id) = kill_instance(
-                db,
-                &inst.name,
-                pid as u32,
-                inst,
-                is_headless,
-            );
+            let (result, pane_closed, preset_name, pane_id) =
+                kill_instance(db, &inst.name, pid as u32, inst, is_headless);
             let pane_info = pane_info_str(pane_closed, &preset_name, &pane_id);
             match result {
                 terminal::KillResult::Sent => {
@@ -393,7 +383,8 @@ fn kill_single(
     };
 
     let is_headless = inst.background != 0;
-    let (result, pane_closed, preset_name, pane_id) = kill_instance(db, &name, pid, &inst, is_headless);
+    let (result, pane_closed, preset_name, pane_id) =
+        kill_instance(db, &name, pid, &inst, is_headless);
     stop_instance(db, &name, initiator, "killed");
 
     let pane_info = pane_info_str(pane_closed, &preset_name, &pane_id);

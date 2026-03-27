@@ -70,7 +70,8 @@ pub fn do_resume(
     }
 
     // Load snapshot: from active instance (fork) or stopped event (resume)
-    let (tool, session_id, launch_args_str, tag, background, last_event_id, snapshot_dir) = if fork {
+    let (tool, session_id, launch_args_str, tag, background, last_event_id, snapshot_dir) = if fork
+    {
         load_instance_data(&db, &name)?
     } else {
         load_stopped_snapshot(&db, &name)?
@@ -85,7 +86,8 @@ pub fn do_resume(
     }
 
     // Extract hcom-level flags (--tag, --terminal, --dir) from extra args before tool parsing
-    let (tag_override, terminal_override, dir_override, clean_extra) = extract_hcom_flags(extra_args);
+    let (tag_override, terminal_override, dir_override, clean_extra) =
+        extract_hcom_flags(extra_args);
 
     // Determine effective working directory:
     // - Explicit --dir flag wins (validated and canonicalized)
@@ -145,7 +147,9 @@ pub fn do_resume(
     let launcher_name = flags
         .name
         .as_deref()
-        .and_then(|value| identity::resolve_identity(&db, Some(value), None, None, None, None, None).ok())
+        .and_then(|value| {
+            identity::resolve_identity(&db, Some(value), None, None, None, None, None).ok()
+        })
         .map(|id| id.name)
         .or_else(|| flags.name.clone())
         .unwrap_or_else(|| {
@@ -222,7 +226,9 @@ pub fn do_resume(
 
 /// Extract hcom-level flags (--tag, --terminal, --name, --go) from args.
 /// Returns (tag, terminal, remaining) with hcom flags stripped.
-fn extract_hcom_flags(args: &[String]) -> (Option<String>, Option<String>, Option<String>, Vec<String>) {
+fn extract_hcom_flags(
+    args: &[String],
+) -> (Option<String>, Option<String>, Option<String>, Vec<String>) {
     let mut tag = None;
     let mut terminal = None;
     let mut dir = None;
@@ -301,15 +307,50 @@ fn load_stopped_snapshot(
         if let Ok(data) = serde_json::from_str::<serde_json::Value>(data_str) {
             if data.get("action").and_then(|v| v.as_str()) == Some("stopped") {
                 if let Some(snapshot) = data.get("snapshot") {
-                    let tool = snapshot.get("tool").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    let session_id = snapshot.get("session_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    let launch_args = snapshot.get("launch_args").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    let tag = snapshot.get("tag").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    let background = snapshot.get("background").and_then(|v| v.as_i64()).unwrap_or(0) != 0;
-                    let last_event_id = snapshot.get("last_event_id").and_then(|v| v.as_i64()).unwrap_or(0);
-                    let directory = snapshot.get("directory").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let tool = snapshot
+                        .get("tool")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let session_id = snapshot
+                        .get("session_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let launch_args = snapshot
+                        .get("launch_args")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let tag = snapshot
+                        .get("tag")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let background = snapshot
+                        .get("background")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0)
+                        != 0;
+                    let last_event_id = snapshot
+                        .get("last_event_id")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    let directory = snapshot
+                        .get("directory")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
 
-                    return Ok((tool, session_id, launch_args, tag, background, last_event_id, directory));
+                    return Ok((
+                        tool,
+                        session_id,
+                        launch_args,
+                        tag,
+                        background,
+                        last_event_id,
+                        directory,
+                    ));
                 }
             }
         }
@@ -456,7 +497,8 @@ mod tests {
 
     #[test]
     fn test_extract_hcom_flags_terminal() {
-        let (tag, terminal, dir, remaining) = extract_hcom_flags(&s(&["--terminal", "alacritty", "--model", "opus"]));
+        let (tag, terminal, dir, remaining) =
+            extract_hcom_flags(&s(&["--terminal", "alacritty", "--model", "opus"]));
         assert_eq!(tag, None);
         assert_eq!(terminal, Some("alacritty".to_string()));
         assert_eq!(dir, None);
@@ -465,7 +507,8 @@ mod tests {
 
     #[test]
     fn test_extract_hcom_flags_tag_and_terminal() {
-        let (tag, terminal, dir, remaining) = extract_hcom_flags(&s(&["--tag", "test", "--terminal", "kitty"]));
+        let (tag, terminal, dir, remaining) =
+            extract_hcom_flags(&s(&["--tag", "test", "--terminal", "kitty"]));
         assert_eq!(tag, Some("test".to_string()));
         assert_eq!(terminal, Some("kitty".to_string()));
         assert_eq!(dir, None);
@@ -474,7 +517,8 @@ mod tests {
 
     #[test]
     fn test_extract_hcom_flags_equals_form() {
-        let (tag, terminal, dir, remaining) = extract_hcom_flags(&s(&["--tag=test", "--terminal=alacritty"]));
+        let (tag, terminal, dir, remaining) =
+            extract_hcom_flags(&s(&["--tag=test", "--terminal=alacritty"]));
         assert_eq!(tag, Some("test".to_string()));
         assert_eq!(terminal, Some("alacritty".to_string()));
         assert_eq!(dir, None);
@@ -492,7 +536,8 @@ mod tests {
 
     #[test]
     fn test_extract_hcom_flags_dir() {
-        let (tag, terminal, dir, remaining) = extract_hcom_flags(&s(&["--dir", "/tmp/test", "--model", "opus"]));
+        let (tag, terminal, dir, remaining) =
+            extract_hcom_flags(&s(&["--dir", "/tmp/test", "--model", "opus"]));
         assert_eq!(tag, None);
         assert_eq!(terminal, None);
         assert_eq!(dir, Some("/tmp/test".to_string()));

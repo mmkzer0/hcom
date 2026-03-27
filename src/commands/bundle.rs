@@ -703,10 +703,9 @@ fn cmd_bundle_chain(db: &HcomDb, args: &BundleChainArgs) -> i32 {
 fn cmd_bundle_prepare(db: &HcomDb, args: &BundlePrepareArgs, ctx: Option<&CommandContext>) -> i32 {
     let json_mode = args.json;
     let compact = args.compact;
-    let for_agent = args
-        .for_agent
-        .as_deref()
-        .map(|name| crate::instances::resolve_display_name(db, name).unwrap_or_else(|| name.to_string()));
+    let for_agent = args.for_agent.as_deref().map(|name| {
+        crate::instances::resolve_display_name(db, name).unwrap_or_else(|| name.to_string())
+    });
     let last_transcript = args.last_transcript;
     let last_events = args.last_events;
 

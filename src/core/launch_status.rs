@@ -118,7 +118,8 @@ fn get_batch_failure_details_for_ids(db: &HcomDb, batch_ids: &[String]) -> Vec<S
             let Ok(Some(inst)) = db.get_instance_full(&name) else {
                 continue;
             };
-            if let Some(detail) = crate::instances::get_or_finalize_launch_failure_detail(db, &inst) {
+            if let Some(detail) = crate::instances::get_or_finalize_launch_failure_detail(db, &inst)
+            {
                 details.push(format!("{}: {}", name, detail));
             }
         }
@@ -609,7 +610,10 @@ mod tests {
         let mut data = serde_json::Map::new();
         data.insert("status".into(), serde_json::json!("inactive"));
         data.insert("status_context".into(), serde_json::json!("launch_failed"));
-        data.insert("created_at".into(), serde_json::json!(crate::shared::time::now_epoch_i64()));
+        data.insert(
+            "created_at".into(),
+            serde_json::json!(crate::shared::time::now_epoch_i64()),
+        );
         data.insert(
             "status_detail".into(),
             serde_json::json!("Error: Operation not permitted (os error 1) Fully reset tmux first (`tmux kill-server`), then start a fresh tmux server with approval/escalation (for example: `tmux new-session -d -s hcom-external`), then retry."),
@@ -642,7 +646,10 @@ mod tests {
         let mut data = serde_json::Map::new();
         data.insert("status".into(), serde_json::json!("inactive"));
         data.insert("status_context".into(), serde_json::json!("new"));
-        data.insert("created_at".into(), serde_json::json!(crate::shared::time::now_epoch_i64()));
+        data.insert(
+            "created_at".into(),
+            serde_json::json!(crate::shared::time::now_epoch_i64()),
+        );
         data.insert("tool".into(), serde_json::json!("codex"));
         data.insert(
             "launch_context".into(),

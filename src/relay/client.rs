@@ -4,10 +4,10 @@
 //! Manual exponential backoff on connection errors (rumqttc auto-reconnects
 //! with zero delay; we add sleep between retries).
 
+use rumqttc::TlsConfiguration;
 use rumqttc::v5::mqttbytes::QoS;
 use rumqttc::v5::mqttbytes::v5::Packet;
 use rumqttc::v5::{Client, Connection, Event, MqttOptions};
-use rumqttc::TlsConfiguration;
 use rustls::RootCertStore;
 use rustls_native_certs::load_native_certs;
 use std::sync::{Arc, Condvar, Mutex, mpsc};

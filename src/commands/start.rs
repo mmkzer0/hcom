@@ -659,8 +659,8 @@ fn start_bare(
     ctx: &HcomContext,
     explicit_name: Option<&str>,
 ) -> Result<i32> {
-    let explicit_name =
-        explicit_name.map(|name| instances::resolve_display_name(db, name).unwrap_or_else(|| name.to_string()));
+    let explicit_name = explicit_name
+        .map(|name| instances::resolve_display_name(db, name).unwrap_or_else(|| name.to_string()));
     let explicit_name = explicit_name.as_deref();
 
     // Skip vanilla detection if --name is provided with an existing instance

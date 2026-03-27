@@ -77,8 +77,8 @@ fn parse_token(output: &str) -> Option<String> {
 
 fn parse_device_id(status_output: &str) -> Option<String> {
     for line in status_output.lines() {
-        if line.starts_with("Device:") {
-            return Some(line["Device:".len()..].trim().to_string());
+        if let Some(rest) = line.strip_prefix("Device:") {
+            return Some(rest.trim().to_string());
         }
     }
     None
@@ -127,14 +127,12 @@ struct RelayGuard {
 
 impl Drop for RelayGuard {
     fn drop(&mut self) {
-        for dir in [&self.dir_a, &self.dir_b] {
-            if let Some(d) = dir {
-                let d_str = d.to_string_lossy();
-                let _ = hcom_with_dir("relay off", &d_str);
-                let _ = hcom_with_dir("relay daemon stop", &d_str);
-                kill_daemon(&d_str);
-                let _ = fs::remove_dir_all(d);
-            }
+        for d in [&self.dir_a, &self.dir_b].into_iter().flatten() {
+            let d_str = d.to_string_lossy();
+            let _ = hcom_with_dir("relay off", &d_str);
+            let _ = hcom_with_dir("relay daemon stop", &d_str);
+            kill_daemon(&d_str);
+            let _ = fs::remove_dir_all(d);
         }
     }
 }
@@ -416,7 +414,11 @@ fn test_relay_roundtrip() {
                             data = parsed;
                         }
                     }
-                    if data["text"].as_str().map(|t| t.contains(&marker_b)).unwrap_or(false) {
+                    if data["text"]
+                        .as_str()
+                        .map(|t| t.contains(&marker_b))
+                        .unwrap_or(false)
+                    {
                         return Some((ev, data));
                     }
                 }
