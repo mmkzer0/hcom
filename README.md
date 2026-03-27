@@ -13,7 +13,7 @@ Prefix any agent with `hcom` and they're connected. When one agent edits a file,
 
 Works with Claude Code, Gemini CLI, Codex, OpenCode, and any AI tool that can run shell commands.
 
-![demo](https://raw.githubusercontent.com/aannoo/hcom/refs/heads/assets/screencapture-new-new.gif)
+![demo](https://github.com/aannoo/hcom/releases/download/v0.6.8/screencapture-new-new.gif)
 
 ---
 
