@@ -973,13 +973,12 @@ fn get_posttooluse_messages(db: &HcomDb, instance_name: &str) -> Option<Value> {
     let get_instance_data = common::make_instance_lookup(db);
     let hints = common::load_config_hints();
     let get_config_hints = || hints.clone();
-    let tip_checker = common::make_tip_checker(db);
     let user_display = messages::format_hook_messages(
         &deliver_messages,
         instance_name,
         &get_instance_data,
         &get_config_hints,
-        Some(&tip_checker),
+        None,
     );
 
     Some(serde_json::json!({
@@ -1147,15 +1146,14 @@ fn handle_userpromptsubmit(
             let get_instance_data = common::make_instance_lookup(db);
             let hints = common::load_config_hints();
             let get_config_hints = || hints.clone();
-            let tip_checker = common::make_tip_checker(db);
-
             let user_display = messages::format_hook_messages(
                 &deliver,
                 instance_name,
                 &get_instance_data,
                 &get_config_hints,
-                Some(&tip_checker),
+                None,
             );
+            let tip_checker = common::make_tip_checker(db);
             let model_context = messages::format_messages_json(
                 &deliver,
                 instance_name,

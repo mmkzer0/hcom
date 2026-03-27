@@ -199,12 +199,13 @@ fn deliver_raw_messages(
     let get_instance_data = make_instance_lookup(db);
     let hints = load_config_hints();
     let get_config_hints = || hints.clone();
+    let tip_checker = make_tip_checker(db);
     let formatted = messages::format_messages_json(
         &deliver,
         instance_name,
         &get_instance_data,
         &get_config_hints,
-        None,
+        Some(&tip_checker),
     );
 
     // Update status to active with delivery context
