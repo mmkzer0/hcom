@@ -1,7 +1,7 @@
 //! Start command: `hcom start [--as <name>] [--orphan <name|pid>]`
 //!
-//!
-//! Three main paths:
+//! Runs inside an already-running tool session rather than launching a new one.
+//! Used for adhoc/manual setup, identity rebinding, and orphan recovery:
 //! - Bare start: detect vanilla tool or create adhoc instance
 //! - `--orphan`: recover orphaned PTY process
 //! - `--as`: rebind session identity

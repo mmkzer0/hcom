@@ -1182,8 +1182,8 @@ fn verify_hooks_at(settings_path: &Path, check_permissions: bool) -> bool {
                         return false;
                     }
                     let command = hook.get("command").and_then(|v| v.as_str()).unwrap_or("");
-                    let has_hcom =
-                        command.contains("${HCOM}") || command.to_ascii_lowercase().contains("hcom");
+                    let has_hcom = command.contains("${HCOM}")
+                        || command.to_ascii_lowercase().contains("hcom");
                     if !has_hcom || !command.contains(cmd_suffix) {
                         return false;
                     }

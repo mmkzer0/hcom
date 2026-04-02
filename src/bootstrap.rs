@@ -1,6 +1,7 @@
-//! Bootstrap context builder — template-based.
+//! Build the one-time bootstrap prompt injected into a newly connected agent.
 //!
-//! Concise bootstrap optimized for token efficiency. Agents learn details via --help.
+//! Teaches the agent its identity and the `hcom` CLI contract (messaging,
+//! listing, spawning). Concise for token efficiency; agents learn details via --help.
 
 use std::collections::BTreeMap;
 use std::fs;

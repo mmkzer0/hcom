@@ -137,9 +137,7 @@ pub(crate) fn make_instance_lookup(db: &HcomDb) -> impl Fn(&str) -> Option<Value
 }
 
 /// Build a tip-tracking callback for hook message formatting.
-pub(crate) fn make_tip_checker(
-    db: &HcomDb,
-) -> impl Fn(&str, &str) -> (bool, Box<dyn Fn()>) + '_ {
+pub(crate) fn make_tip_checker(db: &HcomDb) -> impl Fn(&str, &str) -> (bool, Box<dyn Fn()>) + '_ {
     move |instance_name: &str, tip_key: &str| {
         let seen = crate::core::tips::has_seen_tip(db, instance_name, tip_key);
         let db_path = db.path().to_path_buf();

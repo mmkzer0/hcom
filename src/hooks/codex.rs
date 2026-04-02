@@ -1202,5 +1202,4 @@ mod tests {
             let _ = remove_codex_hooks();
         }
     }
-
 }

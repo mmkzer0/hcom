@@ -174,6 +174,9 @@ pub fn set_hookless_command_status(db: &HcomDb, cmd_name: &str, ctx: &CommandCon
 /// Codex and adhoc instances have no delivery hooks, so messages are delivered
 /// via CLI command output. Skips for --json output to preserve machine-readable format.
 ///
+/// Not display-only: also advances the instance cursor and updates delivery status.
+/// This is the hookless counterpart to hook-based delivery.
+///
 /// Returns formatted output string if messages were delivered, None otherwise.
 pub fn maybe_deliver_pending_messages(
     db: &HcomDb,

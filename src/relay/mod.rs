@@ -243,7 +243,8 @@ pub fn trigger_push() {
 }
 
 /// Wait for relay data. Returns true if new remote events arrived in DB.
-/// Polls for events with ':' in instance name (relay-imported events).
+/// Detects new events by the `:` in instance name (relay-imported events use
+/// namespaced names like `luna:ABCD`). Breaks if relay import naming changes.
 pub fn relay_wait(timeout_secs: f64) -> bool {
     let db = match HcomDb::open() {
         Ok(db) => db,

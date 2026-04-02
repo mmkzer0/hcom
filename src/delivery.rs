@@ -88,6 +88,7 @@ fn refresh_status(
                 "delivery.status_check",
                 &format!("DB error getting status: {}", e),
             );
+            // Fail closed: don't inject into a PTY whose state we can't verify.
             "stopped".to_string()
         }
     };
@@ -493,7 +494,16 @@ const IDLE_WAIT: Duration = Duration::from_secs(30);
 /// Maximum number of Enter-key retries during phase 2 (text clear).
 const MAX_ENTER_ATTEMPTS: u32 = 3;
 
-/// Delivery loop states
+/// Delivery state machine for the native PTY path (Claude/Gemini/Codex).
+///
+/// OpenCode bypasses this entirely — it early-returns with its own loop
+/// inside `run_delivery_loop`.
+/// - `Pending`: evaluates gate + idle checks, performs text injection
+/// - `WaitTextRender`: confirms injected text appeared in the prompt, sends Enter on match
+/// - `WaitTextClear`: verifies prompt cleared after Enter, retries Enter on timeout
+/// - `VerifyCursor`: waits for hook-side cursor advance (falls back to has_pending==false)
+///
+/// Failed verification returns to `Pending`; success goes to `Idle` or `Pending` (if more queued).
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum State {
     Idle,
@@ -503,7 +513,8 @@ enum State {
     VerifyCursor,
 }
 
-/// Run the delivery loop
+/// Run the delivery loop — surfaces out-of-band hcom messages into the tool's
+/// conversation by injecting text at a safe prompt state.
 ///
 /// This is the main delivery thread function. It:
 /// 1. Waits for messages (notify-driven)
@@ -1119,7 +1130,10 @@ pub fn run_delivery_loop(
                             phase_started_at = Instant::now();
                             enter_attempt = 0;
 
-                            // Send Enter if safe
+                            // Re-check submit hazards only. The full gate ran before
+                            // injection; by now a permission prompt or user typing may
+                            // have appeared. Text in the prompt is harmless — pressing
+                            // Enter is what would clobber state.
                             if !state.is_user_active() {
                                 let screen = state.screen.read().unwrap();
                                 if !screen.approval {
@@ -1287,7 +1301,9 @@ pub fn run_delivery_loop(
                             continue;
                         }
 
-                        // Check if messages are actually gone
+                        // Cursor advance is the primary proof, but "no pending rows"
+                        // is also sufficient — avoids wedging when hook delivery
+                        // succeeded but cursor bookkeeping didn't advance.
                         if !db.has_pending(&current_name) {
                             // Success (cursor tracking issue but delivery worked)
                             // Clear gate block status

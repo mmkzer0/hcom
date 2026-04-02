@@ -307,8 +307,8 @@ pub fn remove_pid(hcom_dir: &Path, pid: u32) {
 /// and sets status to listening so the PTY delivery gate can inject messages.
 /// Does NOT log events, print output, or remove from pidtrack — caller handles those.
 ///
-/// Returns `Err` if the critical instance INSERT fails (caller must not prune
-/// the pidtrack entry on failure —
+/// Returns `Err` if the critical instance INSERT fails. Caller must leave the
+/// pidtrack entry intact on failure so recovery can be retried later.
 pub fn recover_single_orphan_to_db(
     db: &crate::db::HcomDb,
     orphan: &OrphanProcess,

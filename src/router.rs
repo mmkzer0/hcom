@@ -247,7 +247,10 @@ pub fn extract_global_flags_full(argv: &[String]) -> (Vec<String>, GlobalFlags, 
 }
 
 /// Determine action from argv (after binary name is stripped).
-/// This is the core routing logic.
+///
+/// High-level precedence: no args -> TUI; top-level global flags / special modes
+/// (`relay-worker`, `pty`); then first non-flag token as hook, CLI command, or
+/// launch verb.
 pub fn resolve_action(argv: &[String]) -> Action {
     // No args: TUI
     if argv.is_empty() {
@@ -830,7 +833,9 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
     };
 
     // Deliver pending messages AFTER command.
-    // Codex/adhoc have no hooks, so messages piggyback on CLI output.
+    // Deliver pending messages AFTER command for hookless codex/adhoc instances.
+    // This appends unread hcom messages to the command's stdout — keep in mind
+    // when changing output contracts or adding machine-readable modes.
     if let Some(output) = crate::cli_context::maybe_deliver_pending_messages(&db, &ctx, has_json) {
         print!("{output}");
     }

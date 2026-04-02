@@ -298,7 +298,11 @@ impl MqttRelay {
         }
     }
 
-    /// Handle an incoming MQTT publish message. Routes by topic suffix.
+    /// Handle an incoming MQTT publish message.
+    ///
+    /// Topic layout: `{relay_id}/{device_uuid}` for state snapshots,
+    /// `{relay_id}/control` for control events. Empty payload on a state topic
+    /// means "device gone" (LWT or graceful cleanup).
     fn handle_incoming_message(&self, topic: &str, payload: &[u8]) {
         let prefix = format!("{}/", self.relay_id);
         if !topic.starts_with(&prefix) {

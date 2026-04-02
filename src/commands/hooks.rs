@@ -48,6 +48,22 @@ fn get_tool_status() -> Vec<(&'static str, bool, String)> {
     ]
 }
 
+fn gemini_install_failure_reason() -> Option<String> {
+    let version = crate::hooks::gemini::get_gemini_version()?;
+    if version >= crate::hooks::gemini::GEMINI_MIN_VERSION {
+        return None;
+    }
+    Some(format!(
+        "Gemini CLI {}.{}.{} is too old; hooks require >= {}.{}.{}",
+        version.0,
+        version.1,
+        version.2,
+        crate::hooks::gemini::GEMINI_MIN_VERSION.0,
+        crate::hooks::gemini::GEMINI_MIN_VERSION.1,
+        crate::hooks::gemini::GEMINI_MIN_VERSION.2
+    ))
+}
+
 /// Show hook installation status for all tools.
 fn cmd_hooks_status() -> i32 {
     let status = get_tool_status();
@@ -118,7 +134,7 @@ fn cmd_hooks_add(argv: &[String]) -> i32 {
                 if crate::hooks::gemini::setup_gemini_hooks(include_permissions) {
                     AddResult::Added
                 } else {
-                    AddResult::Failed(None)
+                    AddResult::Failed(gemini_install_failure_reason())
                 }
             }
             "codex" => {
@@ -319,6 +335,8 @@ pub fn cmd_hooks(_db: &HcomDb, args: &HooksArgs, _ctx: Option<&CommandContext>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hooks::test_helpers::EnvGuard;
+    use serial_test::serial;
 
     #[test]
     fn test_detect_current_tool_default() {
@@ -329,5 +347,31 @@ mod tests {
             ["claude", "gemini", "codex", "opencode", "adhoc"].contains(&tool),
             "unexpected tool: {tool}"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn test_gemini_install_failure_reason_reports_old_version() {
+        let _guard = EnvGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let bin_dir = dir.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::write(bin_dir.join("gemini"), "#!/bin/sh\n").unwrap();
+        std::fs::write(bin_dir.join("package.json"), r#"{"version":"0.25.9"}"#).unwrap();
+
+        let saved_path = std::env::var("PATH").ok();
+        unsafe {
+            std::env::set_var("PATH", &bin_dir);
+        }
+
+        let reason = gemini_install_failure_reason().expect("expected failure reason");
+        assert!(reason.contains("0.25.9"));
+        assert!(reason.contains(">= 0.26.0"));
+
+        if let Some(path) = saved_path {
+            unsafe { std::env::set_var("PATH", path) };
+        } else {
+            unsafe { std::env::remove_var("PATH") };
+        }
     }
 }

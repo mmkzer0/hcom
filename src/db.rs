@@ -1,7 +1,17 @@
 //! SQLite database access for hcom
 //!
-//! Minimal read/write access to ~/.hcom/hcom.db for:
-//! - Reading unread messages (events table with type='message')
+//! Three loosely-coupled state planes live in a single DB:
+//! - `instances`: live per-agent state (TUI display, gating, delivery cursors)
+//! - `events`: append-only history / message log / relay replication source
+//! - `process_bindings`, `session_bindings`, `notify_endpoints`, `kv`: routing
+//!   and control-plane state
+//!
+//! Callers typically write an event, advance per-instance cursors separately,
+//! and touch bindings/endpoints/kv for delivery, identity resolution, relay
+//! cursors, request-watch bookkeeping, and other control-plane state.
+//!
+//! Includes:
+//! - Reading unread messages from `events`
 //! - Updating cursor position (instances.last_event_id)
 //! - Reading instance status
 //! - Registering notify endpoints
@@ -229,6 +239,8 @@ impl HcomDb {
     }
 
     /// Reconnect if the DB file was replaced (e.g., by hcom reset / schema bump).
+    /// Long-lived threads (PTY delivery, listeners) hold an open connection to the
+    /// old inode; this moves them onto the new DB file.
     /// Returns true if reconnection happened.
     pub fn reconnect_if_stale(&mut self) -> bool {
         let current_inode = get_inode(&self.db_path);
@@ -657,6 +669,10 @@ impl HcomDb {
         Ok(SchemaCompat::Ok)
     }
 
+    /// Try in-place migration for consecutive schema versions.
+    ///
+    /// Returns `Ok(false)` if any step is missing from `MIGRATIONS`,
+    /// causing `ensure_schema()` to fall back to archive+recreate.
     fn try_apply_migrations(&self, old_version: i32) -> Result<bool> {
         if old_version <= 0 || old_version >= SCHEMA_VERSION {
             return Ok(false);
@@ -848,6 +864,10 @@ impl HcomDb {
     ///
     /// Skips own messages. Checks scope: "broadcast" delivers to all,
     /// "mentions" checks the mentions array with cross-device base-name matching.
+    ///
+    /// `receiver` may be local (`luna`) or relay-namespaced (`luna:ABCD`).
+    /// Mentions compare on base name so the same event JSON routes correctly
+    /// on both local and relayed peers without rewriting stored scope.
     fn should_deliver_to(json: &serde_json::Value, receiver: &str) -> bool {
         let from = json.get("from").and_then(|v| v.as_str()).unwrap_or("");
         if from == receiver {
@@ -1031,7 +1051,11 @@ impl HcomDb {
         Ok(())
     }
 
-    /// Set instance status (for cleanup)
+    /// Set instance status in the live `instances` row.
+    ///
+    /// Side effect: the first call after instance creation (`status_context == "new"`)
+    /// emits a `life` event with `action: "ready"` and may trigger batch-completion
+    /// notification. For transient TUI-only context, use `set_gate_status()` instead.
     pub fn set_status(&self, name: &str, status: &str, context: &str) -> Result<()> {
         // Check if this is first status update (status_context="new" → ready event)
         let is_new = self
@@ -1984,7 +2008,8 @@ impl HcomDb {
             }
         }
 
-        // Load all subscriptions
+        // Snapshot subscriptions. Request-watch cancellation can delete KV rows
+        // concurrently, so later code re-checks key existence before acting.
         let rows: Vec<(String, String)> = match self
             .conn
             .prepare_cached("SELECT key, value FROM kv WHERE key LIKE 'events_sub:%'")

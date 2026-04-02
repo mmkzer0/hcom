@@ -200,7 +200,8 @@ pub fn handle_state_message(db: &HcomDb, device_id: &str, payload: &[u8], own_de
             .and_then(|v| v.as_f64())
             .unwrap_or(0.0);
 
-        // Skip instances with activity from before our reset
+        // Local reset wins: ignore remote snapshots older than our reset so
+        // cleared instances don't reappear from broker-retained state.
         if local_reset_ts > 0.0 && status_time < local_reset_ts {
             continue;
         }
@@ -366,6 +367,9 @@ fn import_remote_events(
             .unwrap_or(0);
 
         if remote_max_id > 0 && remote_max_id < last_event_id {
+            // Cursor regression: remote DB was recreated/reset. Drop cached
+            // state and reimport from zero, otherwise the stale cursor would
+            // skip the entire new history.
             log::log_info(
                 "relay",
                 "relay.reset",
@@ -435,6 +439,9 @@ fn import_remote_events(
             .cloned()
             .unwrap_or(Value::Object(Default::default()));
 
+        // Namespace asymmetry by design:
+        // - `instance` / `from` keep the remote short_id suffix -> globally unique history
+        // - `mentions` / `delivered_to` strip *our own* suffix -> local delivery still matches
         if let Some(obj) = data.as_object_mut() {
             // Namespace 'from' field
             if let Some(from) = obj.get("from").and_then(|v| v.as_str()).map(String::from) {

@@ -1,4 +1,8 @@
-//! hcom — inter-agent communication CLI: PTY wrapper, hook handler, TUI.
+//! hcom — inter-agent communication for AI coding tools.
+//!
+//! Humans usually launch agents with `hcom <tool>` and talk to them through
+//! each tool's own UI. Agents use `hcom` CLI commands (learnt through bootstrap.rs)
+//! as a side-channel for messaging and coordination with other agents.
 
 mod bootstrap;
 mod cli_context;

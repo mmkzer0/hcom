@@ -698,7 +698,10 @@ mod tests {
             std::env::set_var("XDG_CONFIG_HOME", &xdg);
         }
 
-        assert_eq!(get_opencode_plugin_dir(), xdg.join("opencode").join("plugins"));
+        assert_eq!(
+            get_opencode_plugin_dir(),
+            xdg.join("opencode").join("plugins")
+        );
 
         if let Some(home) = saved_home {
             unsafe { std::env::set_var("HOME", home) };
