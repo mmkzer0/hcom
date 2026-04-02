@@ -18,13 +18,12 @@ Works with Claude Code, Gemini CLI, Codex, OpenCode, and any AI tool that can ru
 ---
 
 ## Install
- 
 
 ```bash
 brew install aannoo/hcom/hcom
 ```
- 
-<details><summary>Or with pip/uv/curl</summary>
+
+<details><summary>Or with curl/pip/uv</summary>
 
 ```bash
 # Direct installer works on macOS, Linux, Android (Termux), and WSL
@@ -37,9 +36,9 @@ uv tool install hcom
 # Or with pip
 pip install hcom
 ```
- 
+
 </details>
- 
+
 ---
 
 ## Quickstart
@@ -201,7 +200,7 @@ HCOM_DIR=$PWD/.hcom                # for sandbox or project local
 <summary>CLI</summary>
 
 ```
-hcom (hook-comms) v0.7.5 - multi-agent communication
+hcom (hook-comms) v0.7.8 - multi-agent communication
 
 Usage:
 hcom                                  TUI dashboard
@@ -230,6 +229,7 @@ reset        Archive and clear database
 hooks        Add or remove hooks
 status       Installation and diagnostics
 term         View/inject into agent PTY screens
+update       Check and apply updates
 
 
 ## send
@@ -665,6 +665,19 @@ Usage:
     hcom run docs --scripts        Script creation guide
 
   User scripts: ~/.hcom/scripts/
+
+## update
+
+Usage:
+  hcom update                     Check for and apply updates
+  hcom update --check             Only check — print status without applying
+
+  Detects install method and runs the right update command:
+    brew install    → brew upgrade hcom
+    uv tool install → uv tool upgrade hcom
+    pip install     → pip install -U hcom
+    curl installer  → re-run hcom-installer.sh
+    dev build       → use ./build.sh manually
 
 ## claude
 
