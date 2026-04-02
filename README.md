@@ -19,15 +19,23 @@ Works with Claude Code, Gemini CLI, Codex, OpenCode, and any AI tool that can ru
 
 ## Install
  
+
 ```bash
-curl -fsSL https://raw.githubusercontent.com/aannoo/hcom/main/install.sh | sh
+brew install aannoo/hcom/hcom
 ```
  
-<details><summary>Or with pip/uv</summary>
- 
+<details><summary>Or with pip/uv/curl</summary>
+
 ```bash
-pip install hcom        # or
+# Direct installer works on macOS, Linux, Android (Termux), and WSL
+curl -fsSL https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.sh | sh
+```
+
+```bash
+# With uv
 uv tool install hcom
+# Or with pip
+pip install hcom
 ```
  
 </details>
@@ -1173,4 +1181,3 @@ Issues and PRs welcome. The codebase is Rust — `./build.sh` builds, runs tests
 ## License
 
 [MIT](LICENSE)
-

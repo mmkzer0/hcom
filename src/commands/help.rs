@@ -563,9 +563,10 @@ const UPDATE_HELP: &[HelpEntry] = &[
         "",
         "Detects install method and runs the right update command:",
     ),
+    ("", "  brew install    → brew upgrade hcom"),
     ("", "  uv tool install → uv tool upgrade hcom"),
     ("", "  pip install     → pip install -U hcom"),
-    ("", "  curl installer  → re-run install.sh"),
+    ("", "  curl installer  → re-run hcom-installer.sh"),
     ("", "  dev build       → use ./build.sh manually"),
 ];
 

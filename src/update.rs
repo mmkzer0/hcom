@@ -166,7 +166,7 @@ fn get_update_cmd() -> &'static str {
     let exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(_) => {
-            return "curl -fsSL https://raw.githubusercontent.com/aannoo/hcom/main/install.sh | sh";
+            return "curl -fsSL https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.sh | sh";
         }
     };
 
@@ -182,6 +182,11 @@ fn get_update_cmd() -> &'static str {
         return "./build.sh";
     }
 
+    // Homebrew install (Cellar path on both Apple Silicon and Intel)
+    if path_str.contains("/Cellar/") {
+        return "brew upgrade hcom";
+    }
+
     // uv tool install
     if path_str.contains("/uv/") || path_str.contains("/.local/share/uv/") {
         return "uv tool upgrade hcom";
@@ -193,7 +198,7 @@ fn get_update_cmd() -> &'static str {
     }
 
     // Default: curl installer
-    "curl -fsSL https://raw.githubusercontent.com/aannoo/hcom/main/install.sh | sh"
+    "curl -fsSL https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.sh | sh"
 }
 
 /// Check for updates (once daily cached). Returns (latest_version, update_cmd) or None.

@@ -1,0 +1,15 @@
+- name: Set up Android SDK
+  if: ${{ contains(matrix.targets, 'aarch64-linux-android') }}
+  uses: android-actions/setup-android@v3
+- name: Install Android NDK
+  if: ${{ contains(matrix.targets, 'aarch64-linux-android') }}
+  run: yes | sdkmanager "ndk;25.2.9519653" > /dev/null
+- name: Configure Android target
+  if: ${{ contains(matrix.targets, 'aarch64-linux-android') }}
+  shell: bash
+  run: |
+    rustup target add aarch64-linux-android
+    NDK_BIN="$ANDROID_HOME/ndk/25.2.9519653/toolchains/llvm/prebuilt/linux-x86_64/bin"
+    echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$NDK_BIN/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
+    echo "CC_aarch64_linux_android=$NDK_BIN/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
+    echo "AR_aarch64_linux_android=$NDK_BIN/llvm-ar" >> "$GITHUB_ENV"
