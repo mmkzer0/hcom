@@ -1,11 +1,10 @@
 //! Auto-update checker — checks latest release via git ls-remote once daily.
 //! Uses git ls-remote instead of the GitHub REST API to avoid rate limits.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::paths::{FLAGS_DIR, atomic_write, hcom_path};
 use std::fs;
-use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 const CHECK_INTERVAL: Duration = Duration::from_secs(86400); // 24 hours
@@ -193,13 +192,63 @@ fn get_update_cmd() -> &'static str {
         return "uv tool upgrade hcom";
     }
 
-    // pip install (venv or site-packages)
-    if path_str.contains("/site-packages/") || path_str.contains("/venv/") {
+    // pip install inside a venv or directly in site-packages/dist-packages
+    if path_str.contains("/site-packages/")
+        || path_str.contains("/dist-packages/")
+        || path_str.contains("/venv/")
+    {
+        return "pip install -U hcom";
+    }
+
+    // pip install --user with maturin `bindings = "bin"` puts the binary in
+    // ~/.local/bin, so the executable path alone doesn't reveal pip ownership.
+    if is_user_site_pip_install(&resolved) {
         return "pip install -U hcom";
     }
 
     // Default: curl installer
     "curl -fsSL https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.sh | sh"
+}
+
+fn is_user_site_pip_install(exe: &Path) -> bool {
+    let home = match std::env::var_os("HOME") {
+        Some(home) => PathBuf::from(home),
+        None => return false,
+    };
+
+    let local_bin = home.join(".local/bin");
+    if !exe.starts_with(&local_bin) {
+        return false;
+    }
+
+    let local_lib = home.join(".local/lib");
+    let Ok(entries) = fs::read_dir(local_lib) else {
+        return false;
+    };
+
+    for entry in entries.flatten() {
+        let py_dir = entry.path();
+        if !py_dir.is_dir() {
+            continue;
+        }
+
+        for pkg_dir_name in ["site-packages", "dist-packages"] {
+            let pkg_dir = py_dir.join(pkg_dir_name);
+            let Ok(pkg_entries) = fs::read_dir(pkg_dir) else {
+                continue;
+            };
+
+            if pkg_entries.flatten().any(|pkg| {
+                pkg.file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with("hcom-") && name.ends_with(".dist-info"))
+            }) {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 /// Check for updates (once daily cached). Returns (latest_version, update_cmd) or None.
@@ -274,5 +323,47 @@ mod tests {
     fn test_get_update_cmd_default() {
         // In test context, binary is in target/debug, which contains /target/
         assert_eq!(get_update_cmd(), "./build.sh");
+    }
+
+    #[test]
+    fn test_user_site_pip_detection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let exe = home.join(".local/bin/hcom");
+        let dist_info = home.join(".local/lib/python3.13/site-packages/hcom-0.7.8.dist-info");
+
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&dist_info).unwrap();
+        std::fs::write(&exe, b"binary").unwrap();
+
+        let old_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", home);
+        }
+        assert!(is_user_site_pip_install(&exe));
+        match old_home {
+            Some(val) => unsafe { std::env::set_var("HOME", val) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    #[test]
+    fn test_user_site_pip_detection_ignores_plain_local_bin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let exe = home.join(".local/bin/hcom");
+
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, b"binary").unwrap();
+
+        let old_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", home);
+        }
+        assert!(!is_user_site_pip_install(&exe));
+        match old_home {
+            Some(val) => unsafe { std::env::set_var("HOME", val) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
     }
 }
