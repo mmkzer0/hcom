@@ -312,7 +312,7 @@ pub static TERMINAL_PRESETS: LazyLock<Vec<(&'static str, TerminalPreset)>> = Laz
                 Some("kitten"),
                 Some("kitty"),
                 "kitten @ launch --type=tab --env HCOM_PROCESS_ID={process_id} -- bash {script}",
-                Some("kitten @ close-tab --match id:{pane_id}"),
+                Some("kitten @ close-window --match id:{pane_id}"),
                 None,
                 DL,
             ),
@@ -377,5 +377,14 @@ mod tests {
         assert!(preset.close.is_some());
 
         assert!(get_terminal_preset("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_kitty_tab_close_matches_window_id() {
+        let preset = get_terminal_preset("kitty-tab").unwrap();
+        assert_eq!(
+            preset.close,
+            Some("kitten @ close-window --match id:{pane_id}")
+        );
     }
 }

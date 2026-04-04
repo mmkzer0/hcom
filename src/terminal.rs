@@ -285,6 +285,93 @@ pub fn find_kitty_socket() -> String {
     String::new()
 }
 
+fn resolve_kitty_remote_socket(kitty_socket: &str) -> String {
+    if !kitty_socket.is_empty() {
+        return kitty_socket.to_string();
+    }
+    std::env::var("KITTY_LISTEN_ON")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(find_kitty_socket)
+}
+
+fn normalize_terminal_mode_for_launch(
+    mut terminal_mode: String,
+    opens_new_window: bool,
+    run_here: bool,
+) -> (String, String) {
+    let mut kitty_socket = String::new();
+
+    if opens_new_window {
+        if terminal_mode == "default" {
+            if let Some(detected) = detect_terminal_from_env() {
+                terminal_mode = detected;
+            }
+        }
+        if terminal_mode == "kitty" {
+            if std::env::var("KITTY_WINDOW_ID")
+                .ok()
+                .filter(|v| !v.is_empty())
+                .is_some()
+            {
+                // Inside kitty — use split, but still need socket for --to injection
+                kitty_socket = resolve_kitty_remote_socket(&kitty_socket);
+                terminal_mode = "kitty-split".to_string();
+            } else {
+                kitty_socket = find_kitty_socket();
+                terminal_mode = if kitty_socket.is_empty() {
+                    "kitty-window".to_string()
+                } else {
+                    "kitty-tab".to_string()
+                };
+            }
+        } else if terminal_mode == "wezterm" {
+            if std::env::var("WEZTERM_PANE")
+                .ok()
+                .filter(|v| !v.is_empty())
+                .is_some()
+            {
+                terminal_mode = "wezterm-split".to_string();
+            } else if wezterm_reachable() {
+                terminal_mode = "wezterm-tab".to_string();
+            } else {
+                terminal_mode = "wezterm-window".to_string();
+            }
+        }
+
+        if terminal_mode == "kitty-tab" || terminal_mode == "kitty-split" {
+            kitty_socket = resolve_kitty_remote_socket(&kitty_socket);
+        }
+    } else if run_here {
+        if let Some(detected) = detect_terminal_from_env() {
+            terminal_mode = detected;
+        } else if terminal_mode == "here" {
+            terminal_mode = "default".to_string();
+        }
+    }
+
+    (terminal_mode, kitty_socket)
+}
+
+pub fn resolve_terminal_mode_for_tips(
+    terminal: Option<&str>,
+    config_terminal: &str,
+    background: bool,
+    run_here: bool,
+) -> (String, bool) {
+    let explicit_terminal = terminal
+        .filter(|t| !t.is_empty())
+        .or_else(|| {
+            (config_terminal != "default" && !config_terminal.is_empty()).then_some(config_terminal)
+        });
+
+    let requested = explicit_terminal.unwrap_or("default").to_string();
+    let (resolved, _) =
+        normalize_terminal_mode_for_launch(requested, !background && !run_here, run_here);
+
+    (resolved.clone(), explicit_terminal.is_none() && resolved != "default")
+}
+
 /// Check if a wezterm mux server is reachable.
 pub fn wezterm_reachable() -> bool {
     Command::new("wezterm")
@@ -933,58 +1020,13 @@ pub fn launch_terminal(
     let opens_new_window = !background && !run_here;
 
     // Resolve smart terminal shortcuts
-    let mut kitty_socket = String::new();
+    let (terminal_mode_resolved, kitty_socket) =
+        normalize_terminal_mode_for_launch(terminal_mode, opens_new_window, run_here);
+    terminal_mode = terminal_mode_resolved;
+
     let mut final_env = config_and_instance_env;
-
-    if opens_new_window {
-        if terminal_mode == "default" {
-            if let Some(detected) = detect_terminal_from_env() {
-                terminal_mode = detected;
-            }
-        }
-        if terminal_mode == "kitty" {
-            if std::env::var("KITTY_WINDOW_ID")
-                .ok()
-                .filter(|v| !v.is_empty())
-                .is_some()
-            {
-                // Inside kitty — use split, but still need socket for --to injection
-                kitty_socket = std::env::var("KITTY_LISTEN_ON")
-                    .ok()
-                    .filter(|v| !v.is_empty())
-                    .unwrap_or_else(find_kitty_socket);
-                terminal_mode = "kitty-split".to_string();
-            } else {
-                kitty_socket = find_kitty_socket();
-                terminal_mode = if kitty_socket.is_empty() {
-                    "kitty-window".to_string()
-                } else {
-                    "kitty-tab".to_string()
-                };
-            }
-        } else if terminal_mode == "wezterm" {
-            if std::env::var("WEZTERM_PANE")
-                .ok()
-                .filter(|v| !v.is_empty())
-                .is_some()
-            {
-                terminal_mode = "wezterm-split".to_string();
-            } else if wezterm_reachable() {
-                terminal_mode = "wezterm-tab".to_string();
-            } else {
-                terminal_mode = "wezterm-window".to_string();
-            }
-        }
-
-        if !kitty_socket.is_empty() {
-            final_env.insert("KITTY_LISTEN_ON".to_string(), kitty_socket.clone());
-        }
-    } else if run_here {
-        if let Some(detected) = detect_terminal_from_env() {
-            terminal_mode = detected;
-        } else if terminal_mode == "here" {
-            terminal_mode = "default".to_string();
-        }
+    if opens_new_window && !kitty_socket.is_empty() {
+        final_env.insert("KITTY_LISTEN_ON".to_string(), kitty_socket.clone());
     }
 
     if terminal_mode != "default" && terminal_mode != "print" {
@@ -1374,6 +1416,19 @@ pub fn resolve_terminal_info(
 
     if let Some(launch_context_json) = launch_context_json.filter(|s| !s.is_empty()) {
         if let Ok(lc) = serde_json::from_str::<serde_json::Value>(launch_context_json) {
+            if info.preset_name.is_empty() {
+                info.preset_name = lc
+                    .get("terminal_preset_effective")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| {
+                        lc.get("terminal_preset")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                    })
+                    .unwrap_or("")
+                    .to_string();
+            }
             info.pane_id = lc
                 .get("pane_id")
                 .and_then(|v| v.as_str())
@@ -1401,7 +1456,9 @@ pub fn resolve_terminal_info(
         }
     }
 
-    // Infer preset when pane_id captured but preset column isn't populated.
+    // Legacy kitty launches may have pane/socket metadata but no persisted preset.
+    // Both kitty-tab and kitty-split now close via close-window on the captured ID,
+    // so treating these old records as kitty-split is sufficient for cleanup.
     if info.preset_name.is_empty() && !info.pane_id.is_empty() && !info.kitty_listen_on.is_empty() {
         info.preset_name = "kitty-split".to_string();
     }
@@ -1512,6 +1569,87 @@ mod tests {
         let result = detect_terminal_from_env();
         // Just verify it returns an Option - value depends on test environment
         let _ = result;
+    }
+
+    #[test]
+    fn test_normalize_terminal_mode_for_launch_resolves_socket_for_auto_detected_kitty() {
+        let saved_window = std::env::var("KITTY_WINDOW_ID").ok();
+        let saved_listen = std::env::var("KITTY_LISTEN_ON").ok();
+        unsafe {
+            std::env::set_var("KITTY_WINDOW_ID", "window-1");
+            std::env::set_var("KITTY_LISTEN_ON", "unix:/tmp/kitty-test");
+        }
+
+        let (mode, socket) =
+            normalize_terminal_mode_for_launch("default".to_string(), true, false);
+
+        assert_eq!(mode, "kitty-split");
+        assert_eq!(socket, "unix:/tmp/kitty-test");
+
+        unsafe {
+            if let Some(value) = saved_window {
+                std::env::set_var("KITTY_WINDOW_ID", value);
+            } else {
+                std::env::remove_var("KITTY_WINDOW_ID");
+            }
+            if let Some(value) = saved_listen {
+                std::env::set_var("KITTY_LISTEN_ON", value);
+            } else {
+                std::env::remove_var("KITTY_LISTEN_ON");
+            }
+        }
+    }
+
+    #[test]
+    fn test_resolve_terminal_mode_for_tips_uses_normalized_auto_detected_mode() {
+        let saved_window = std::env::var("KITTY_WINDOW_ID").ok();
+        let saved_listen = std::env::var("KITTY_LISTEN_ON").ok();
+        unsafe {
+            std::env::set_var("KITTY_WINDOW_ID", "window-1");
+            std::env::set_var("KITTY_LISTEN_ON", "unix:/tmp/kitty-test");
+        }
+
+        let (mode, auto) = resolve_terminal_mode_for_tips(None, "default", false, false);
+
+        assert_eq!(mode, "kitty-split");
+        assert!(auto);
+
+        unsafe {
+            if let Some(value) = saved_window {
+                std::env::set_var("KITTY_WINDOW_ID", value);
+            } else {
+                std::env::remove_var("KITTY_WINDOW_ID");
+            }
+            if let Some(value) = saved_listen {
+                std::env::set_var("KITTY_LISTEN_ON", value);
+            } else {
+                std::env::remove_var("KITTY_LISTEN_ON");
+            }
+        }
+    }
+
+    #[test]
+    fn test_resolve_terminal_info_uses_launch_context_preset_when_column_missing() {
+        let info = resolve_terminal_info(
+            None,
+            Some(
+                r#"{"terminal_preset_effective":"kitty-tab","pane_id":"pane-1","kitty_listen_on":"unix:/tmp/kitty"}"#,
+            ),
+        );
+        assert_eq!(info.preset_name, "kitty-tab");
+        assert_eq!(info.pane_id, "pane-1");
+        assert_eq!(info.kitty_listen_on, "unix:/tmp/kitty");
+    }
+
+    #[test]
+    fn test_resolve_terminal_info_falls_back_for_legacy_kitty_metadata() {
+        let info = resolve_terminal_info(
+            None,
+            Some(r#"{"pane_id":"pane-1","kitty_listen_on":"unix:/tmp/kitty"}"#),
+        );
+        assert_eq!(info.preset_name, "kitty-split");
+        assert_eq!(info.pane_id, "pane-1");
+        assert_eq!(info.kitty_listen_on, "unix:/tmp/kitty");
     }
 
     #[test]

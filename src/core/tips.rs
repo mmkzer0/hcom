@@ -108,7 +108,9 @@ pub fn print_launch_tips(db: &HcomDb, ctx: LaunchTipsContext<'_>) {
 
     // Terminal-mode awareness — built-in presets with close support
     let has_close = ctx.terminal_mode == "kitty"
+        || ctx.terminal_mode.starts_with("kitty-")
         || ctx.terminal_mode == "wezterm"
+        || ctx.terminal_mode.starts_with("wezterm-")
         || ctx.terminal_mode.starts_with("tmux")
         || {
             // Check user-defined presets in config.toml for close command

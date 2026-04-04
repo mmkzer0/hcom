@@ -148,20 +148,12 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
         .ok()
         .flatten()
         .is_some();
-    let detected_terminal;
-    let terminal_auto_detected;
-    let terminal_mode = if let Some(t) = terminal_for_tips.as_deref() {
-        terminal_auto_detected = false;
-        t
-    } else if hcom_config.terminal != "default" && !hcom_config.terminal.is_empty() {
-        terminal_auto_detected = false;
-        &hcom_config.terminal
-    } else {
-        detected_terminal =
-            crate::terminal::detect_terminal_from_env().unwrap_or_else(|| "default".to_string());
-        terminal_auto_detected = detected_terminal != "default";
-        &detected_terminal
-    };
+    let (terminal_mode, terminal_auto_detected) = crate::terminal::resolve_terminal_mode_for_tips(
+        terminal_for_tips.as_deref(),
+        &hcom_config.terminal,
+        background,
+        hcom_flags.run_here.unwrap_or(false),
+    );
     crate::core::tips::print_launch_tips(
         &db,
         crate::core::tips::LaunchTipsContext {
@@ -170,7 +162,7 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
             launcher_name: Some(launcher_name_ref),
             launcher_participating,
             background,
-            terminal_mode,
+            terminal_mode: &terminal_mode,
             terminal_auto_detected,
         },
     );

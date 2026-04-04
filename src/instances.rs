@@ -1023,6 +1023,17 @@ pub fn persist_terminal_launch_context(
     if let Some(pid) = process_id.filter(|v| !v.is_empty()) {
         ctx.insert("process_id".into(), serde_json::json!(pid));
     }
+    if !effective_preset.is_empty() {
+        ctx.insert(
+            "terminal_preset_effective".into(),
+            serde_json::json!(effective_preset),
+        );
+        // Legacy compatibility for older readers and migration logic.
+        ctx.insert("terminal_preset".into(), serde_json::json!(effective_preset));
+    }
+    if let Some(requested) = requested_preset.filter(|v| !v.is_empty() && *v != "default") {
+        ctx.insert("terminal_preset_requested".into(), serde_json::json!(requested));
+    }
 
     let mut updates = serde_json::Map::new();
     updates.insert(
@@ -2276,6 +2287,45 @@ mod tests {
             stored.status_detail,
             "process exited before startup completed (exit code 1)"
         );
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_persist_terminal_launch_context_stores_presets_in_launch_context() {
+        let (db, path) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, created_at) VALUES (?1, ?2, ?3)",
+                rusqlite::params!["luna", "codex", 1.0f64],
+            )
+            .unwrap();
+
+        persist_terminal_launch_context(
+            &db,
+            "luna",
+            Some("kitty"),
+            "kitty-tab",
+            Some("proc-1"),
+        );
+
+        let row = db.get_instance_full("luna").unwrap().unwrap();
+        let ctx: serde_json::Value =
+            serde_json::from_str(row.launch_context.as_deref().unwrap_or("{}")).unwrap();
+
+        assert_eq!(
+            ctx.get("terminal_preset_effective").and_then(|v| v.as_str()),
+            Some("kitty-tab")
+        );
+        assert_eq!(
+            ctx.get("terminal_preset").and_then(|v| v.as_str()),
+            Some("kitty-tab")
+        );
+        assert_eq!(
+            ctx.get("terminal_preset_requested").and_then(|v| v.as_str()),
+            Some("kitty")
+        );
+        assert_eq!(ctx.get("process_id").and_then(|v| v.as_str()), Some("proc-1"));
+
         cleanup(path);
     }
 
