@@ -555,7 +555,7 @@ fn cmd_events_sub(db: &HcomDb, args: &EventsSubArgs, caller_name: Option<&str>) 
              \x20 --status VAL                      listening | active | blocked\n\
              \x20 --context PATTERN                 tool:Bash | deliver:X (supports * wildcard)\n\
              \x20 --action VAL                      created | started | ready | stopped | batch_launched\n\
-             \x20 --cmd PATTERN                     Shell command (contains, ^prefix, $suffix, =exact, *glob)\n\
+             \x20 --cmd PATTERN                     Shell command (contains, ^prefix, =exact)\n\
              \x20 --file PATH                       File write (*.py for glob, file.py for contains)\n\
              \x20 --collision                        Two agents edit same file within 30s\n\
              \x20 --from NAME                       Sender\n\

@@ -40,7 +40,7 @@ const fn p(
 const DL: &[&str] = &["Darwin", "Linux"];
 const DLW: &[&str] = &["Darwin", "Linux", "Windows"];
 
-/// All 24 terminal presets.
+/// All 26 terminal presets.
 pub static TERMINAL_PRESETS: LazyLock<Vec<(&'static str, TerminalPreset)>> = LazyLock::new(|| {
     vec![
         // macOS native

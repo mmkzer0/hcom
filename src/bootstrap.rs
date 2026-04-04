@@ -45,7 +45,7 @@ You MUST use `hcom <cmd+flags> --name {instance_name}` for all hcom commands:
 - See who's active: list [-v] [--json] [--names] [--format '{{name}} {{status}}']
 - Read another's conversation: transcript [name] [--range N-M] [--last N] [--full]
 - View events: events [--last N] [--all] [--sql EXPR] [filters]
-  Filters (same flag=OR, different=AND): --agent NAME | --type message|status|life | --status listening|active|blocked | --cmd PATTERN (contains, ^prefix, $suffix, =exact, *glob) | --file PATH (*.py for glob, file.py for contains)
+  Filters (same flag=OR, different=AND): --agent NAME | --type message|status|life | --status listening|active|blocked | --cmd PATTERN (contains, ^prefix, =exact) | --file PATH (*.py for glob, file.py for contains)
   Event-based notifications, watch agents, subscribe, react: events sub [filters] | --help
 - Handoff context: bundle prepare
 - Spawn agents: [num] <claude|gemini|codex|opencode> [--tag labelOrGroup] [--terminal tmux|kitty|wezterm|etc]

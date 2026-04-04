@@ -321,6 +321,7 @@ impl HcomConfig {
             ("claude_args", &self.claude_args),
             ("gemini_args", &self.gemini_args),
             ("codex_args", &self.codex_args),
+            ("opencode_args", &self.opencode_args),
         ] {
             if !value.is_empty() {
                 if let Err(e) = shell_words::split(value) {

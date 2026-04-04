@@ -23,7 +23,7 @@ const FILTER_HELP: &[HelpEntry] = &[
     ),
     (
         "  --cmd PATTERN",
-        "Shell command (contains, ^prefix, $suffix, =exact, *glob)",
+        "Shell command (contains, ^prefix, =exact)",
     ),
     (
         "  --file PATH",
@@ -102,7 +102,7 @@ const EVENTS_HELP_2: &[HelpEntry] = &[
         "  status_context",
         "tool:X, deliver:X, approval, prompt, exit:X",
     ),
-    ("  life_action", "created, ready, stopped, batch_launched"),
+    ("  life_action", "created, started, ready, stopped, batch_launched"),
     ("", ""),
     (
         "",
@@ -172,7 +172,6 @@ const LIST_HELP: &[HelpEntry] = &[
 ];
 
 const SEND_HELP: &[HelpEntry] = &[
-    ("Usage:", ""),
     ("  send @name -- message text", "Direct message"),
     ("  send @name1 @name2 -- message", "Multiple targets"),
     ("  send -- message text", "Broadcast to all"),
