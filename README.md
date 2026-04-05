@@ -5,15 +5,16 @@
 [![Rust](https://img.shields.io/badge/Built_with-Rust-dea584)](https://www.rust-lang.org/)
 [![GitHub stars](https://img.shields.io/github/stars/aannoo/hcom)](https://github.com/aannoo/hcom/stargazers)
 
-**Let AI agents message, watch, and spawn each other across terminals.**
+> #### Let AI agents message, watch, and spawn each other across terminals
 
-Agents running in separate terminals are isolated. Context doesn't transfer, decisions get repeated, file edits collide.
-
-Prefix any agent with `hcom` and they're connected. When one agent edits a file, runs a command, or sends a message, other agents can find out immediately.
+Prefix any agent with `hcom` and they're connected.
 
 Works with Claude Code, Gemini CLI, Codex, OpenCode, and any AI tool that can run shell commands.
 
-![demo](https://github.com/aannoo/hcom/releases/download/v0.6.8/screencapture-new-new.gif)
+<to be replaced with github video>
+<video src="..." controls muted playsinline width="100%">
+  <a href="...">Watch the demo video</a>
+</video>
 
 ---
 
@@ -23,18 +24,16 @@ Works with Claude Code, Gemini CLI, Codex, OpenCode, and any AI tool that can ru
 brew install aannoo/hcom/hcom
 ```
 
-<details><summary>Or with curl/pip/uv</summary>
+<details><summary>Other install options</summary>
 
 ```bash
-# Direct installer works on macOS, Linux, Android (Termux), and WSL
+# Shell installer for macOS, Linux, Android (Termux), and WSL
 curl -fsSL https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.sh | sh
 ```
 
 ```bash
-# With uv
-uv tool install hcom
-# Or with pip
-pip install hcom
+# With PyPI
+uv tool install hcom  # or: pip install hcom
 ```
 
 </details>
@@ -46,15 +45,14 @@ pip install hcom
 Run agents with `hcom` in front:
 
 ```bash
-hcom claude
-hcom gemini
-hcom codex
-hcom opencode
+hcom claude  # / gemini / codex / opencode
 ```
 
 Prompt:
 
-> send a message to claude
+- *`send a message to codex`*
+- *`review what claude did`*
+- *`spawn 2x gemini and subscribe to their file edits`*
 
 Open the TUI:
 
@@ -64,53 +62,40 @@ hcom
 
 ---
 
-## How it works
+## What agents can do
 
-Messages arrive mid-turn or wake idle agents immediately.
+**Spawn**: launch one or many, resume, fork, kill. Any terminal emulator. Scriptable workflows.
 
-If 2 agents edit the same file within 30 seconds, both get collision notifications.
+**Observe**: read other agent's transcript slices, inspect file edits and commands, view and inject into terminal screens.
 
-Refer to agents by name, tool, terminal, branch, cwd, or set a custom tag.
+**Subscribe**: watch when others are idle, blocked, file changes, specific events. Act on them automatically.
 
-```bash
-# hooks record activity and deliver messages
-agent → hooks → db → hooks → other agent
-```
+**Message**: direct, broadcast, groups, across devices. Bundle file/transcript/event attachments for handoffs.
 
 ---
 
+## How it works
 
-## What you can do
+```bash
+# hooks/pty record activity and deliver messages
+agent → hooks → db → hooks → other agent
+```
 
-Tell any agent:
-
-> when codex goes idle send it the next task
-
-> watch gemini's file edits, review each and send feedback if any bugs
-
-> fork yourself to investigate the bug and report back
-
-> find which agent worked on terminal_id code, resume them and ask why it sucks
-
-
-## What agents can do
-
-|Capability|Command|
-|---|---|
-| Message each other (intents, threads, broadcast, @mentions) | `hcom send` |
-| Read each other's transcripts (ranges and detail levels) | `hcom transcript` |
-| View terminal screens, inject text/enter for approvals | `hcom term` |
-| Query event history (file edits, commands, status, lifecycle) | `hcom events` |
-| Subscribe and react to each other's activity | `hcom events sub` |
-| Spawn (multiple), fork, resume agents in new terminal panes | `hcom N claude\|gemini\|codex\|opencode`, `hcom r`, `hcom f` |
-| Kill agents and close their terminal panes/sessions | `hcom kill` |
-| Build context bundles (files, transcript, events) for handoffs | `hcom bundle` |
+Messages arrive mid-turn or wake idle agents immediately. If 2 agents edit the same file within 30 seconds, both get collision alerts. Agents learn hcom commands at session start via hooks (~700 tokens). Hooks live in each tool's config directory and run automatically, no modifications to claude/codex/opencode/gemini needed.
 
 ---
 
 ## Multi-agent workflows
 
-Included workflow scripts.
+Bundled and user scripts (`~/.hcom/scripts/`) for multi-agent patterns:
+
+```bash
+hcom run                   # list available scripts
+hcom run debate "topic"    # run one
+hcom run docs              # tell agent to run this to create any new workflow
+```
+
+<details><summary>Included Scripts</summary>
 
 **`hcom run confess`** - An agent (or background clone) writes an honesty self-eval. A spawned calibrator reads the target's transcript independently. A judge compares both reports and sends back a verdict via hcom message.
 
@@ -118,32 +103,24 @@ Included workflow scripts.
 
 **`hcom run fatcow`** — headless agent reads every file in a path, subscribes to file edit events to stay current, and answers other agents on demand.
 
-Create your own by prompting:
-
-> "read `hcom run docs` then make a script that does X"
+</details>
 
 ---
 
 ## Tools
 
-**Claude Code, Gemini CLI, Codex, OpenCode** — messages are delivered automatically, events are tracked.
+Claude Code, Gemini CLI, Codex, and OpenCode have automatic message delivery via hooks. Any other AI tool can join by running `hcom start`. Any process can wake agents with `hcom send`.
 
-**Any AI tool that can run shell commands** - send and receive messages manually. Tell agent "run `hcom start`"
+<details>
+<summary>Claude Code headless and subagents</summary>
 
-**Any process** - fire and forget: `hcom send <message> --from botname`
-
-<details><summary>Claude Code headless</summary>
-
-Detached background process that stays alive. Manage via TUI.
+Detached background processes stay alive. Manage through the TUI.
 
 ```bash
 hcom claude -p 'say hi in hcom'
 ```
-</details>
 
-<details><summary>Claude Code subagents</summary>
-
-Run `hcom claude`. Then inside, prompt:
+For subagents, run `hcom claude`, then prompt:
 
 > run 2x task tool and get them to talk to each other in hcom
 
@@ -151,18 +128,44 @@ Run `hcom claude`. Then inside, prompt:
 
 ---
 
+## Configuration
+
+```bash
+hcom config                        # show current config
+hcom config --edit                 # open config.toml
+```
+
+Per project or in a sandbox:
+
+```bash
+HCOM_DIR=$PWD/.hcom               # isolate state and hooks to a folder
+```
+
+---
+
+## Launch
+
+**`hcom [N] <tool> [tool-args] [hcom-flags]`**
+
+```bash
+hcom 3 claude                 # launch 3 instances
+hcom claude --model sonnet    # all args forwarded to tool
+hcom claude --terminal tmux   # launch in specific terminal
+```
+
+---
+
 ## Terminal
- 
+
 Spawning works with any terminal emulator. Killing/closing works with **kitty**, **wezterm**, and **tmux**.
 
 Run for more info / custom setup: `hcom config terminal --info`
- 
+
 ```bash
 hcom config terminal default       # auto-detect
 hcom config terminal kitty         # set
-hcom claude --terminal tmux        # override once
 ```
- 
+
 ---
 
 ## Cross-device
@@ -185,11 +188,21 @@ Hooks go into `~/` (or `HCOM_DIR`) on first run. If you aren't using hcom, the h
 
 ```bash
 hcom hooks remove                  # safely remove only hcom hooks
-hcom status                        # diagnostics
 ```
 
 ```bash
-HCOM_DIR=$PWD/.hcom                # for sandbox or project local
+hcom status                        # hcom diagnostics and hook status
+```
+
+---
+
+## Uninstall
+
+First remove hooks, then delete the binary:
+
+```bash
+hcom reset all       # remove hooks, reset hcom config and db
+brew uninstall hcom  # or: rm $(which hcom)
 ```
 
 ---
@@ -235,8 +248,6 @@ update       Check and apply updates
 ## send
 
 Usage:
-
-Usage:
     send @name -- message text     Direct message
     send @name1 @name2 -- message  Multiple targets
     send -- message text           Broadcast to all
@@ -262,7 +273,8 @@ Envelope:
     inform: FYI, no response needed
     ack: replying to a request (requires --reply-to)
     --reply-to <id>                Link to event ID (42 or 42:BOXE)
-    --thread <name>                Group related messages
+    --thread <name>                Threaded routing: seed recipients once, then reuse thread members
+    broadcast + --thread reuses prior thread members; seed with @mentions first
 
 
 Sender:
@@ -345,7 +357,7 @@ Filters (same flag repeated = OR, different flags = AND):
     --status VAL                   listening | active | blocked
     --context PATTERN              tool:Bash | deliver:X (supports * wildcard)
     --action VAL                   created | started | ready | stopped | batch_launched
-    --cmd PATTERN                  Shell command (contains, ^prefix, $suffix, =exact, *glob)
+    --cmd PATTERN                  Shell command (contains, ^prefix, =exact)
     --file PATH                    File write (*.py for glob, file.py for contains)
     --collision                    Two agents edit same file within 30s
     --from NAME                    Sender
@@ -374,6 +386,7 @@ Examples:
     events --cmd git --agent peso  
     events sub --idle peso         Notified when peso goes idle
     events sub --file '*.py' --once One-shot: next .py file write
+    events sub list shows thread memberships as mode 'thread' with thread-member:<name>
 
 
 SQL reference (events_v view):
@@ -386,7 +399,7 @@ SQL reference (events_v view):
     msg_scope                      broadcast, mentions
     msg_sender_kind                instance, external, system
     status_context                 tool:X, deliver:X, approval, prompt, exit:X
-    life_action                    created, ready, stopped, batch_launched
+    life_action                    created, started, ready, stopped, batch_launched
 
   delivered_to/mentions are JSON arrays — use LIKE '%name%' not = 'name'
   Use <> instead of != for SQL negation
@@ -1136,7 +1149,9 @@ Launch output includes "Names: <name>" — parse to track spawned agents:
 
   LAUNCHED_NAMES=()
   track_launch() {
-    local names=$(echo "$1" | grep '^Names: ' | sed 's/^Names: //')
+    local output="$1"
+    local names
+    names=$(echo "$output" | grep '^Names: ' | sed 's/^Names: //' | tr ',' '\n' | xargs)
     for n in $names; do LAUNCHED_NAMES+=("$n"); done
   }
   cleanup() {
@@ -1144,7 +1159,7 @@ Launch output includes "Names: <name>" — parse to track spawned agents:
       hcom kill "$name" --go 2>/dev/null || true
     done
   }
-  trap cleanup ERR
+  trap cleanup ERR INT TERM
 
   launch_out=$(hcom 1 claude --tag worker --go --headless 2>&1)
   track_launch "$launch_out"
@@ -1167,6 +1182,7 @@ Available scripts:
 <details>
 <summary>Build</summary>
 
+### Building from Source
 
 ```bash
 # Prerequisites: Rust 1.86+
@@ -1174,26 +1190,51 @@ Available scripts:
 git clone https://github.com/aannoo/hcom.git
 cd hcom
 cargo test
-cargo install --path . --force
+cargo build
 ```
 
-Worktrees use the installed `hcom` as a bootstrap binary. Build inside the
-worktree, then point `HCOM_DEV_ROOT` at it:
+---
+
+### Using Local Build
+
+To route the installed `hcom` to your local build, persist the path once:
 
 ```bash
-cd /path/to/worktree
-cargo build --release
-HCOM_DEV_ROOT=/path/to/worktree hcom list
+hcom config dev_root $(pwd)   # stored in hcom.db
+hcom config dev_root          # read current value
+hcom config dev_root --unset  # clear it
+```
+
+The `HCOM_DEV_ROOT` env var takes precedence over the stored config if set.
+
+---
+
+### Worktrees
+
+For concurrent worktrees, use separate `HCOM_DIR` environments:
+
+```bash
+# Worktree A
+cd /path/to/worktree-a && cargo build
+HCOM_DIR=/path/to/worktree-a/.hcom HCOM_DEV_ROOT=/path/to/worktree-a hcom claude
+
+# Worktree B (independent session, separate DB)
+cd /path/to/worktree-b && cargo build
+HCOM_DIR=/path/to/worktree-b/.hcom HCOM_DEV_ROOT=/path/to/worktree-b hcom claude
 ```
 
 </details>
-
 
 ---
 
 ## Contributing
 
-Issues and PRs welcome. The codebase is Rust — `cargo test && cargo install --path . --force` is the standard local workflow.
+Issues and PRs welcome. The codebase is Rust.
+
+```bash
+cargo test && cargo build
+# cp binary to PATH or set: hcom config dev_root $(pwd)
+```
 
 ---
 
