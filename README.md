@@ -11,10 +11,7 @@ Prefix any agent with `hcom` and they're connected.
 
 Works with Claude Code, Gemini CLI, Codex, OpenCode, and any AI tool that can run shell commands.
 
-<to be replaced with github video>
-<video src="..." controls muted playsinline width="100%">
-  <a href="...">Watch the demo video</a>
-</video>
+https://github.com/user-attachments/assets/1ce23ed9-f529-4be0-8124-816aa4c2fd43
 
 ---
 
@@ -50,9 +47,9 @@ hcom claude  # / gemini / codex / opencode
 
 Prompt:
 
-- *`send a message to codex`*
-- *`review what claude did`*
-- *`spawn 2x gemini and subscribe to their file edits`*
+- `send a message to codex`
+- `review what claude did`
+- `spawn 2x gemini and subscribe to their file edits`
 
 Open the TUI:
 
