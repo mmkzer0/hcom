@@ -204,7 +204,14 @@ const SEND_HELP: &[HelpEntry] = &[
     ("", "  inform: FYI, no response needed"),
     ("", "  ack: replying to a request (requires --reply-to)"),
     ("  --reply-to <id>", "Link to event ID (42 or 42:BOXE)"),
-    ("  --thread <name>", "Group related messages"),
+    (
+        "  --thread <name>",
+        "Threaded routing: seed recipients once, then reuse thread members",
+    ),
+    (
+        "",
+        "  broadcast + --thread reuses prior thread members; seed with @mentions first",
+    ),
     ("", ""),
     ("Sender:", ""),
     ("  --from <name>", "External sender identity (alias: -b)"),

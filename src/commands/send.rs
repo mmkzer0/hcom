@@ -85,7 +85,7 @@ pub struct SendArgs {
     #[arg(long)]
     pub reply_to: Option<String>,
 
-    /// Group related messages
+    /// Threaded routing: seed recipients once, then reuse thread members
     #[arg(long)]
     pub thread: Option<String>,
 
