@@ -1,4 +1,4 @@
-name: Post-announce: add compare link
+name: "Post-announce: add compare link"
 
 on:
   workflow_call:
