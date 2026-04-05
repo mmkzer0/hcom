@@ -168,7 +168,7 @@ Debaters: Review this context first."
 fi
 
 # Set trap
-trap cleanup ERR
+trap cleanup ERR INT TERM
 
 bg_flag=""
 [[ "$interactive" == "false" ]] && bg_flag="--headless"
@@ -250,13 +250,13 @@ PROCEDURE:
    hcom send \"@pro- @con- CON: Present your opening argument AGAINST: ${topic}. You can see PRO's argument above.\" --thread ${thread} --intent request
    Wait: hcom events --wait ${timeout} --sql \"msg_thread='${thread}'\"
 
-4. REBUTTALS (${rounds} rounds)
+3. REBUTTALS (${rounds} rounds)
    For each round:
    - Prompt each debater to respond to opponent's latest argument (CC both)
    - Wait for responses
    - Provide brief feedback
 
-5. FINAL JUDGMENT
+4. FINAL JUDGMENT
    hcom send \"@pro- @con- VERDICT: [WINNER or TIE]
 
    PRO strengths: ...
@@ -346,10 +346,10 @@ PROCEDURE:
    Wait for all ${#worker_arr[@]} responses:
    hcom events --wait ${timeout} --sql \"msg_thread='${thread}' AND msg_from IN (${workers_sql})\"
 
-4. REBUTTALS (${rounds} rounds)
+3. REBUTTALS (${rounds} rounds)
    For each round, prompt each debater to respond to opponents.
 
-5. FINAL JUDGMENT
+4. FINAL JUDGMENT
    Announce winner with scores, send to all debaters via --thread ${thread}.
 
 RULES:
@@ -369,7 +369,7 @@ track_launch "$launch_out"
 echo "Judge launched ($tool)"
 
 # Clear trap
-trap - ERR
+trap - ERR INT TERM
 
 echo
 echo "Watch debate:"

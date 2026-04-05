@@ -27,6 +27,7 @@ fn bundled_agent_desc(name: &str) -> &'static str {
     match name {
         "confess" => "3 agents",
         "debate" => "2+ agents",
+        "fatcow" => "1 agent",
         _ => "",
     }
 }
@@ -450,7 +451,9 @@ Launch output includes "Names: <name>" — parse to track spawned agents:
 
   LAUNCHED_NAMES=()
   track_launch() {
-    local names=$(echo "$1" | grep '^Names: ' | sed 's/^Names: //')
+    local output="$1"
+    local names
+    names=$(echo "$output" | grep '^Names: ' | sed 's/^Names: //' | tr ',' '\n' | xargs)
     for n in $names; do LAUNCHED_NAMES+=("$n"); done
   }
   cleanup() {
@@ -458,7 +461,7 @@ Launch output includes "Names: <name>" — parse to track spawned agents:
       hcom kill "$name" --go 2>/dev/null || true
     done
   }
-  trap cleanup ERR
+  trap cleanup ERR INT TERM
 
   launch_out=$(hcom 1 claude --tag worker --go --headless 2>&1)
   track_launch "$launch_out"

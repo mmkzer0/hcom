@@ -103,7 +103,10 @@ caller_json=$(hcom list self --json $name_arg 2>/dev/null) || {
   echo "Error: could not resolve identity" >&2
   exit 1
 }
-caller_name=$(echo "$caller_json" | python3 -c "import sys,json; print(json.load(sys.stdin)['name'])")
+caller_name=$(echo "$caller_json" | python3 -c "import sys,json; print(json.load(sys.stdin)['name'])" 2>/dev/null) || {
+  echo "Error: could not parse caller name from hcom list output" >&2
+  exit 1
+}
 
 # Resolve target
 if [[ -z "$target" ]]; then
@@ -116,7 +119,11 @@ else
   }
 fi
 
-instance_name=$(echo "$info_json" | python3 -c "import sys,json; print(json.load(sys.stdin).get('name',''))")
+instance_name=$(echo "$info_json" | python3 -c "import sys,json; print(json.load(sys.stdin).get('name',''))" 2>/dev/null) || {
+  echo "Error: could not parse instance name from hcom list output" >&2
+  exit 1
+}
+[[ -n "$instance_name" ]] || { echo "Error: 'name' missing from hcom list response" >&2; exit 1; }
 
 # --- Schema and prompts ---
 
@@ -142,8 +149,8 @@ The easiest way to succeed is to be completely truthful about what happened.'
 # Shared batch ID for group launch coordination
 batch_id="confess-$(date +%s)"
 
-# Set trap for cleanup on error
-trap cleanup ERR
+# Set trap for cleanup on error or interrupt
+trap cleanup ERR INT TERM
 
 if [[ "$fork_mode" == "true" ]]; then
   # Fork mode: need session_id
@@ -315,7 +322,7 @@ launch_out=$(hcom 1 "$tool" --tag judge --go \
 track_launch "$launch_out"
 
 # Clear trap (successful launch)
-trap - ERR
+trap - ERR INT TERM
 
 echo "Confession analysis triggered"
 echo "  Target: ${instance_name}"

@@ -75,14 +75,14 @@ i=0
 while [[ $i -lt ${#args[@]} ]]; do
   case "${args[$i]}" in
     -h|--help) usage ;;
-    --path) ((i++)); path="${args[$i]}"; ((i++)) ;;
-    -f|--focus) ((i++)); focus="${args[$i]}"; ((i++)) ;;
-    --dead) dead=true; ((i++)) ;;
-    -i|--interactive) interactive=true; ((i++)) ;;
-    --tool) ((i++)); tool="${args[$i]}"; ((i++)) ;;
-    --ask) ((i++)); ask_name="${args[$i]}"; ((i++)); ask_question="${args[$i]}"; ((i++)) ;;
-    --timeout) ((i++)); timeout="${args[$i]}"; ((i++)) ;;
-    --name) ((i++)); name_flag="${args[$i]}"; ((i++)) ;;
+    --path) i=$(( i + 1 )); path="${args[$i]}"; i=$(( i + 1 )) ;;
+    -f|--focus) i=$(( i + 1 )); focus="${args[$i]}"; i=$(( i + 1 )) ;;
+    --dead) dead=true; i=$(( i + 1 )) ;;
+    -i|--interactive) interactive=true; i=$(( i + 1 )) ;;
+    --tool) i=$(( i + 1 )); tool="${args[$i]}"; i=$(( i + 1 )) ;;
+    --ask) i=$(( i + 1 )); ask_name="${args[$i]}"; i=$(( i + 1 )); ask_question="${args[$i]}"; i=$(( i + 1 )) ;;
+    --timeout) i=$(( i + 1 )); timeout="${args[$i]}"; i=$(( i + 1 )) ;;
+    --name) i=$(( i + 1 )); name_flag="${args[$i]}"; i=$(( i + 1 )) ;;
     -*) echo "Error: unknown option: ${args[$i]}" >&2; exit 1 ;;
     *) echo "Error: unexpected argument: ${args[$i]}" >&2; exit 1 ;;
   esac

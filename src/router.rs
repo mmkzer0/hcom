@@ -626,8 +626,15 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
         return 0;
     }
 
-    // Strip command name from stripped args to get command-specific argv
-    let cmd_argv: Vec<String> = stripped.iter().skip(1).cloned().collect();
+    // Strip command name from stripped args to get command-specific argv.
+    // For "run", re-inject --help so the script itself can handle it.
+    let cmd_argv: Vec<String> = {
+        let mut v: Vec<String> = stripped.iter().skip(1).cloned().collect();
+        if cmd == "run" && help_requested {
+            v.push("--help".to_string());
+        }
+        v
+    };
 
     // "relay daemon" subcommand doesn't need DB or identity context
     if cmd == "relay" && cmd_argv.first().map(|s| s.as_str()) == Some("daemon") {
