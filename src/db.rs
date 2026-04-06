@@ -241,6 +241,10 @@ impl HcomDb {
 
     /// Open DB connection without schema checks (for testing only).
     pub fn open_raw(db_path: &std::path::Path) -> Result<Self> {
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create db directory: {}", parent.display()))?;
+        }
         let conn = Connection::open(db_path)
             .with_context(|| format!("Failed to open database: {}", db_path.display()))?;
 
