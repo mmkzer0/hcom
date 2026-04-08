@@ -214,7 +214,7 @@ brew uninstall hcom  # or: rm $(which hcom)
 <summary>CLI</summary>
 
 ```
-hcom (hook-comms) v0.7.9 - multi-agent communication
+hcom (hook-comms) v0.7.10 - multi-agent communication
 
 Usage:
 hcom                                  TUI dashboard
@@ -387,7 +387,6 @@ Examples:
     events --cmd git --agent peso  
     events sub --idle peso         Notified when peso goes idle
     events sub --file '*.py' --once One-shot: next .py file write
-    events sub list shows thread memberships as mode 'thread' with thread-member:<name>
 
 
 SQL reference (events_v view):
@@ -701,6 +700,7 @@ Usage:
     hcom 3 claude                      Opens 3 new terminal windows
     hcom 3 claude -p "prompt"          3 headless in background
     hcom 1 claude --agent <name>       .claude/agents/<name>.md
+    hcom claude --model sonnet|opus|haiku Use a specific model
 
 hcom Flags:
     --tag <name>                 Group tag (names become tag-*)
@@ -731,6 +731,7 @@ Usage:
     hcom gemini                        Runs in current terminal
     hcom 3 gemini                      Opens 3 new terminal windows
     hcom N gemini --yolo               Flags forwarded to gemini
+    hcom gemini --model gemini-3.1-pro-preview|gemini-2.5-flash Use a specific model
 
 hcom Flags:
     --tag <name>                 Group tag (names become tag-*)
@@ -761,6 +762,7 @@ Usage:
     hcom codex                         Runs in current terminal
     hcom 3 codex                       Opens 3 new terminal windows
     hcom codex --sandbox danger-full-access Flags forwarded to codex
+    hcom codex --model gpt-5.4|gpt-5.4-mini Use a specific model
 
 hcom Flags:
     --tag <name>                 Group tag (names become tag-*)
@@ -790,6 +792,7 @@ Usage:
 
     hcom opencode                      Runs in current terminal
     hcom 3 opencode                    Opens 3 new terminal windows
+    hcom opencode --model anthropic/claude-sonnet-4-6|openai/gpt-5.4 Use a specific model
 
 hcom Flags:
     --tag <name>                 Group tag (names become tag-*)
@@ -1221,6 +1224,7 @@ HCOM_DIR=$(pwd)/.hcom HCOM_DEV_ROOT=$(pwd) hcom claude
 ```
 
 </details>
+
 
 ---
 
