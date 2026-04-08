@@ -10,9 +10,7 @@ use crate::instance_binding;
 use crate::instance_lifecycle as lifecycle;
 use crate::instances;
 use crate::log::{log_error, log_info};
-use crate::messages;
 use crate::shared::ST_LISTENING;
-use crate::shared::constants::MAX_MESSAGES_PER_DELIVERY;
 use crate::shared::context::HcomContext;
 
 use super::common;
@@ -316,22 +314,8 @@ fn handle_read(db: &HcomDb, argv: &[String]) -> (i32, String) {
         if messages.is_empty() {
             return (0, String::new());
         }
-        let deliver = if messages.len() > MAX_MESSAGES_PER_DELIVERY {
-            &messages[..MAX_MESSAGES_PER_DELIVERY]
-        } else {
-            &messages
-        };
-        let get_instance_data = common::make_instance_lookup(db);
-        let hints = common::load_config_hints();
-        let get_config_hints = || hints.clone();
-        let tip_checker = common::make_tip_checker(db);
-        let formatted = messages::format_messages_json(
-            deliver,
-            &name,
-            &get_instance_data,
-            &get_config_hints,
-            Some(&tip_checker),
-        );
+        let deliver = common::limit_delivery_messages(&messages);
+        let formatted = common::format_messages_json_for_instance(db, &deliver, &name);
         return (0, formatted);
     }
 
@@ -981,6 +965,43 @@ mod tests {
         let (code, output) = handle_read(&db, &argv);
         assert_eq!(code, 0);
         assert_eq!(output, "true");
+    }
+
+    #[test]
+    fn test_handle_read_format_does_not_advance_cursor() {
+        let (_dir, db) = test_db();
+        let _ = db.conn().execute(
+            "INSERT INTO instances (name, tool, status, status_context, status_time, created_at, last_event_id) VALUES ('testinst', 'opencode', 'listening', 'start', 0, 0, 0)",
+            [],
+        );
+        let _ = db.conn().execute(
+            "INSERT INTO events (type, timestamp, instance, data) VALUES ('message', '2026-01-01T00:00:00Z', 'luna', '{\"from\":\"luna\",\"text\":\"hello\",\"scope\":\"broadcast\"}')",
+            [],
+        );
+
+        let before: i64 = db
+            .conn()
+            .query_row(
+                "SELECT last_event_id FROM instances WHERE name = 'testinst'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(before, 0);
+
+        let (code, output) = handle_read(&db, &sv(&["--name", "testinst", "--format"]));
+        assert_eq!(code, 0);
+        assert!(output.contains("hello"));
+
+        let after: i64 = db
+            .conn()
+            .query_row(
+                "SELECT last_event_id FROM instances WHERE name = 'testinst'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(after, 0);
     }
 
     // ── Dispatcher (unit tests for routing logic, not full integration) ──

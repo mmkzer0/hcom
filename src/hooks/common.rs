@@ -153,6 +153,107 @@ pub(crate) fn make_tip_checker(db: &HcomDb) -> impl Fn(&str, &str) -> (bool, Box
     }
 }
 
+pub(crate) struct DeliveryBatch {
+    messages: Vec<Value>,
+}
+
+impl DeliveryBatch {
+    pub(crate) fn into_messages(self) -> Vec<Value> {
+        self.messages
+    }
+
+    pub(crate) fn format_model_context(&self, db: &HcomDb, instance_name: &str) -> String {
+        format_messages_json_for_instance(db, &self.messages, instance_name)
+    }
+
+    pub(crate) fn format_user_display(&self, db: &HcomDb, instance_name: &str) -> String {
+        format_hook_messages_for_instance(db, &self.messages, instance_name)
+    }
+}
+
+pub(crate) fn limit_delivery_messages(messages: &[Value]) -> Vec<Value> {
+    if messages.len() > MAX_MESSAGES_PER_DELIVERY {
+        messages[..MAX_MESSAGES_PER_DELIVERY].to_vec()
+    } else {
+        messages.to_vec()
+    }
+}
+
+pub(crate) fn format_messages_json_for_instance(
+    db: &HcomDb,
+    messages: &[Value],
+    instance_name: &str,
+) -> String {
+    let get_instance_data = make_instance_lookup(db);
+    let hints = load_config_hints();
+    let get_config_hints = || hints.clone();
+    let tip_checker = make_tip_checker(db);
+    messages::format_messages_json(
+        messages,
+        instance_name,
+        &get_instance_data,
+        &get_config_hints,
+        Some(&tip_checker),
+    )
+}
+
+pub(crate) fn format_hook_messages_for_instance(
+    db: &HcomDb,
+    messages: &[Value],
+    instance_name: &str,
+) -> String {
+    let get_instance_data = make_instance_lookup(db);
+    let hints = load_config_hints();
+    let get_config_hints = || hints.clone();
+    messages::format_hook_messages(messages, instance_name, &get_instance_data, &get_config_hints, None)
+}
+
+pub(crate) fn prepare_delivery_batch(
+    db: &HcomDb,
+    instance_name: &str,
+    raw_messages: Vec<Message>,
+) -> Option<DeliveryBatch> {
+    if raw_messages.is_empty() {
+        return None;
+    }
+
+    let messages: Vec<Value> = raw_messages.iter().map(message_to_value).collect();
+    let deliver = limit_delivery_messages(&messages);
+
+    let last_id = deliver
+        .last()
+        .and_then(|m| m.get("event_id").and_then(|v| v.as_i64()))
+        .unwrap_or(0);
+
+    let mut updates = serde_json::Map::new();
+    updates.insert("last_event_id".into(), serde_json::json!(last_id));
+    instances::update_instance_position(db, instance_name, &updates);
+
+    let sender = deliver
+        .first()
+        .and_then(|m| m.get("from").and_then(|v| v.as_str()))
+        .unwrap_or("unknown");
+    let sender_display = instances::get_display_name(db, sender);
+    let msg_ts = deliver
+        .last()
+        .and_then(|m| m.get("timestamp").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .to_string();
+
+    instances::set_status(
+        db,
+        instance_name,
+        ST_ACTIVE,
+        &format!("deliver:{}", sender_display),
+        instances::StatusUpdate {
+            msg_ts: &msg_ts,
+            ..Default::default()
+        },
+    );
+
+    Some(DeliveryBatch { messages: deliver })
+}
+
 /// Fetch unread messages, update cursor, set delivery status.
 ///
 /// Returns (delivered_messages, formatted_json). Empty vec and None if no messages.
@@ -172,64 +273,11 @@ fn deliver_raw_messages(
     instance_name: &str,
     raw_messages: Vec<Message>,
 ) -> (Vec<Value>, Option<String>) {
-    if raw_messages.is_empty() {
+    let Some(batch) = prepare_delivery_batch(db, instance_name, raw_messages) else {
         return (vec![], None);
-    }
-
-    let messages: Vec<Value> = raw_messages.iter().map(message_to_value).collect();
-
-    let deliver = if messages.len() > MAX_MESSAGES_PER_DELIVERY {
-        messages[..MAX_MESSAGES_PER_DELIVERY].to_vec()
-    } else {
-        messages
     };
-
-    // Advance cursor to last delivered event ID
-    let last_id = deliver
-        .last()
-        .and_then(|m| m.get("event_id").and_then(|v| v.as_i64()))
-        .unwrap_or(0);
-
-    let mut updates = serde_json::Map::new();
-    updates.insert("last_event_id".into(), serde_json::json!(last_id));
-    instances::update_instance_position(db, instance_name, &updates);
-
-    // Format for hook delivery
-    let get_instance_data = make_instance_lookup(db);
-    let hints = load_config_hints();
-    let get_config_hints = || hints.clone();
-    let tip_checker = make_tip_checker(db);
-    let formatted = messages::format_messages_json(
-        &deliver,
-        instance_name,
-        &get_instance_data,
-        &get_config_hints,
-        Some(&tip_checker),
-    );
-
-    // Update status to active with delivery context
-    let sender = deliver
-        .first()
-        .and_then(|m| m.get("from").and_then(|v| v.as_str()))
-        .unwrap_or("unknown");
-    let display = instances::get_display_name(db, sender);
-    let msg_ts = deliver
-        .last()
-        .and_then(|m| m.get("timestamp").and_then(|v| v.as_str()))
-        .unwrap_or("");
-
-    lifecycle::set_status(
-        db,
-        instance_name,
-        ST_ACTIVE,
-        &format!("deliver:{}", display),
-        lifecycle::StatusUpdate {
-            msg_ts,
-            ..Default::default()
-        },
-    );
-
-    (deliver, Some(formatted))
+    let formatted = batch.format_model_context(db, instance_name);
+    (batch.into_messages(), Some(formatted))
 }
 
 /// Stop hook polling loop — NOT used by main PTY path.
@@ -1257,6 +1305,106 @@ mod tests {
         let db = crate::db::HcomDb::open_raw(&db_path).unwrap();
         db.init_db().unwrap();
         (dir, db)
+    }
+
+    fn insert_test_instance(db: &crate::db::HcomDb, name: &str) {
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, status_context, status_time, created_at, last_event_id)
+                 VALUES (?1, 'claude', 'listening', 'start', 0, 0, 0)",
+                [name],
+            )
+            .unwrap();
+    }
+
+    fn insert_test_message(
+        db: &crate::db::HcomDb,
+        instance: &str,
+        from: &str,
+        text: &str,
+        timestamp: &str,
+    ) {
+        let data = serde_json::json!({
+            "from": from,
+            "text": text,
+            "scope": "broadcast",
+        })
+        .to_string();
+        db.conn()
+            .execute(
+                "INSERT INTO events (type, timestamp, instance, data) VALUES ('message', ?1, ?2, ?3)",
+                rusqlite::params![timestamp, instance, data],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn test_prepare_delivery_batch_empty() {
+        let (_dir, db) = make_test_db();
+        insert_test_instance(&db, "nova");
+
+        let batch = prepare_delivery_batch(&db, "nova", vec![]);
+        assert!(batch.is_none());
+    }
+
+    #[test]
+    fn test_prepare_delivery_batch_caps_cursor_and_status() {
+        let (_dir, db) = make_test_db();
+        insert_test_instance(&db, "nova");
+        for i in 0..(MAX_MESSAGES_PER_DELIVERY + 2) {
+            insert_test_message(
+                &db,
+                "luna",
+                "luna",
+                &format!("msg {i}"),
+                &format!("2026-01-01T00:00:{i:02}Z"),
+            );
+        }
+
+        let raw_messages = db.get_unread_messages("nova");
+        let batch = prepare_delivery_batch(&db, "nova", raw_messages).unwrap();
+
+        assert_eq!(batch.messages.len(), MAX_MESSAGES_PER_DELIVERY);
+
+        let cursor: i64 = db
+            .conn()
+            .query_row(
+                "SELECT last_event_id FROM instances WHERE name = 'nova'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let expected_last_id = batch
+            .messages
+            .last()
+            .and_then(|m| m.get("event_id"))
+            .and_then(|v| v.as_i64())
+            .unwrap();
+        assert_eq!(cursor, expected_last_id);
+
+        let instance = db.get_instance_full("nova").unwrap().unwrap();
+        let last_msg_ts = batch
+            .messages
+            .last()
+            .and_then(|m| m.get("timestamp"))
+            .and_then(|v| v.as_str())
+            .unwrap();
+        let delivered_name = crate::instances::get_display_name(&db, "luna");
+        let mut deliver_events = db
+            .conn()
+            .prepare(
+                "SELECT data FROM events WHERE type = 'status' AND instance = 'nova' ORDER BY id DESC LIMIT 1",
+            )
+            .unwrap();
+        let event_data: String = deliver_events
+            .query_row([], |row| row.get(0))
+            .unwrap();
+        let event_json: serde_json::Value = serde_json::from_str(&event_data).unwrap();
+
+        assert_eq!(instance.status, ST_ACTIVE);
+        assert_eq!(instance.status_context, format!("deliver:{delivered_name}"));
+        assert_eq!(event_json["msg_ts"], last_msg_ts);
+        assert_eq!(event_json["context"], format!("deliver:{delivered_name}"));
     }
 
     #[test]

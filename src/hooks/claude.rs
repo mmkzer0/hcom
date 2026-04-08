@@ -23,7 +23,7 @@ use crate::instances;
 use crate::log;
 use crate::messages;
 use crate::paths;
-use crate::shared::constants::{BIND_MARKER_RE, MAX_MESSAGES_PER_DELIVERY};
+use crate::shared::constants::BIND_MARKER_RE;
 use crate::shared::context::HcomContext;
 use crate::shared::{ST_ACTIVE, ST_BLOCKED, ST_INACTIVE, ST_LISTENING};
 
@@ -971,24 +971,14 @@ fn inject_bootstrap_if_needed(
 
 /// Check for unread messages to deliver at PostToolUse.
 fn get_posttooluse_messages(db: &HcomDb, instance_name: &str) -> Option<Value> {
-    let (deliver_messages, model_context) = common::deliver_pending_messages(db, instance_name);
-    if deliver_messages.is_empty() {
+    let raw_messages = db.get_unread_messages(instance_name);
+    let Some(batch) = common::prepare_delivery_batch(db, instance_name, raw_messages) else {
         return None;
-    }
-
-    let model_context = model_context?;
+    };
+    let model_context = batch.format_model_context(db, instance_name);
 
     // Claude needs user-facing display in addition to model context
-    let get_instance_data = common::make_instance_lookup(db);
-    let hints = common::load_config_hints();
-    let get_config_hints = || hints.clone();
-    let user_display = messages::format_hook_messages(
-        &deliver_messages,
-        instance_name,
-        &get_instance_data,
-        &get_config_hints,
-        None,
-    );
+    let user_display = batch.format_user_display(db, instance_name);
 
     Some(serde_json::json!({
         "systemMessage": user_display,
@@ -1134,62 +1124,9 @@ fn handle_userpromptsubmit(
     // PTY mode: deliver messages
     if ctx.is_pty_mode {
         let raw_messages = db.get_unread_messages(instance_name);
-        if !raw_messages.is_empty() {
-            let messages: Vec<Value> = raw_messages.iter().map(message_to_value).collect();
-
-            let deliver = if messages.len() > MAX_MESSAGES_PER_DELIVERY {
-                messages[..MAX_MESSAGES_PER_DELIVERY].to_vec()
-            } else {
-                messages
-            };
-
-            let last_id = deliver
-                .last()
-                .and_then(|m| m.get("event_id").and_then(|v| v.as_i64()))
-                .unwrap_or(0);
-            let mut pos_updates = serde_json::Map::new();
-            pos_updates.insert("last_event_id".into(), serde_json::json!(last_id));
-            instances::update_instance_position(db, instance_name, &pos_updates);
-
-            // Format messages
-            let get_instance_data = common::make_instance_lookup(db);
-            let hints = common::load_config_hints();
-            let get_config_hints = || hints.clone();
-            let user_display = messages::format_hook_messages(
-                &deliver,
-                instance_name,
-                &get_instance_data,
-                &get_config_hints,
-                None,
-            );
-            let tip_checker = common::make_tip_checker(db);
-            let model_context = messages::format_messages_json(
-                &deliver,
-                instance_name,
-                &get_instance_data,
-                &get_config_hints,
-                Some(&tip_checker),
-            );
-
-            let sender = deliver
-                .first()
-                .and_then(|m| m.get("from").and_then(|v| v.as_str()))
-                .unwrap_or("unknown");
-            let display = instances::get_display_name(db, sender);
-            let msg_ts = deliver
-                .last()
-                .and_then(|m| m.get("timestamp").and_then(|v| v.as_str()))
-                .unwrap_or("");
-            lifecycle::set_status(
-                db,
-                instance_name,
-                ST_ACTIVE,
-                &format!("deliver:{}", display),
-                lifecycle::StatusUpdate {
-                    msg_ts,
-                    ..Default::default()
-                },
-            );
+        if let Some(batch) = common::prepare_delivery_batch(db, instance_name, raw_messages) {
+            let user_display = batch.format_user_display(db, instance_name);
+            let model_context = batch.format_model_context(db, instance_name);
 
             let output = serde_json::json!({
                 "systemMessage": user_display,
@@ -1669,58 +1606,10 @@ fn subagent_posttooluse(db: &HcomDb, raw: &Value) -> (i32, String) {
 
     // Message delivery
     let raw_messages = db.get_unread_messages(&subagent_name);
-    if raw_messages.is_empty() {
+    let Some(batch) = common::prepare_delivery_batch(db, &subagent_name, raw_messages) else {
         return (0, String::new());
-    }
-
-    let messages: Vec<Value> = raw_messages.iter().map(message_to_value).collect();
-
-    let deliver = if messages.len() > MAX_MESSAGES_PER_DELIVERY {
-        messages[..MAX_MESSAGES_PER_DELIVERY].to_vec()
-    } else {
-        messages
     };
-
-    // Advance cursor
-    let last_id = deliver
-        .last()
-        .and_then(|m| m.get("event_id").and_then(|v| v.as_i64()))
-        .unwrap_or(0);
-    let mut updates = serde_json::Map::new();
-    updates.insert("last_event_id".into(), serde_json::json!(last_id));
-    instances::update_instance_position(db, &subagent_name, &updates);
-
-    let get_instance_data = common::make_instance_lookup(db);
-    let hints = common::load_config_hints();
-    let get_config_hints = || hints.clone();
-    let tip_checker = common::make_tip_checker(db);
-    let formatted = messages::format_messages_json(
-        &deliver,
-        &subagent_name,
-        &get_instance_data,
-        &get_config_hints,
-        Some(&tip_checker),
-    );
-
-    let sender = deliver
-        .first()
-        .and_then(|m| m.get("from").and_then(|v| v.as_str()))
-        .unwrap_or("unknown");
-    let display = instances::get_display_name(db, sender);
-    let msg_ts = deliver
-        .last()
-        .and_then(|m| m.get("timestamp").and_then(|v| v.as_str()))
-        .unwrap_or("");
-    lifecycle::set_status(
-        db,
-        &subagent_name,
-        ST_ACTIVE,
-        &format!("deliver:{}", display),
-        lifecycle::StatusUpdate {
-            msg_ts,
-            ..Default::default()
-        },
-    );
+    let formatted = batch.format_model_context(db, &subagent_name);
 
     let output = serde_json::json!({
         "hookSpecificOutput": {
@@ -1805,13 +1694,6 @@ fn bind_vanilla_from_marker(
 
     Some(instance_name.to_string())
 }
-
-/// Convert a Message to a JSON Value for hook delivery.
-///
-/// Used by handle_userpromptsubmit and subagent_posttooluse for
-/// message-to-JSON serialization.
-// message_to_value is in common.rs (pub(crate))
-use super::common::message_to_value;
 
 /// Extract --name flag value from a bash command string.
 fn extract_name(command: &str) -> Option<String> {
@@ -2368,6 +2250,14 @@ pub fn remove_claude_hooks() -> bool {
 mod tests {
     use super::*;
 
+    fn make_test_db() -> (tempfile::TempDir, HcomDb) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = HcomDb::open_raw(&db_path).unwrap();
+        db.init_db().unwrap();
+        (dir, db)
+    }
+
     #[test]
     fn test_get_real_session_id_normal() {
         let raw = serde_json::json!({"session": {"session_id": "abc-123"}});
@@ -2432,6 +2322,36 @@ mod tests {
     fn test_subagent_start_empty_agent_id() {
         let raw = serde_json::json!({"agent_id": ""});
         assert!(subagent_start(&raw).is_none());
+    }
+
+    #[test]
+    fn test_get_posttooluse_messages_returns_dual_output() {
+        let (_dir, db) = make_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, status_context, status_time, created_at, last_event_id)
+                 VALUES ('nova', 'claude', 'listening', 'start', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO events (type, timestamp, instance, data)
+                 VALUES ('message', '2026-01-01T00:00:00Z', 'luna', '{\"from\":\"luna\",\"text\":\"hello\",\"scope\":\"broadcast\"}')",
+                [],
+            )
+            .unwrap();
+
+        let output = get_posttooluse_messages(&db, "nova").unwrap();
+        let system_message = output["systemMessage"].as_str().unwrap();
+        assert!(system_message.contains("luna"));
+        assert!(system_message.contains("nova"));
+        assert!(system_message.contains("hello"));
+        let ctx = output["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert!(ctx.contains("luna"));
+        assert!(ctx.contains("hello"));
     }
 
     #[test]
