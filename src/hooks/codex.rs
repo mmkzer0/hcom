@@ -11,6 +11,7 @@ use serde_json::Value;
 use crate::db::{HcomDb, InstanceRow};
 use crate::hooks::common;
 use crate::hooks::family;
+use crate::instance_lifecycle as lifecycle;
 use crate::instances;
 use crate::log;
 use crate::paths;
@@ -220,7 +221,7 @@ fn handle_notify(db: &HcomDb, ctx: &HcomContext, raw: &Value) -> i32 {
 
     let idle_since = crate::shared::time::now_iso();
 
-    instances::set_status(db, &instance_name, ST_LISTENING, "", Default::default());
+    lifecycle::set_status(db, &instance_name, ST_LISTENING, "", Default::default());
 
     let mut idle_updates = serde_json::Map::new();
     idle_updates.insert("idle_since".into(), Value::String(idle_since));

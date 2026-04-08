@@ -7,6 +7,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::db::HcomDb;
+use crate::instance_lifecycle;
 use rusqlite::params;
 
 /// Result of a launch wait operation.
@@ -118,7 +119,7 @@ fn get_batch_failure_details_for_ids(db: &HcomDb, batch_ids: &[String]) -> Vec<S
             let Ok(Some(inst)) = db.get_instance_full(&name) else {
                 continue;
             };
-            if let Some(detail) = crate::instances::get_or_finalize_launch_failure_detail(db, &inst)
+            if let Some(detail) = instance_lifecycle::get_or_finalize_launch_failure_detail(db, &inst)
             {
                 details.push(format!("{}: {}", name, detail));
             }
@@ -378,7 +379,7 @@ pub fn wait_for_launch(
 ) -> LaunchResult {
     // Clean up stale placeholders before polling.
     // Stale placeholders can block launch detection.
-    crate::instances::cleanup_stale_placeholders(db);
+    instance_lifecycle::cleanup_stale_placeholders(db);
 
     let fetch = |db: &HcomDb| -> Option<LaunchData> {
         if let Some(bid) = batch_id {

@@ -525,7 +525,7 @@ fn count_gt(sorted_ids: &[u64], waterline: u64) -> usize {
 // ── Recently stopped ────────────────────────────────────────────
 
 fn load_recently_stopped(conn: &Connection, now: f64) -> Vec<Agent> {
-    load_stopped(conn, now, Some(crate::instances::RECENTLY_STOPPED_WINDOW))
+    load_stopped(conn, now, Some(crate::instance_lifecycle::RECENTLY_STOPPED_WINDOW))
 }
 
 /// Load stopped agents. `max_age_secs`: None = all time, Some(n) = last n seconds.

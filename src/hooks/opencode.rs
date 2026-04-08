@@ -6,6 +6,7 @@ use serde_json::Value;
 
 use crate::bootstrap;
 use crate::db::HcomDb;
+use crate::instance_lifecycle as lifecycle;
 use crate::instances;
 use crate::log::{log_error, log_info};
 use crate::messages;
@@ -48,7 +49,7 @@ fn upsert_plugin_notify_endpoint(db: &HcomDb, instance_name: &str, port: u16) {
 /// Used by status handler when instance becomes listening.
 /// Queries all kinds (pty, hook, plugin) and sends a brief TCP connect to each.
 fn notify_all_endpoints(db: &HcomDb, instance_name: &str) {
-    instances::notify_instance_endpoints(db, instance_name, &[]);
+    lifecycle::notify_instance_endpoints(db, instance_name, &[]);
 }
 
 /// Get path to OpenCode's SQLite database.
@@ -100,7 +101,7 @@ fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (i32, String
         }
 
         instances::update_instance_position(db, &existing_name, &rebind_updates);
-        instances::set_status(
+        lifecycle::set_status(
             db,
             &existing_name,
             ST_LISTENING,
@@ -180,7 +181,7 @@ fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (i32, String
         }
     }
 
-    instances::set_status(
+    lifecycle::set_status(
         db,
         &instance_name,
         ST_LISTENING,
@@ -267,12 +268,12 @@ fn handle_status(db: &HcomDb, argv: &[String]) -> (i32, String) {
     let context = parse_flag(argv, "--context").unwrap_or_default();
     let detail = parse_flag(argv, "--detail").unwrap_or_default();
 
-    instances::set_status(
+    lifecycle::set_status(
         db,
         &name,
         &status,
         &context,
-        instances::StatusUpdate {
+        lifecycle::StatusUpdate {
             detail: &detail,
             ..Default::default()
         },

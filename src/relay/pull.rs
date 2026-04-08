@@ -9,6 +9,7 @@ use rusqlite::params;
 use serde_json::Value;
 
 use crate::db::HcomDb;
+use crate::instance_lifecycle;
 use crate::log;
 
 use super::{device_short_id, safe_kv_get, safe_kv_set};
@@ -341,7 +342,7 @@ pub fn handle_state_message(db: &HcomDb, device_id: &str, payload: &[u8], own_de
 
     // Wake local TCP instances so they see new messages immediately.
     //
-    crate::instances::notify_all_instances(db);
+    instance_lifecycle::notify_all_instances(db);
 }
 
 /// Import remote events with cursor-based dedup.

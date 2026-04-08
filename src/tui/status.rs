@@ -1,14 +1,14 @@
-use crate::instances;
+use crate::instance_lifecycle;
 use crate::tui::model::{Agent, AgentStatus};
 
-// ── Timeout constants — single source of truth in crate::instances ──
+// ── Timeout constants — single source of truth in crate::instance_lifecycle ──
 
-const HEARTBEAT_THRESHOLD_TCP: f64 = instances::HEARTBEAT_THRESHOLD_TCP as f64;
-const HEARTBEAT_THRESHOLD_NO_TCP: f64 = instances::HEARTBEAT_THRESHOLD_NO_TCP as f64;
-const STATUS_ACTIVITY_TIMEOUT: f64 = instances::STATUS_ACTIVITY_TIMEOUT as f64;
-const LAUNCH_PLACEHOLDER_TIMEOUT: f64 = instances::LAUNCH_PLACEHOLDER_TIMEOUT as f64;
-const WAKE_GRACE_PERIOD: f64 = instances::WAKE_GRACE_PERIOD;
-const UNKNOWN_HEARTBEAT_AGE: f64 = instances::UNKNOWN_HEARTBEAT_AGE as f64;
+const HEARTBEAT_THRESHOLD_TCP: f64 = instance_lifecycle::HEARTBEAT_THRESHOLD_TCP as f64;
+const HEARTBEAT_THRESHOLD_NO_TCP: f64 = instance_lifecycle::HEARTBEAT_THRESHOLD_NO_TCP as f64;
+const STATUS_ACTIVITY_TIMEOUT: f64 = instance_lifecycle::STATUS_ACTIVITY_TIMEOUT as f64;
+const LAUNCH_PLACEHOLDER_TIMEOUT: f64 = instance_lifecycle::LAUNCH_PLACEHOLDER_TIMEOUT as f64;
+const WAKE_GRACE_PERIOD: f64 = instance_lifecycle::WAKE_GRACE_PERIOD;
+const UNKNOWN_HEARTBEAT_AGE: f64 = instance_lifecycle::UNKNOWN_HEARTBEAT_AGE as f64;
 
 // ── Computed status result ────────────────────────────────────────
 

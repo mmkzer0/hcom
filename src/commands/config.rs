@@ -10,6 +10,7 @@ use serde_json::Value;
 
 use crate::db::DEV_ROOT_KV_KEY;
 use crate::db::HcomDb;
+use crate::instance_lifecycle;
 use crate::instances;
 use crate::shared::CommandContext;
 
@@ -579,7 +580,7 @@ fn config_instance(
                 println!("Set tag for {inst_name}: {tag}");
             }
             // Notify for display update
-            crate::instances::notify_all_instances(db);
+            instance_lifecycle::notify_all_instances(db);
         }
         "timeout" => {
             if value.is_empty() || value.eq_ignore_ascii_case("default") {

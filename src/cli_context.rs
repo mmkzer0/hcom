@@ -8,6 +8,7 @@
 
 use crate::db::HcomDb;
 use crate::identity;
+use crate::instance_lifecycle as lifecycle;
 use crate::instances;
 #[cfg(test)]
 use crate::shared::SenderIdentity;
@@ -167,7 +168,7 @@ pub fn set_hookless_command_status(db: &HcomDb, cmd_name: &str, ctx: &CommandCon
     } else {
         ST_ACTIVE
     };
-    instances::set_status(db, &identity.name, status, &context, Default::default());
+    lifecycle::set_status(db, &identity.name, status, &context, Default::default());
 }
 
 /// For hookless instances (codex/adhoc): append unread messages after command output.
@@ -240,12 +241,12 @@ pub fn maybe_deliver_pending_messages(
     } else {
         ST_INACTIVE
     };
-    instances::set_status(
+    lifecycle::set_status(
         db,
         &identity.name,
         status,
         &context,
-        instances::StatusUpdate {
+        lifecycle::StatusUpdate {
             msg_ts,
             ..Default::default()
         },

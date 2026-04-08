@@ -11,6 +11,7 @@ use serde_json::Value;
 use crate::db::{HcomDb, InstanceRow};
 use crate::hooks::common;
 use crate::hooks::{HookPayload, HookResult};
+use crate::instance_lifecycle as lifecycle;
 use crate::instances;
 use crate::log;
 use crate::shared::constants::BIND_MARKER_RE;
@@ -264,7 +265,7 @@ fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) ->
         updates.insert("transcript_path".into(), Value::String(tp.clone()));
     }
     instances::update_instance_position(db, &instance_name, &updates);
-    instances::set_status(
+    lifecycle::set_status(
         db,
         &instance_name,
         ST_LISTENING,
@@ -349,7 +350,7 @@ fn handle_beforeagent(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> 
         outputs.push(formatted);
     } else {
         // Real user prompt (not hcom injection)
-        instances::set_status(db, instance_name, ST_ACTIVE, "prompt", Default::default());
+        lifecycle::set_status(db, instance_name, ST_ACTIVE, "prompt", Default::default());
     }
 
     if outputs.is_empty() {
@@ -370,7 +371,7 @@ fn handle_afteragent(db: &HcomDb, _ctx: &HcomContext, payload: &HookPayload) -> 
         None => return hook_noop(),
     };
 
-    instances::set_status(db, &instance.name, ST_LISTENING, "", Default::default());
+    lifecycle::set_status(db, &instance.name, ST_LISTENING, "", Default::default());
     common::notify_hook_instance_with_db(db, &instance.name);
 
     hook_noop()
@@ -452,7 +453,7 @@ fn handle_notification(db: &HcomDb, _ctx: &HcomContext, payload: &HookPayload) -
     };
 
     if payload.notification_type.as_deref() == Some("ToolPermission") {
-        instances::set_status(
+        lifecycle::set_status(
             db,
             &instance.name,
             ST_BLOCKED,

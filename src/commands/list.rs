@@ -8,9 +8,12 @@ use std::collections::HashMap;
 
 use crate::db::{HcomDb, InstanceRow};
 use crate::identity;
+use crate::instance_lifecycle::{
+    RECENTLY_STOPPED_WINDOW, cleanup_stale_instances, cleanup_stale_placeholders, format_age,
+    get_instance_status,
+};
 use crate::instances::{
-    cleanup_stale_instances, cleanup_stale_placeholders, format_age, get_full_name,
-    get_instance_status, is_remote_instance, resolve_display_name,
+    get_full_name, is_remote_instance, resolve_display_name,
 };
 use crate::shared::{CommandContext, SENDER, ST_LISTENING, shorten_path_max, status_icon};
 
@@ -814,7 +817,7 @@ fn get_recently_stopped(
     exclude_active: &std::collections::HashSet<String>,
 ) -> Vec<String> {
     let now = crate::shared::time::now_epoch_f64();
-    let cutoff = now - crate::instances::RECENTLY_STOPPED_WINDOW;
+    let cutoff = now - RECENTLY_STOPPED_WINDOW;
     let cutoff_ts = chrono::DateTime::from_timestamp(cutoff as i64, 0)
         .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S").to_string())
         .unwrap_or_default();

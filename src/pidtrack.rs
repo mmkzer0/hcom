@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::instance_lifecycle as lifecycle;
+
 const PIDFILE_NAME: &str = ".tmp/launched_pids.json";
 
 /// Tracked process entry.
@@ -396,7 +398,7 @@ pub fn recover_single_orphan_to_db(
     }
 
     // Set listening so PTY delivery gate allows message injection
-    instances::set_status(
+    lifecycle::set_status(
         db,
         instance_name,
         ST_LISTENING,

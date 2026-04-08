@@ -1,7 +1,7 @@
 //! TCP notification server for instant wake on message arrival.
 //!
 //! Used by the delivery loop to block efficiently instead of busy-polling.
-//! When a message is sent (`hcom send`), `notify_all_instances()` connects
+//! When a message is sent (`hcom send`), the lifecycle wake helpers connect
 //! briefly to each instance's notify port to wake its delivery thread.
 //!
 //! TCP chosen for clean poll/select integration across process boundaries.

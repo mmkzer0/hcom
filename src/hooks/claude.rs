@@ -17,6 +17,7 @@ use crate::db::{HcomDb, InstanceRow};
 use crate::hooks::HookPayload;
 use crate::hooks::common;
 use crate::hooks::family;
+use crate::instance_lifecycle as lifecycle;
 use crate::instances;
 use crate::log;
 use crate::messages;
@@ -566,7 +567,7 @@ fn bind_and_bootstrap(
     // Capture launch context
     instances::capture_and_store_launch_context(db, &instance_name);
 
-    instances::set_status(
+    lifecycle::set_status(
         db,
         &instance_name,
         ST_LISTENING,
@@ -644,12 +645,12 @@ fn start_task(db: &HcomDb, session_id: &str, raw: &Value) -> (String, i32) {
         .cloned()
         .unwrap_or(Value::Object(Default::default()));
     let detail = family::extract_tool_detail("claude", "Task", &tool_input);
-    instances::set_status(
+    lifecycle::set_status(
         db,
         &instance_name,
         ST_ACTIVE,
         "tool:Task",
-        instances::StatusUpdate {
+        lifecycle::StatusUpdate {
             detail: &detail,
             ..Default::default()
         },
@@ -908,7 +909,7 @@ fn handle_posttooluse(
 
     // Clear blocked status if tool completed
     if instance_data.status == ST_BLOCKED {
-        instances::set_status(
+        lifecycle::set_status(
             db,
             instance_name,
             ST_ACTIVE,
@@ -1051,7 +1052,7 @@ fn handle_poll(
 
     // PTY mode: exit immediately, PTY wrapper handles injection
     if ctx.is_pty_mode {
-        instances::set_status(db, instance_name, ST_LISTENING, "", Default::default());
+        lifecycle::set_status(db, instance_name, ST_LISTENING, "", Default::default());
         common::notify_hook_instance_with_db(db, instance_name);
         return (0, String::new());
     }
@@ -1074,7 +1075,7 @@ fn handle_poll(
         common::poll_messages(db, instance_name, timeout as u64, ctx.is_background);
 
     if timed_out {
-        instances::set_status(
+        lifecycle::set_status(
             db,
             instance_name,
             ST_INACTIVE,
@@ -1117,7 +1118,7 @@ fn handle_userpromptsubmit(
                 }
             });
             paths::increment_flag_counter("instance_count");
-            instances::set_status(db, instance_name, ST_ACTIVE, "prompt", Default::default());
+            lifecycle::set_status(db, instance_name, ST_ACTIVE, "prompt", Default::default());
             return (0, serde_json::to_string(&output).unwrap_or_default());
         }
     }
@@ -1171,12 +1172,12 @@ fn handle_userpromptsubmit(
                 .last()
                 .and_then(|m| m.get("timestamp").and_then(|v| v.as_str()))
                 .unwrap_or("");
-            instances::set_status(
+            lifecycle::set_status(
                 db,
                 instance_name,
                 ST_ACTIVE,
                 &format!("deliver:{}", display),
-                instances::StatusUpdate {
+                lifecycle::StatusUpdate {
                     msg_ts,
                     ..Default::default()
                 },
@@ -1193,7 +1194,7 @@ fn handle_userpromptsubmit(
         }
     }
 
-    instances::set_status(db, instance_name, ST_ACTIVE, "prompt", Default::default());
+    lifecycle::set_status(db, instance_name, ST_ACTIVE, "prompt", Default::default());
     (0, String::new())
 }
 
@@ -1209,12 +1210,12 @@ fn handle_permission_request(
     }
 
     let detail = family::extract_tool_detail("claude", &payload.tool_name, &payload.tool_input);
-    instances::set_status(
+    lifecycle::set_status(
         db,
         instance_name,
         ST_BLOCKED,
         "approval",
-        instances::StatusUpdate {
+        lifecycle::StatusUpdate {
             detail: &detail,
             ..Default::default()
         },
@@ -1241,7 +1242,7 @@ fn handle_notify(
 
     match payload.notification_type.as_deref() {
         Some("idle_prompt") => {
-            instances::set_status(db, instance_name, ST_LISTENING, "", Default::default());
+            lifecycle::set_status(db, instance_name, ST_LISTENING, "", Default::default());
             common::notify_hook_instance_with_db(db, instance_name);
             return (0, String::new());
         }
@@ -1250,7 +1251,7 @@ fn handle_notify(
             return (0, String::new());
         }
         Some("elicitation_dialog") => {
-            instances::set_status(
+            lifecycle::set_status(
                 db,
                 instance_name,
                 ST_BLOCKED,
@@ -1272,12 +1273,12 @@ fn handle_notify(
 
     // Back-compat fallback for older Claude payloads that only include free-form text.
     if message == "Claude is waiting for your input" {
-        instances::set_status(db, instance_name, ST_LISTENING, "", Default::default());
+        lifecycle::set_status(db, instance_name, ST_LISTENING, "", Default::default());
         common::notify_hook_instance_with_db(db, instance_name);
         return (0, String::new());
     }
     if message.starts_with("Claude needs your permission") {
-        instances::set_status(
+        lifecycle::set_status(
             db,
             instance_name,
             ST_BLOCKED,
@@ -1507,7 +1508,7 @@ fn cleanup_dead_subagents(db: &HcomDb, session_id: &str, transcript_path: &str) 
 
         // Stop the subagent instance if it exists
         if let Ok(Some(name)) = db.get_instance_by_agent_id(agent_id) {
-            instances::set_status(
+            lifecycle::set_status(
                 db,
                 &name,
                 ST_INACTIVE,
@@ -1607,7 +1608,7 @@ fn subagent_stop(db: &HcomDb, raw: &Value, session_id: &str) -> (i32, String) {
         } else {
             "task_completed"
         };
-        instances::set_status(
+        lifecycle::set_status(
             db,
             &subagent_name,
             ST_INACTIVE,
@@ -1702,12 +1703,12 @@ fn subagent_posttooluse(db: &HcomDb, raw: &Value) -> (i32, String) {
         .last()
         .and_then(|m| m.get("timestamp").and_then(|v| v.as_str()))
         .unwrap_or("");
-    instances::set_status(
+    lifecycle::set_status(
         db,
         &subagent_name,
         ST_ACTIVE,
         &format!("deliver:{}", display),
-        instances::StatusUpdate {
+        lifecycle::StatusUpdate {
             msg_ts,
             ..Default::default()
         },

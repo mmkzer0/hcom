@@ -10,6 +10,7 @@ use serde_json::Value;
 
 use crate::bootstrap;
 use crate::db::{HcomDb, InstanceRow, Message};
+use crate::instance_lifecycle as lifecycle;
 use crate::instances;
 use crate::log;
 use crate::messages;
@@ -217,12 +218,12 @@ fn deliver_raw_messages(
         .and_then(|m| m.get("timestamp").and_then(|v| v.as_str()))
         .unwrap_or("");
 
-    instances::set_status(
+    lifecycle::set_status(
         db,
         instance_name,
         ST_ACTIVE,
         &format!("deliver:{}", display),
-        instances::StatusUpdate {
+        lifecycle::StatusUpdate {
             msg_ts,
             ..Default::default()
         },
@@ -295,7 +296,7 @@ fn poll_messages_inner(
     }
 
     // Set listening status
-    instances::set_status(db, instance_name, ST_LISTENING, "", Default::default());
+    lifecycle::set_status(db, instance_name, ST_LISTENING, "", Default::default());
 
     let start = Instant::now();
     let timeout = Duration::from_secs(timeout_secs);
@@ -785,7 +786,7 @@ fn try_bind_from_transcript(
 pub fn get_pending_instances(db: &HcomDb) -> Vec<String> {
     // Purge leaked launch placeholders before treating them as bindable.
     // Otherwise an old transcript marker can silently re-bind a stale row.
-    crate::instances::cleanup_stale_placeholders(db);
+    lifecycle::cleanup_stale_placeholders(db);
     let mut stmt = match db.conn().prepare(
         "SELECT name FROM instances WHERE session_id IS NULL AND tool != 'adhoc' ORDER BY created_at DESC",
     ) {
@@ -812,7 +813,7 @@ pub fn notify_hook_instance(instance_name: &str) {
 
 /// Wake hook poll loop with an existing DB handle.
 pub fn notify_hook_instance_with_db(db: &HcomDb, instance_name: &str) {
-    instances::notify_instance_endpoints(db, instance_name, &["hook"]);
+    lifecycle::notify_instance_endpoints(db, instance_name, &["hook"]);
 }
 
 /// Stop instance: log snapshot, clean bindings, delete row.
@@ -1090,7 +1091,7 @@ pub fn finalize_session(
     );
 
     // Set inactive status
-    instances::set_status(
+    lifecycle::set_status(
         db,
         instance_name,
         ST_INACTIVE,
@@ -1120,12 +1121,12 @@ pub fn update_tool_status(
     tool_input: &Value,
 ) {
     let detail = super::family::extract_tool_detail(tool, tool_name, tool_input);
-    instances::set_status(
+    lifecycle::set_status(
         db,
         instance_name,
         ST_ACTIVE,
         &format!("tool:{}", tool_name),
-        instances::StatusUpdate {
+        lifecycle::StatusUpdate {
             detail: &detail,
             ..Default::default()
         },
@@ -1548,7 +1549,7 @@ mod tests {
 
         // Simulate a leaked launch placeholder older than the stale threshold.
         let old_time = crate::shared::time::now_epoch_f64()
-            - (crate::instances::CLEANUP_PLACEHOLDER_THRESHOLD as f64 + 80.0);
+            - (lifecycle::CLEANUP_PLACEHOLDER_THRESHOLD as f64 + 80.0);
         let _ = db.conn().execute(
             "INSERT INTO instances (name, tool, status, status_context, created_at)
              VALUES ('luna', 'claude', 'pending', 'new', ?1)",

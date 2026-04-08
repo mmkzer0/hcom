@@ -15,6 +15,7 @@ use crate::bootstrap;
 use crate::config::HcomConfig;
 use crate::db::HcomDb;
 use crate::identity;
+use crate::instance_lifecycle as lifecycle;
 use crate::instance_names;
 use crate::instances;
 use crate::log::log_info;
@@ -243,7 +244,7 @@ fn start_subagent(db: &HcomDb, info: &SubagentInfo) -> Result<i32> {
         .ok();
 
     if let Some(name) = existing_name {
-        instances::set_status(db, &name, ST_ACTIVE, "start", Default::default());
+        lifecycle::set_status(db, &name, ST_ACTIVE, "start", Default::default());
         println!("hcom already started for {name}");
         return Ok(0);
     }
@@ -352,7 +353,7 @@ fn start_subagent(db: &HcomDb, info: &SubagentInfo) -> Result<i32> {
     instances::capture_and_store_launch_context(db, &subagent_name);
 
     // Set active status (logs life event)
-    instances::set_status(
+    lifecycle::set_status(
         db,
         &subagent_name,
         ST_ACTIVE,
@@ -599,7 +600,7 @@ fn start_rebind(
             }
         }
 
-        let _ = instances::notify_instance_with_db(db, &target_name);
+        let _ = lifecycle::notify_instance_with_db(db, &target_name);
     }
 
     // Print bootstrap

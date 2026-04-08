@@ -11,7 +11,8 @@ use std::time::Duration;
 use crate::core::filters::{EventFilterArgs, build_sql_from_flags, resolve_filter_names};
 use crate::db::HcomDb;
 use crate::identity;
-use crate::instances::{self, StatusUpdate, get_display_name, set_status};
+use crate::instance_lifecycle::{StatusUpdate, set_status};
+use crate::instances::{self, get_display_name};
 use crate::notify::NotifyServer;
 use crate::shared::{CommandContext, ST_ACTIVE, ST_INACTIVE, ST_LISTENING};
 

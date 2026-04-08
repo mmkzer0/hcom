@@ -1265,7 +1265,7 @@ fn format_event_summary(data: &Value) -> String {
     "(no summary)".to_string()
 }
 
-use crate::instances::format_age;
+use crate::shared::time::format_age;
 
 // ── Main Entry Point ─────────────────────────────────────────────────────
 

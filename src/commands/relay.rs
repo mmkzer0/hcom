@@ -5,6 +5,7 @@ use crate::db::HcomDb;
 use crate::relay::{self, DEFAULT_BROKERS};
 use crate::shared::CommandContext;
 use crate::shared::ansi::{FG_GRAY, FG_GREEN, FG_RED, FG_YELLOW, RESET};
+use crate::shared::time::format_age;
 
 /// Parsed arguments for `hcom relay`.
 #[derive(clap::Parser, Debug)]
@@ -70,7 +71,7 @@ fn format_time(timestamp: f64) -> String {
     if age <= 0 {
         return "just now".to_string();
     }
-    format!("{} ago", crate::instances::format_age(age))
+    format!("{} ago", format_age(age))
 }
 
 /// Get device short ID via FNV-1a hash
