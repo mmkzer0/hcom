@@ -721,25 +721,13 @@ fn start_bare(
         instance_names::generate_unique_name(db)?
     };
 
-    // Remote instance — send control via relay
+    // Remote instances are relay mirrors. We can stop them remotely, but starting
+    // them would require remote launch semantics that hcom doesn't implement.
     if let Ok(Some(ref existing)) = db.get_instance_full(&name) {
         if crate::instances::is_remote_instance(existing) {
-            if name.contains(':') {
-                let (rname, device_short_id) = name.rsplit_once(':').unwrap();
-                let config = crate::config::HcomConfig::load(None).unwrap_or_default();
-                if crate::relay::control::send_control_ephemeral(
-                    &config,
-                    "start",
-                    rname,
-                    device_short_id,
-                ) {
-                    println!("Start sent to {name}");
-                    return Ok(0);
-                } else {
-                    bail!("Failed to send start to {name} - relay unavailable");
-                }
-            }
-            bail!("Cannot start remote '{name}' - missing device suffix");
+            bail!(
+                "Remote start is not supported for '{name}'. Start it on the owning device instead."
+            );
         }
     }
 
@@ -821,6 +809,7 @@ fn start_bare(
 mod tests {
     use super::*;
     use clap::Parser;
+    use rusqlite::params;
 
     #[test]
     fn test_start_args_bare() {
@@ -859,5 +848,31 @@ mod tests {
     fn test_start_args_unknown_flag_errors() {
         let err = StartArgs::try_parse_from(["start", "--bogus"]);
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_start_rejects_remote_instances() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, origin_device_id, created_at) VALUES (?1, ?2, ?3)",
+                params![
+                    "luna:ABCD",
+                    "remote-device",
+                    crate::shared::time::now_epoch_f64()
+                ],
+            )
+            .unwrap();
+
+        let flags = crate::router::GlobalFlags {
+            name: Some("luna:ABCD".to_string()),
+            go: false,
+        };
+        let err = run(&["start".to_string()], &flags).unwrap_err();
+        assert!(
+            err.to_string().contains("Remote start is not supported"),
+            "unexpected error: {err}"
+        );
     }
 }

@@ -21,7 +21,7 @@ pub fn build_state(db: &HcomDb) -> Value {
 
     let instances = match db.conn().prepare(
         "SELECT name, status, status_context, status_detail, status_time, parent_name,
-                session_id, parent_session_id, agent_id, directory, transcript_path,
+                directory, transcript_path,
                 wait_timeout, last_stop, tcp_mode, tag, tool, background
          FROM instances WHERE COALESCE(origin_device_id, '') = ''",
     ) {
@@ -35,17 +35,14 @@ pub fn build_state(db: &HcomDb) -> Value {
                         row.get::<_, Option<String>>(3)?,  // status_detail
                         row.get::<_, Option<f64>>(4)?,     // status_time
                         row.get::<_, Option<String>>(5)?,  // parent_name
-                        row.get::<_, Option<String>>(6)?,  // session_id
-                        row.get::<_, Option<String>>(7)?,  // parent_session_id
-                        row.get::<_, Option<String>>(8)?,  // agent_id
-                        row.get::<_, Option<String>>(9)?,  // directory
-                        row.get::<_, Option<String>>(10)?, // transcript_path
-                        row.get::<_, Option<i64>>(11)?,    // wait_timeout
-                        row.get::<_, Option<f64>>(12)?,    // last_stop
-                        row.get::<_, Option<bool>>(13)?,   // tcp_mode
-                        row.get::<_, Option<String>>(14)?, // tag
-                        row.get::<_, Option<String>>(15)?, // tool
-                        row.get::<_, Option<bool>>(16)?,   // background
+                        row.get::<_, Option<String>>(6)?,  // directory
+                        row.get::<_, Option<String>>(7)?,  // transcript_path
+                        row.get::<_, Option<i64>>(8)?,     // wait_timeout
+                        row.get::<_, Option<f64>>(9)?,     // last_stop
+                        row.get::<_, Option<bool>>(10)?,   // tcp_mode
+                        row.get::<_, Option<String>>(11)?, // tag
+                        row.get::<_, Option<String>>(12)?, // tool
+                        row.get::<_, Option<bool>>(13)?,   // background
                     ))
                 })
                 .ok()
@@ -67,17 +64,14 @@ pub fn build_state(db: &HcomDb) -> Value {
                         "context": row.2.as_deref().unwrap_or(""),
                         "status_time": row.4.unwrap_or(0.0),
                         "parent": row.5,
-                        "session_id": row.6,
-                        "parent_session_id": row.7,
-                        "agent_id": row.8,
-                        "directory": row.9,
-                        "transcript": row.10,
-                        "wait_timeout": row.11.unwrap_or(86400),
-                        "last_stop": row.12.unwrap_or(0.0),
-                        "tcp_mode": row.13.unwrap_or(false),
-                        "tag": row.14,
-                        "tool": row.15.as_deref().unwrap_or("claude"),
-                        "background": row.16.unwrap_or(false),
+                        "directory": row.6,
+                        "transcript": row.7,
+                        "wait_timeout": row.8.unwrap_or(86400),
+                        "last_stop": row.9.unwrap_or(0.0),
+                        "tcp_mode": row.10.unwrap_or(false),
+                        "tag": row.11,
+                        "tool": row.12.as_deref().unwrap_or("claude"),
+                        "background": row.13.unwrap_or(false),
                         "detail": row.3.as_deref().unwrap_or(""),
                     }),
                 );

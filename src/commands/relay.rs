@@ -267,6 +267,12 @@ fn relay_status(db: &HcomDb) -> i32 {
     0
 }
 
+/// Internal fast-path: wake the relay worker so queued events publish immediately.
+fn relay_push() -> i32 {
+    crate::relay::trigger_push();
+    0
+}
+
 /// Enable or disable relay sync.
 fn relay_toggle(db: &HcomDb, enable: bool) -> i32 {
     let config = config::load_config_snapshot().core;
@@ -305,6 +311,36 @@ fn relay_toggle(db: &HcomDb, enable: bool) -> i32 {
         println!("\nRun 'hcom relay connect' to reconnect");
         0
     }
+}
+
+/// Persist relay settings to config.toml.
+/// Relay auth is cleared when no password is provided so stale credentials
+/// don't poison future joins/reconfigurations.
+fn render_relay_config_content(
+    content: &str,
+    relay_id: &str,
+    broker: &str,
+    auth_token: Option<&str>,
+) -> String {
+    let mut content = update_toml_key(content, "relay_id", &format!("\"{relay_id}\""));
+    content = update_toml_key(&content, "relay", &format!("\"{broker}\""));
+    content = update_toml_key(&content, "relay_enabled", "true");
+    update_toml_key(
+        &content,
+        "relay_token",
+        &format!("\"{}\"", auth_token.unwrap_or("")),
+    )
+}
+
+fn persist_relay_config(
+    relay_id: &str,
+    broker: &str,
+    auth_token: Option<&str>,
+) -> Result<(), String> {
+    let config_path = crate::paths::config_toml_path();
+    let content = std::fs::read_to_string(&config_path).unwrap_or_default();
+    let content = render_relay_config_content(&content, relay_id, broker, auth_token);
+    std::fs::write(&config_path, &content).map_err(|e| format!("Failed to write config: {e}"))
 }
 
 /// Create a new relay group.
@@ -367,16 +403,8 @@ fn relay_new(_db: &HcomDb, argv: &[String]) -> i32 {
     };
 
     // Save config
-    let config_path = crate::paths::config_toml_path();
-    let content = std::fs::read_to_string(&config_path).unwrap_or_default();
-    let mut content = update_toml_key(&content, "relay_id", &format!("\"{relay_id}\""));
-    content = update_toml_key(&content, "relay", &format!("\"{pinned_broker}\""));
-    content = update_toml_key(&content, "relay_enabled", "true");
-    if let Some(ref token) = auth_token {
-        content = update_toml_key(&content, "relay_token", &format!("\"{token}\""));
-    }
-    if let Err(e) = std::fs::write(&config_path, &content) {
-        eprintln!("Error: Failed to write config: {e}");
+    if let Err(e) = persist_relay_config(&relay_id, &pinned_broker, auth_token.as_deref()) {
+        eprintln!("Error: {e}");
         return 1;
     }
 
@@ -450,16 +478,8 @@ fn relay_connect(db: &HcomDb, argv: &[String]) -> i32 {
     }
 
     // Save config
-    let config_path = crate::paths::config_toml_path();
-    let content = std::fs::read_to_string(&config_path).unwrap_or_default();
-    let mut content = update_toml_key(&content, "relay_id", &format!("\"{relay_id}\""));
-    content = update_toml_key(&content, "relay", &format!("\"{effective_broker}\""));
-    content = update_toml_key(&content, "relay_enabled", "true");
-    if let Some(ref token) = auth_token {
-        content = update_toml_key(&content, "relay_token", &format!("\"{token}\""));
-    }
-    if let Err(e) = std::fs::write(&config_path, &content) {
-        eprintln!("Error: Failed to write config: {e}");
+    if let Err(e) = persist_relay_config(&relay_id, &effective_broker, auth_token.as_deref()) {
+        eprintln!("Error: {e}");
         return 1;
     }
 
@@ -549,7 +569,8 @@ pub fn cmd_relay(db: &HcomDb, args: &RelayArgs, _ctx: Option<&CommandContext>) -
              hcom relay connect          Re-enable existing relay\n  \
              hcom relay connect <token>  Join relay from another device\n  \
              hcom relay off              Disable relay sync\n  \
-             hcom relay disconnect       Disable relay sync\n\n\
+             hcom relay disconnect       Disable relay sync\n  \
+             hcom relay push             Trigger an immediate relay push\n\n\
              Daemon:\n  \
              hcom relay daemon           Show daemon status\n  \
              hcom relay daemon start     Start the relay daemon\n  \
@@ -568,6 +589,7 @@ pub fn cmd_relay(db: &HcomDb, args: &RelayArgs, _ctx: Option<&CommandContext>) -
         "off" | "disconnect" => relay_toggle(db, false),
         "on" => relay_connect(db, &Vec::new()),
         "status" => relay_status(db),
+        "push" => relay_push(),
         "daemon" => crate::commands::daemon::cmd_daemon(&argv[1..]),
         _ => {
             // Could be a token passed directly
@@ -575,7 +597,7 @@ pub fn cmd_relay(db: &HcomDb, args: &RelayArgs, _ctx: Option<&CommandContext>) -
                 relay_connect(db, argv)
             } else {
                 eprintln!("Error: Unknown subcommand: {first}");
-                eprintln!("Usage: hcom relay [new|connect|disconnect|status]");
+                eprintln!("Usage: hcom relay [new|connect|disconnect|status|push]");
                 1
             }
         }
@@ -585,6 +607,7 @@ pub fn cmd_relay(db: &HcomDb, args: &RelayArgs, _ctx: Option<&CommandContext>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hooks::test_helpers::isolated_test_env;
 
     #[test]
     fn test_encode_decode_public_broker_token() {
@@ -643,5 +666,31 @@ mod tests {
         assert_eq!(broker.as_deref(), Some("mqtts://host:8883"));
         assert_eq!(auth.as_deref(), Some("secret"));
         assert_eq!(remaining, vec!["other"]);
+    }
+
+    #[test]
+    fn test_persist_relay_config_clears_stale_token_when_password_omitted() {
+        let _ = isolated_test_env();
+        let contents = render_relay_config_content(
+            "[relay]\nurl = \"mqtt://old:1883\"\nid = \"old-id\"\ntoken = \"stale-secret\"\nenabled = true\n",
+            "new-id",
+            "mqtt://127.0.0.1:1",
+            None,
+        );
+        let doc: toml_edit::DocumentMut = contents.parse().unwrap();
+        assert_eq!(doc["relay"]["id"].as_str(), Some("new-id"));
+        assert_eq!(doc["relay"]["url"].as_str(), Some("mqtt://127.0.0.1:1"));
+        assert_eq!(doc["relay"]["token"].as_str(), Some(""));
+        assert_eq!(doc["relay"]["enabled"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn test_relay_push_subcommand_exists() {
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let args = RelayArgs {
+            args: vec!["push".to_string()],
+        };
+        assert_eq!(cmd_relay(&db, &args, None), 0);
     }
 }

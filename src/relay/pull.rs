@@ -200,6 +200,7 @@ pub fn handle_state_message(db: &HcomDb, device_id: &str, payload: &[u8], own_de
             .get("status_time")
             .and_then(|v| v.as_f64())
             .unwrap_or(0.0);
+        let status_time_i64 = status_time as i64;
 
         // Local reset wins: ignore remote snapshots older than our reset so
         // cleared instances don't reappear from broker-retained state.
@@ -242,14 +243,14 @@ pub fn handle_state_message(db: &HcomDb, device_id: &str, payload: &[u8], own_de
                     .unwrap_or("unknown"),
                 inst.get("context").and_then(|v| v.as_str()).unwrap_or(""),
                 inst.get("detail").and_then(|v| v.as_str()).unwrap_or(""),
-                status_time,
+                status_time_i64,
                 parent,
                 inst.get("directory").and_then(|v| v.as_str()),
                 inst.get("transcript").and_then(|v| v.as_str()),
                 now,
-                Option::<String>::None, // session_id
-                Option::<String>::None, // parent_session_id
-                Option::<String>::None, // agent_id
+                Option::<String>::None,
+                Option::<String>::None,
+                Option::<String>::None,
                 inst.get("wait_timeout")
                     .and_then(|v| v.as_i64())
                     .unwrap_or(86400),
@@ -553,5 +554,75 @@ fn clear_short_id(db: &HcomDb, device_id: &str) {
                 break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hooks::test_helpers::isolated_test_env;
+    use serde_json::json;
+
+    #[test]
+    fn test_handle_state_message_drops_remote_unique_identity_fields() {
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+
+        let payload = json!({
+            "state": {
+                "short_id": "ABCD",
+                "reset_ts": 0.0,
+                "instances": {
+                    "orla": {
+                        "status": "active",
+                        "context": "",
+                        "detail": "",
+                        "status_time": crate::shared::time::now_epoch_f64(),
+                        "parent": serde_json::Value::Null,
+                        "directory": "/tmp/demo-parent",
+                        "transcript": "/tmp/demo-parent/transcript.jsonl",
+                        "wait_timeout": 42,
+                        "last_stop": 0.0,
+                        "tcp_mode": false,
+                        "tag": "demo",
+                        "tool": "codex",
+                        "background": false
+                    },
+                    "luna": {
+                        "status": "active",
+                        "context": "",
+                        "detail": "",
+                        "status_time": crate::shared::time::now_epoch_f64(),
+                        "parent": "orla",
+                        "directory": "/tmp/demo",
+                        "transcript": "/tmp/demo/transcript.jsonl",
+                        "wait_timeout": 42,
+                        "last_stop": 0.0,
+                        "tcp_mode": false,
+                        "tag": "demo",
+                        "tool": "codex",
+                        "background": false
+                    }
+                }
+            },
+            "events": []
+        });
+
+        handle_state_message(
+            &db,
+            "device-1234",
+            &serde_json::to_vec(&payload).unwrap(),
+            "own-device-5678",
+        );
+
+        let row = db
+            .get_instance_full("luna:ABCD")
+            .unwrap()
+            .expect("remote row");
+        assert_eq!(row.parent_name.as_deref(), Some("orla:ABCD"));
+        assert_eq!(row.session_id, None);
+        assert_eq!(row.parent_session_id, None);
+        assert_eq!(row.agent_id, None);
+        assert_eq!(row.tool, "codex");
     }
 }

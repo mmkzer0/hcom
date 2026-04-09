@@ -221,13 +221,19 @@ pub fn handle_control_events(
                 );
             }
             "start" => {
-                // Remote start: log only. Local device would need to actually start the process.
+                // Older clients may still send remote start requests; keep rejecting
+                // them explicitly so the behavior is visible in logs instead of
+                // looking like a successful no-op.
                 log::log_with_fields(
-                    "INFO",
+                    "WARN",
                     "relay",
-                    "relay.control_recv",
+                    "relay.control_unsupported",
                     "",
-                    &[("action", "start"), ("target", target), ("ignored", "true")],
+                    &[
+                        ("action", "start"),
+                        ("target", target),
+                        ("reason", "unsupported"),
+                    ],
                 );
             }
             _ => {}
