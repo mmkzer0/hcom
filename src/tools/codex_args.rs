@@ -467,11 +467,12 @@ pub fn merge_codex_args(env_spec: &CodexArgsSpec, cli_spec: &CodexArgsSpec) -> C
     let all_bool: HashSet<String> = BOOLEAN_FLAGS.iter().map(|s| s.to_string()).collect();
     merged = deduplicate_boolean_flags(&merged, &all_bool);
 
-    // For resume: positionals immediately after subcommand
+    // For session subcommands, positionals must come immediately after the
+    // subcommand so Codex parses the target thread/session correctly.
     let mut combined = Vec::new();
     if let Some(ref sub) = final_subcommand {
         combined.push(sub.clone());
-        if sub == "resume" {
+        if matches!(sub.as_str(), "resume" | "fork") {
             combined.extend(final_positionals.iter().cloned());
             combined.extend(merged);
         } else {
@@ -903,6 +904,17 @@ mod tests {
         // Positional should come right after "resume" in rebuild
         let tokens = merged.rebuild_tokens(true, true);
         assert_eq!(tokens[0], "resume");
+        assert_eq!(tokens[1], "thread-1");
+    }
+
+    #[test]
+    fn test_merge_fork_positional_order() {
+        let env_spec = parse_tokens(&sv(&["--model", "gpt-4"]), SourceType::Env);
+        let cli_spec = parse_tokens(&sv(&["fork", "thread-1"]), SourceType::Cli);
+        let merged = merge_codex_args(&env_spec, &cli_spec);
+        assert_eq!(merged.subcommand, Some("fork".to_string()));
+        let tokens = merged.rebuild_tokens(true, true);
+        assert_eq!(tokens[0], "fork");
         assert_eq!(tokens[1], "thread-1");
     }
 

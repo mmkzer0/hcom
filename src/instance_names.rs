@@ -220,6 +220,25 @@ pub(crate) fn allocate_name(
     Err(anyhow::anyhow!("No available names left in pool"))
 }
 
+pub(crate) fn collect_taken_names(db: &HcomDb) -> Result<(HashSet<String>, HashSet<String>)> {
+    let instances = db.iter_instances_full()?;
+    let alive_names: HashSet<String> = instances.iter().map(|r| r.name.clone()).collect();
+    let mut taken_names = alive_names.clone();
+
+    let stopped: Vec<String> = {
+        let mut stmt = db.conn().prepare(
+            "SELECT DISTINCT instance FROM events
+             WHERE type = 'life' AND json_extract(data, '$.action') = 'stopped'",
+        )?;
+        stmt.query_map([], |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .collect()
+    };
+    taken_names.extend(stopped);
+
+    Ok((alive_names, taken_names))
+}
+
 /// Hash any string to a memorable 4-char name.
 /// Used for device short IDs. Uses FNV-1a hash for distribution.
 pub fn hash_to_name(input: &str, collision_attempt: u32) -> String {
@@ -265,22 +284,7 @@ pub fn generate_unique_name(db: &HcomDb) -> Result<String> {
         .map_err(|(_, e)| anyhow::anyhow!("flock failed: {}", e))?;
 
     let result = (|| -> Result<String> {
-        // Build set of taken names (alive + stopped)
-        let instances = db.iter_instances_full()?;
-        let alive_names: HashSet<String> = instances.iter().map(|r| r.name.clone()).collect();
-        let mut taken_names = alive_names.clone();
-
-        // Also check stopped instances from events to avoid name reuse
-        let stopped: Vec<String> = {
-            let mut stmt = db.conn().prepare(
-                "SELECT DISTINCT instance FROM events
-                 WHERE type = 'life' AND json_extract(data, '$.action') = 'stopped'",
-            )?;
-            stmt.query_map([], |row| row.get(0))?
-                .filter_map(|r| r.ok())
-                .collect()
-        };
-        taken_names.extend(stopped);
+        let (alive_names, taken_names) = collect_taken_names(db)?;
 
         let name = allocate_name(
             &|n| taken_names.contains(n) || db.get_instance_full(n).ok().flatten().is_some(),

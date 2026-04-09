@@ -866,7 +866,7 @@ Usage:\n\
 Launch:\n\
   hcom [N] claude|gemini|codex|opencode [flags] [tool-args]\n\
   hcom r <name>                         Resume stopped agent\n\
-  hcom f <name>                         Fork agent session\n\
+  hcom f <name>                         Fork agent session (claude/codex/opencode)\n\
   hcom kill <name(s)|tag:T|all>         Kill + close terminal pane\n\
 \n\
 Commands:\n\
@@ -1054,5 +1054,18 @@ mod tests {
         assert!(format_entry("Examples:", "").starts_with('\n'));
         // Command line
         assert!(format_entry("list", "Show agents").contains("hcom list"));
+    }
+
+    #[test]
+    fn gemini_help_states_no_fork_support() {
+        let help = get_command_help("gemini");
+        assert!(help.contains("Gemini does not support session forking (hcom f)."));
+        assert!(!help.contains("Resume / Fork:"));
+    }
+
+    #[test]
+    fn top_level_help_scopes_fork_to_supported_tools() {
+        let help = get_help_text();
+        assert!(help.contains("hcom f <name>                         Fork agent session (claude/codex/opencode)"));
     }
 }

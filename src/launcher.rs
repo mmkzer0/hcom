@@ -90,6 +90,7 @@ pub struct LaunchParams {
     pub name: Option<String>,
     pub skip_validation: bool,
     pub terminal: Option<String>,
+    pub append_reply_handoff: bool,
 }
 
 impl Default for LaunchParams {
@@ -111,6 +112,7 @@ impl Default for LaunchParams {
             name: None,
             skip_validation: false,
             terminal: None,
+            append_reply_handoff: true,
         }
     }
 }
@@ -596,7 +598,10 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
     // When a real hcom participant launched us, append a reply instruction so
     // the spawned agent knows to send its result back.
     if let Some(ref prompt) = params.initial_prompt {
-        let reply_suffix = if launcher_name != "api" && launcher_name != "user" {
+        let reply_suffix = if params.append_reply_handoff
+            && launcher_name != "api"
+            && launcher_name != "user"
+        {
             format!("\n\nWhen done, send your result back to @{launcher_name} via hcom.")
         } else {
             String::new()

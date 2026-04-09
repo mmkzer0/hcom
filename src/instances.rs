@@ -198,8 +198,8 @@ pub fn update_instance_position(
 mod tests {
     use super::*;
     use crate::instance_names::{
-        allocate_name, banned_names, gold_names, hash_to_name, is_too_similar, name_pool,
-        score_name,
+        allocate_name, banned_names, collect_taken_names, gold_names, hash_to_name,
+        is_too_similar, name_pool, score_name,
     };
     use rusqlite::Connection;
     use std::collections::HashSet;
@@ -442,6 +442,33 @@ mod tests {
             resolve_display_name_or_stopped(&db, "luna").as_deref(),
             Some("luna")
         );
+
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_collect_taken_names_includes_stopped_snapshots() {
+        let (db, path) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, status_context, created_at)
+                 VALUES ('luna', 'codex', 'listening', 'start', 0)",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data)
+                 VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'life', 'vera', ?1)",
+                rusqlite::params![serde_json::json!({"action": "stopped"}).to_string()],
+            )
+            .unwrap();
+
+        let (alive_names, taken_names) = collect_taken_names(&db).unwrap();
+        assert!(alive_names.contains("luna"));
+        assert!(!alive_names.contains("vera"));
+        assert!(taken_names.contains("luna"));
+        assert!(taken_names.contains("vera"));
 
         cleanup(path);
     }

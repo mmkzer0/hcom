@@ -7,8 +7,11 @@ use anyhow::{Result, bail};
 use serde_json::json;
 
 use crate::db::HcomDb;
+use crate::commands::launch::{
+    LaunchOutputContext, LaunchPreview, extract_launch_flags, is_background_from_args,
+    load_hcom_config, print_launch_feedback, print_launch_preview, resolve_launcher_name,
+};
 use crate::hooks::claude_args;
-use crate::identity;
 use crate::launcher::{self, LaunchParams};
 use crate::log::log_info;
 use crate::router::GlobalFlags;
@@ -85,9 +88,17 @@ pub fn do_resume(
         );
     }
 
-    // Extract hcom-level flags (--tag, --terminal, --dir) from extra args before tool parsing
-    let (tag_override, terminal_override, dir_override, clean_extra) =
-        extract_hcom_flags(extra_args);
+    validate_resume_operation(&tool, fork)?;
+
+    let hcom_config = load_hcom_config();
+    let inherited_tag = if tag.is_empty() {
+        None
+    } else {
+        Some(tag.clone())
+    };
+
+    // Extract hcom-level flags from extra args before tool parsing.
+    let (dir_override, launch_flags, clean_extra) = extract_resume_flags(extra_args);
 
     // Determine effective working directory:
     // - Explicit --dir flag wins (validated and canonicalized)
@@ -119,11 +130,10 @@ pub fn do_resume(
             .unwrap_or_else(|_| ".".to_string())
     };
 
-    // Build tool-specific resume args
-    let mut tool_args = build_resume_args(&tool, &session_id, fork);
+    let should_preview = should_preview_resume(&launch_flags, &clean_extra);
 
-    // Append cleaned extra args (without --tag/--terminal)
-    tool_args.extend(clean_extra);
+    let mut cli_tool_args = build_resume_args(&tool, &session_id, fork);
+    cli_tool_args.extend(clean_extra);
 
     // Merge with original launch args
     let original_args: Vec<String> = if !launch_args_str.is_empty() {
@@ -133,38 +143,113 @@ pub fn do_resume(
     };
 
     // For resume, merge original args with new args (new overrides)
-    let merged_args = if !original_args.is_empty() {
-        merge_resume_args(&tool, &original_args, &tool_args)
+    let merged_cli_args = if !original_args.is_empty() {
+        merge_resume_args(&tool, &original_args, &cli_tool_args)
     } else {
-        tool_args
+        cli_tool_args
     };
 
-    // Detect headless
-    let is_headless = is_headless_from_args(&tool, &merged_args) || background;
+    let mut merged_args = merged_cli_args.clone();
+
+    if launch_flags.headless && tool != "claude" {
+        bail!("--headless is only supported for Claude resume/fork launches");
+    }
+
+    let is_headless = launch_flags.headless || is_background_from_args(&tool, &merged_args) || background;
     let use_pty = tool == "claude" && !is_headless && cfg!(unix);
 
-    // Resolve launcher name: explicit --name flag > identity > "user"
-    let launcher_name = flags
-        .name
-        .as_deref()
-        .and_then(|value| {
-            identity::resolve_identity(&db, Some(value), None, None, None, None, None).ok()
-        })
-        .map(|id| id.name)
-        .or_else(|| flags.name.clone())
-        .unwrap_or_else(|| {
-            identity::resolve_identity(
-                &db,
-                None,
-                None,
-                None,
-                std::env::var("HCOM_PROCESS_ID").ok().as_deref(),
-                None,
-                None,
-            )
-            .map(|id| id.name)
-            .unwrap_or_else(|_| "user".to_string())
+    if tool == "claude" && is_headless {
+        let spec = claude_args::resolve_claude_args(Some(&merged_args), None);
+        let updated = claude_args::add_background_defaults(&spec);
+        merged_args = updated.rebuild_tokens(true);
+    }
+
+    let ctx = crate::shared::HcomContext::from_os();
+    if ctx.is_inside_ai_tool() && !flags.go && should_preview {
+        let action = if fork { "fork" } else { "resume" };
+        let identity_note = if fork {
+            format!("Fork source: {} (new identity)", name)
+        } else {
+            format!("Resume target: {} (same identity)", name)
+        };
+        let cwd_note = format!("Directory source: {}", effective_cwd);
+        let notes = [identity_note.as_str(), cwd_note.as_str()];
+        print_launch_preview(LaunchPreview {
+            action,
+            tool: &tool,
+            count: 1,
+            background: is_headless,
+            args: &merged_cli_args,
+            tag: launch_flags.tag.as_deref().or(inherited_tag.as_deref()),
+            cwd: Some(&effective_cwd),
+            terminal: launch_flags.terminal.as_deref(),
+            config: &hcom_config,
+            show_config_args: false,
+            notes: &notes,
         });
+        return Ok(0);
+    }
+
+    let launcher_name =
+        resolve_launcher_name(&db, flags, std::env::var("HCOM_PROCESS_ID").ok().as_deref());
+    let launcher_name_for_output = launcher_name.clone();
+    let fork_child_name = if fork {
+        let (alive_names, taken_names) = crate::instance_names::collect_taken_names(&db)?;
+        let candidate = crate::instance_names::allocate_name(
+            &|n| taken_names.contains(n) || db.get_instance_full(n).ok().flatten().is_some(),
+            &alive_names,
+            200,
+            1200,
+            900.0,
+        )?;
+        Some(candidate)
+    } else {
+        None
+    };
+    let effective_tag = launch_flags.tag.clone().or(inherited_tag.clone());
+    let fork_initial_prompt = if fork && tool == "codex" {
+        let child_name = fork_child_name
+            .as_deref()
+            .expect("fork child name should be generated");
+        let display_name = effective_tag
+            .as_deref()
+            .map(|tag| format!("{tag}-{child_name}"))
+            .unwrap_or_else(|| child_name.to_string());
+        let identity_reset = format!(
+            "You are a fork of {name}, but your new hcom identity is now {display_name}.\n\
+             Your hcom name is {child_name}.\n\
+             Do not use {name}'s hcom identity anymore, even if it appears in inherited thread history.\n\
+             Use [hcom:{child_name}] in your first response only.\n\
+             Use `hcom ... --name {child_name}` for all hcom commands.\n\
+             If asked about your identity, answer exactly: {display_name}"
+        );
+        Some(match launch_flags.initial_prompt.as_deref() {
+            Some(user_prompt) if !user_prompt.trim().is_empty() => {
+                format!("{identity_reset}\n\n{user_prompt}")
+            }
+            _ => identity_reset,
+        })
+    } else {
+        launch_flags.initial_prompt.clone()
+    };
+    let output_tag = effective_tag.clone();
+    let launch_tag = effective_tag.clone();
+    let base_system_prompt = resume_system_prompt(&tool, &name, fork);
+    let effective_system_prompt = match launch_flags.system_prompt.as_deref() {
+        Some(custom) if !custom.trim().is_empty() => format!("{base_system_prompt}\n\n{custom}"),
+        _ => base_system_prompt,
+    };
+    let output = LaunchOutputContext {
+        action: if fork { "fork" } else { "resume" },
+        tool: &tool,
+        requested_count: 1,
+        tag: output_tag.as_deref(),
+        launcher_name: &launcher_name_for_output,
+        terminal: launch_flags.terminal.as_deref(),
+        background: is_headless,
+        run_here: launch_flags.run_here,
+        hcom_config: &hcom_config,
+    };
 
     // Launch
     let result = launcher::launch(
@@ -173,28 +258,20 @@ pub fn do_resume(
             tool: tool.clone(),
             count: 1,
             args: merged_args,
-            tag: tag_override.or(if tag.is_empty() { None } else { Some(tag) }),
-            system_prompt: Some(if fork {
-                format!(
-                    "YOU ARE A FORK of agent '{}'. \
-                     You have the same session history but are a NEW agent. \
-                     Run hcom start to get your own identity.",
-                    name
-                )
-            } else {
-                format!("YOUR SESSION HAS BEEN RESUMED! You are still '{}'.", name)
-            }),
+            tag: launch_tag,
+            system_prompt: Some(effective_system_prompt),
             pty: use_pty,
             background: is_headless,
             cwd: Some(effective_cwd),
             env: None,
             launcher: Some(launcher_name),
-            run_here: None,
-            initial_prompt: None,
-            batch_id: None,
-            name: if fork { None } else { Some(name.clone()) },
-            skip_validation: true,
-            terminal: terminal_override,
+            run_here: launch_flags.run_here,
+            initial_prompt: fork_initial_prompt,
+            batch_id: launch_flags.batch_id.clone(),
+            name: if fork { fork_child_name } else { Some(name.clone()) },
+            skip_validation: false,
+            terminal: launch_flags.terminal.clone(),
+            append_reply_handoff: !(fork && tool == "codex"),
         },
     )?;
 
@@ -207,10 +284,7 @@ pub fn do_resume(
         );
     }
 
-    if result.launched > 0 {
-        let action = if fork { "Forked" } else { "Resumed" };
-        println!("{} {} ({})", action, name, tool);
-    }
+    print_launch_feedback(&db, &result, &output)?;
 
     log_info(
         if fork { "fork" } else { "resume" },
@@ -224,46 +298,66 @@ pub fn do_resume(
     Ok(if result.launched > 0 { 0 } else { 1 })
 }
 
-/// Extract hcom-level flags (--tag, --terminal, --name, --go) from args.
-/// Returns (tag, terminal, remaining) with hcom flags stripped.
-fn extract_hcom_flags(
+/// Extract resume-only flags, then reuse the shared launch flag parser.
+fn extract_resume_flags(
     args: &[String],
-) -> (Option<String>, Option<String>, Option<String>, Vec<String>) {
-    let mut tag = None;
-    let mut terminal = None;
+) -> (Option<String>, crate::commands::launch::HcomLaunchFlags, Vec<String>) {
     let mut dir = None;
-    let mut remaining = Vec::new();
+    let mut filtered = Vec::new();
     let mut i = 0;
     while i < args.len() {
-        if args[i] == "--tag" && i + 1 < args.len() {
-            tag = Some(args[i + 1].clone());
-            i += 2;
-        } else if args[i].starts_with("--tag=") {
-            tag = Some(args[i][6..].to_string());
-            i += 1;
-        } else if args[i] == "--terminal" && i + 1 < args.len() {
-            terminal = Some(args[i + 1].clone());
-            i += 2;
-        } else if args[i].starts_with("--terminal=") {
-            terminal = Some(args[i][11..].to_string());
-            i += 1;
+        if args[i] == "--" {
+            filtered.extend_from_slice(&args[i..]);
+            break;
         } else if args[i] == "--dir" && i + 1 < args.len() {
             dir = Some(args[i + 1].clone());
             i += 2;
         } else if args[i].starts_with("--dir=") {
             dir = Some(args[i][6..].to_string());
             i += 1;
-        } else if args[i] == "--name" && i + 1 < args.len() {
-            // --name is a global hcom flag, strip it so it doesn't leak to tool CLI
-            i += 2;
-        } else if args[i] == "--go" {
-            i += 1;
         } else {
-            remaining.push(args[i].clone());
+            filtered.push(args[i].clone());
             i += 1;
         }
     }
-    (tag, terminal, dir, remaining)
+    let (flags, remaining) = extract_launch_flags(&filtered);
+    (dir, flags, remaining)
+}
+
+fn should_preview_resume(
+    launch_flags: &crate::commands::launch::HcomLaunchFlags,
+    tool_args: &[String],
+) -> bool {
+    !tool_args.is_empty() || *launch_flags != crate::commands::launch::HcomLaunchFlags::default()
+}
+
+fn validate_resume_operation(tool: &str, fork: bool) -> Result<()> {
+    if fork && tool == "gemini" {
+        bail!("Gemini does not support session forking (hcom f)");
+    }
+    Ok(())
+}
+
+fn resume_system_prompt(tool: &str, name: &str, fork: bool) -> String {
+    if fork {
+        if tool == "codex" {
+            format!(
+                "YOU ARE A FORK of agent '{}'. \
+                 You have the same session history but are a NEW agent with an already-assigned hcom identity. \
+                 Use that assigned identity for all hcom commands.",
+                name
+            )
+        } else {
+            format!(
+                "YOU ARE A FORK of agent '{}'. \
+                 You have the same session history but are a NEW agent. \
+                 Run hcom start to get your own identity.",
+                name
+            )
+        }
+    } else {
+        format!("YOUR SESSION HAS BEEN RESUMED! You are still '{}'.", name)
+    }
 }
 
 /// Load data from an active or stopped instance.
@@ -405,31 +499,44 @@ fn merge_resume_args(tool: &str, original: &[String], resume: &[String]) -> Vec<
             merged.rebuild_tokens(true, true)
         }
         "codex" => {
-            let orig_spec = codex_args::resolve_codex_args(Some(original), None);
+            let stripped_original =
+                crate::tools::codex_preprocessing::strip_codex_developer_instructions(original);
+            let orig_spec = codex_args::resolve_codex_args(Some(&stripped_original), None);
             let resume_spec = codex_args::resolve_codex_args(Some(resume), None);
             let merged = codex_args::merge_codex_args(&orig_spec, &resume_spec);
             merged.rebuild_tokens(true, true)
         }
+        "opencode" => merge_opencode_args(original, resume),
         _ => {
-            // For opencode and unknown: resume args only
+            // For unknown tools: resume args only.
             resume.to_vec()
         }
     }
 }
 
-/// Check if args indicate headless mode.
-fn is_headless_from_args(tool: &str, args: &[String]) -> bool {
-    match tool {
-        "claude" | "claude-pty" => {
-            let spec = claude_args::resolve_claude_args(Some(args), None);
-            spec.is_background
+fn merge_opencode_args(original: &[String], resume: &[String]) -> Vec<String> {
+    let mut preserved = Vec::new();
+    let mut i = 0;
+
+    while i < original.len() {
+        let token = &original[i];
+
+        if token == "--session" || token == "--prompt" {
+            i += 2;
+            continue;
         }
-        "gemini" => {
-            let spec = gemini_args::resolve_gemini_args(Some(args), None);
-            spec.is_headless
+        if token == "--fork" || token.starts_with("--session=") || token.starts_with("--prompt=") {
+            i += 1;
+            continue;
         }
-        _ => false,
+
+        preserved.push(token.clone());
+        i += 1;
     }
+
+    let mut merged = resume.to_vec();
+    merged.extend(preserved);
+    merged
 }
 
 #[cfg(test)]
@@ -490,57 +597,194 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_resume_operation_rejects_gemini_fork() {
+        let err = validate_resume_operation("gemini", true).unwrap_err().to_string();
+        assert_eq!(err, "Gemini does not support session forking (hcom f)");
+    }
+
+    #[test]
+    fn test_validate_resume_operation_allows_gemini_resume() {
+        assert!(validate_resume_operation("gemini", false).is_ok());
+    }
+
+    #[test]
+    fn test_merge_resume_args_opencode_preserves_non_session_flags() {
+        let merged = merge_resume_args(
+            "opencode",
+            &s(&[
+                "--model",
+                "openai/gpt-5.4",
+                "--session",
+                "old-sess",
+                "--prompt",
+                "old prompt",
+                "--approval-mode",
+                "on-request",
+            ]),
+            &s(&["--session", "new-sess", "--fork"]),
+        );
+        assert_eq!(
+            merged,
+            s(&[
+                "--session",
+                "new-sess",
+                "--fork",
+                "--model",
+                "openai/gpt-5.4",
+                "--approval-mode",
+                "on-request",
+            ])
+        );
+    }
+
+    #[test]
+    fn test_merge_resume_args_opencode_strips_equals_form_session_and_prompt() {
+        let merged = merge_resume_args(
+            "opencode",
+            &s(&[
+                "--session=old-sess",
+                "--prompt=old prompt",
+                "--model",
+                "anthropic/claude-sonnet-4-6",
+            ]),
+            &s(&["--session", "new-sess"]),
+        );
+        assert_eq!(
+            merged,
+            s(&[
+                "--session",
+                "new-sess",
+                "--model",
+                "anthropic/claude-sonnet-4-6",
+            ])
+        );
+    }
+
+    #[test]
     fn test_build_resume_args_opencode_fork() {
         let args = build_resume_args("opencode", "sess-000", true);
         assert_eq!(args, s(&["--session", "sess-000", "--fork"]));
     }
 
     #[test]
-    fn test_extract_hcom_flags_terminal() {
-        let (tag, terminal, dir, remaining) =
-            extract_hcom_flags(&s(&["--terminal", "alacritty", "--model", "opus"]));
-        assert_eq!(tag, None);
-        assert_eq!(terminal, Some("alacritty".to_string()));
+    fn test_extract_resume_flags_terminal() {
+        let (dir, flags, remaining) = extract_resume_flags(&s(&["--terminal", "alacritty", "--model", "opus"]));
         assert_eq!(dir, None);
+        assert_eq!(flags.terminal, Some("alacritty".to_string()));
         assert_eq!(remaining, s(&["--model", "opus"]));
     }
 
     #[test]
-    fn test_extract_hcom_flags_tag_and_terminal() {
-        let (tag, terminal, dir, remaining) =
-            extract_hcom_flags(&s(&["--tag", "test", "--terminal", "kitty"]));
-        assert_eq!(tag, Some("test".to_string()));
-        assert_eq!(terminal, Some("kitty".to_string()));
+    fn test_extract_resume_flags_tag_and_terminal() {
+        let (dir, flags, remaining) = extract_resume_flags(&s(&["--tag", "test", "--terminal", "kitty"]));
         assert_eq!(dir, None);
+        assert_eq!(flags.tag, Some("test".to_string()));
+        assert_eq!(flags.terminal, Some("kitty".to_string()));
         assert!(remaining.is_empty());
     }
 
     #[test]
-    fn test_extract_hcom_flags_equals_form() {
-        let (tag, terminal, dir, remaining) =
-            extract_hcom_flags(&s(&["--tag=test", "--terminal=alacritty"]));
-        assert_eq!(tag, Some("test".to_string()));
-        assert_eq!(terminal, Some("alacritty".to_string()));
+    fn test_extract_resume_flags_equals_form() {
+        let (dir, flags, remaining) = extract_resume_flags(&s(&["--tag=test", "--terminal=alacritty"]));
         assert_eq!(dir, None);
+        assert_eq!(flags.tag, Some("test".to_string()));
+        assert_eq!(flags.terminal, Some("alacritty".to_string()));
         assert!(remaining.is_empty());
     }
 
     #[test]
-    fn test_extract_hcom_flags_none() {
-        let (tag, terminal, dir, remaining) = extract_hcom_flags(&s(&["--model", "opus"]));
-        assert_eq!(tag, None);
-        assert_eq!(terminal, None);
+    fn test_extract_resume_flags_none() {
+        let (dir, flags, remaining) = extract_resume_flags(&s(&["--model", "opus"]));
         assert_eq!(dir, None);
+        assert_eq!(flags.tag, None);
+        assert_eq!(flags.terminal, None);
         assert_eq!(remaining, s(&["--model", "opus"]));
     }
 
     #[test]
-    fn test_extract_hcom_flags_dir() {
-        let (tag, terminal, dir, remaining) =
-            extract_hcom_flags(&s(&["--dir", "/tmp/test", "--model", "opus"]));
-        assert_eq!(tag, None);
-        assert_eq!(terminal, None);
+    fn test_extract_resume_flags_dir() {
+        let (dir, flags, remaining) = extract_resume_flags(&s(&["--dir", "/tmp/test", "--model", "opus"]));
         assert_eq!(dir, Some("/tmp/test".to_string()));
+        assert_eq!(flags.tag, None);
+        assert_eq!(flags.terminal, None);
         assert_eq!(remaining, s(&["--model", "opus"]));
+    }
+
+    #[test]
+    fn test_extract_resume_flags_shared_launch_flags() {
+        let (dir, flags, remaining) = extract_resume_flags(&s(&[
+            "--dir=/tmp/test",
+            "--headless",
+            "--batch-id",
+            "batch-1",
+            "--run-here",
+            "--hcom-prompt",
+            "hi",
+            "--hcom-system-prompt",
+            "sys",
+            "--model",
+            "opus",
+        ]));
+        assert_eq!(dir, Some("/tmp/test".to_string()));
+        assert!(flags.headless);
+        assert_eq!(flags.batch_id, Some("batch-1".to_string()));
+        assert_eq!(flags.run_here, Some(true));
+        assert_eq!(flags.initial_prompt, Some("hi".to_string()));
+        assert_eq!(flags.system_prompt, Some("sys".to_string()));
+        assert_eq!(remaining, s(&["--model", "opus"]));
+    }
+
+    #[test]
+    fn test_extract_resume_flags_stops_at_double_dash() {
+        let (dir, flags, remaining) = extract_resume_flags(&s(&[
+            "--dir",
+            "/tmp/test",
+            "--",
+            "--dir",
+            "tool-dir",
+            "--model",
+            "opus",
+        ]));
+        assert_eq!(dir, Some("/tmp/test".to_string()));
+        assert_eq!(flags, crate::commands::launch::HcomLaunchFlags::default());
+        assert_eq!(remaining, s(&["--dir", "tool-dir", "--model", "opus"]));
+    }
+
+    #[test]
+    fn test_should_preview_resume_false_for_plain_resume() {
+        assert!(!should_preview_resume(
+            &crate::commands::launch::HcomLaunchFlags::default(),
+            &[]
+        ));
+    }
+
+    #[test]
+    fn test_should_preview_resume_true_for_tool_args() {
+        assert!(should_preview_resume(
+            &crate::commands::launch::HcomLaunchFlags::default(),
+            &s(&["--model", "opus"])
+        ));
+    }
+
+    #[test]
+    fn test_should_preview_resume_true_for_hcom_only_flags() {
+        let flags = crate::commands::launch::HcomLaunchFlags {
+            terminal: Some("kitty".to_string()),
+            ..Default::default()
+        };
+        assert!(should_preview_resume(&flags, &[]));
+    }
+
+    #[test]
+    fn test_resume_system_prompt_codex_fork_does_not_tell_agent_to_rebind() {
+        let prompt = resume_system_prompt("codex", "luna", true);
+        assert!(prompt.contains("already-assigned hcom identity"));
+        assert!(!prompt.contains("Run hcom start"));
+    }
+
+    #[test]
+    fn test_resume_system_prompt_non_codex_fork_still_uses_start_guidance() {
+        let prompt = resume_system_prompt("claude", "luna", true);
+        assert!(prompt.contains("Run hcom start"));
     }
 }

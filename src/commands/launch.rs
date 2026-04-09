@@ -7,10 +7,11 @@
 use anyhow::{Result, bail};
 
 use crate::config::HcomConfig;
+use crate::core::tips::{self, LaunchTipsContext};
 use crate::db::HcomDb;
 use crate::hooks::claude_args;
 use crate::identity;
-use crate::launcher::{self, LaunchParams};
+use crate::launcher::{self, LaunchParams, LaunchResult};
 use crate::log::log_info;
 use crate::router::GlobalFlags;
 use crate::shared::HcomContext;
@@ -32,13 +33,10 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
     let tag = hcom_flags.tag;
     let terminal = hcom_flags.terminal;
     let headless = hcom_flags.headless;
+    let tag_for_output = tag.clone();
+    let terminal_for_output = terminal.clone();
 
-    // Load config for env-based args
-    let hcom_config = HcomConfig::load(None).unwrap_or_else(|_| {
-        let mut c = HcomConfig::default();
-        c.normalize();
-        c
-    });
+    let hcom_config = load_hcom_config();
 
     // Merge env config args with CLI args
     let mut merged_args = merge_tool_args(&tool, &tool_args, &hcom_config);
@@ -57,7 +55,19 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
     // --go confirmation gate: preview when args present or large batch
     let ctx = HcomContext::from_os();
     if ctx.is_inside_ai_tool() && !flags.go && (!tool_args.is_empty() || count > 5) {
-        print_launch_preview(&tool, count, background, &tool_args, &tag, &hcom_config);
+        print_launch_preview(LaunchPreview {
+            action: "launch",
+            tool: &tool,
+            count,
+            background,
+            args: &tool_args,
+            tag: tag.as_deref(),
+            cwd: None,
+            terminal: terminal.as_deref(),
+            config: &hcom_config,
+            show_config_args: true,
+            notes: &[],
+        });
         return Ok(0);
     }
 
@@ -72,9 +82,17 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
         resolve_launcher_name(&db, flags, std::env::var("HCOM_PROCESS_ID").ok().as_deref());
     let launcher_name_ref = launcher_name.as_str();
 
-    // Clone for post-launch tips (originals are moved into LaunchParams)
-    let tag_for_tips = tag.clone();
-    let terminal_for_tips = terminal.clone();
+    let output = LaunchOutputContext {
+        action: "launch",
+        tool: &tool,
+        requested_count: count,
+        tag: tag_for_output.as_deref(),
+        launcher_name: launcher_name_ref,
+        terminal: terminal_for_output.as_deref(),
+        background,
+        run_here: hcom_flags.run_here,
+        hcom_config: &hcom_config,
+    };
 
     let result = launcher::launch(
         &db,
@@ -99,73 +117,11 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
             name: None, // --name is caller identity, not instance name
             skip_validation: false,
             terminal,
+            append_reply_handoff: true,
         },
     )?;
 
-    // Surface errors
-    if result.failed > 0 {
-        for err in &result.errors {
-            if let Some(msg) = err.get("error").and_then(|v| v.as_str()) {
-                eprintln!("Error: {}", msg);
-            }
-        }
-    }
-
-    if result.launched == 0 && result.failed > 0 {
-        return Ok(1);
-    }
-
-    // Print summary
-    let tool_label = capitalize(&tool);
-    let plural = if count != 1 { "s" } else { "" };
-    if result.failed > 0 {
-        println!(
-            "Started the launch process for {}/{} {} agent{} ({} failed)",
-            result.launched, count, tool_label, plural, result.failed
-        );
-    } else {
-        let s = if result.launched != 1 { "s" } else { "" };
-        println!(
-            "Started the launch process for {} {} agent{}",
-            result.launched, tool_label, s
-        );
-    }
-
-    let instance_names: Vec<&str> = result
-        .handles
-        .iter()
-        .filter_map(|h| h.get("instance_name").and_then(|v| v.as_str()))
-        .collect();
-    if !instance_names.is_empty() {
-        println!("Names: {}", instance_names.join(", "));
-    }
-    println!("Batch id: {}", result.batch_id);
-    println!("To block until ready or fail (30s timeout), run: hcom events launch");
-
-    // Launch tips
-    let launcher_participating = db
-        .get_instance_full(launcher_name_ref)
-        .ok()
-        .flatten()
-        .is_some();
-    let (terminal_mode, terminal_auto_detected) = crate::terminal::resolve_terminal_mode_for_tips(
-        terminal_for_tips.as_deref(),
-        &hcom_config.terminal,
-        background,
-        hcom_flags.run_here.unwrap_or(false),
-    );
-    crate::core::tips::print_launch_tips(
-        &db,
-        crate::core::tips::LaunchTipsContext {
-            launched: result.launched,
-            tag: tag_for_tips.as_deref(),
-            launcher_name: Some(launcher_name_ref),
-            launcher_participating,
-            background,
-            terminal_mode: &terminal_mode,
-            terminal_auto_detected,
-        },
-    );
+    print_launch_feedback(&db, &result, &output)?;
 
     // Log summary
     log_info(
@@ -180,7 +136,11 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
     Ok(if result.failed == 0 { 0 } else { 1 })
 }
 
-fn resolve_launcher_name(db: &HcomDb, flags: &GlobalFlags, process_id: Option<&str>) -> String {
+pub(crate) fn resolve_launcher_name(
+    db: &HcomDb,
+    flags: &GlobalFlags,
+    process_id: Option<&str>,
+) -> String {
     // Launch caller identity only needs explicit --name, then process binding.
     flags
         .name
@@ -205,67 +165,94 @@ fn capitalize(s: &str) -> String {
 }
 
 /// Print launch preview when --go gate blocks inside AI tool.
-fn print_launch_preview(
-    tool: &str,
-    count: usize,
-    background: bool,
-    args: &[String],
-    tag: &Option<String>,
-    config: &HcomConfig,
-) {
-    let mode = if background {
+pub(crate) struct LaunchPreview<'a> {
+    pub action: &'a str,
+    pub tool: &'a str,
+    pub count: usize,
+    pub background: bool,
+    pub args: &'a [String],
+    pub tag: Option<&'a str>,
+    pub cwd: Option<&'a str>,
+    pub terminal: Option<&'a str>,
+    pub config: &'a HcomConfig,
+    pub show_config_args: bool,
+    pub notes: &'a [&'a str],
+}
+
+pub(crate) fn print_launch_preview(preview: LaunchPreview<'_>) {
+    let mode = if preview.background {
         "headless"
     } else {
         "interactive"
     };
-    let cwd = std::env::current_dir()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|_| ".".to_string());
-    let args_key = format!("HCOM_{}_ARGS", tool.to_uppercase());
-    let env_args = match tool {
-        "claude" => &config.claude_args,
-        "gemini" => &config.gemini_args,
-        "codex" => &config.codex_args,
-        "opencode" => &config.opencode_args,
-        _ => "",
+    let cwd = preview
+        .cwd
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            std::env::current_dir()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| ".".to_string())
+        });
+    let args_key = format!("HCOM_{}_ARGS", preview.tool.to_uppercase());
+    let env_args = if preview.show_config_args {
+        match preview.tool {
+            "claude" => &preview.config.claude_args,
+            "gemini" => &preview.config.gemini_args,
+            "codex" => &preview.config.codex_args,
+            "opencode" => &preview.config.opencode_args,
+            _ => "",
+        }
+    } else {
+        ""
     };
 
-    let terminal = std::env::var("HCOM_TERMINAL").unwrap_or_else(|_| config.terminal.clone());
+    let terminal = preview
+        .terminal
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("HCOM_TERMINAL").ok())
+        .unwrap_or_else(|| preview.config.terminal.clone());
 
     println!("\n== LAUNCH PREVIEW ==");
     println!("Add --go to proceed.\n");
-    println!("Tool: {:<10} Count: {:<4} Mode: {}", tool, count, mode);
+    println!("Action: {}", preview.action);
+    println!(
+        "Tool: {:<10} Count: {:<4} Mode: {}",
+        preview.tool, preview.count, mode
+    );
     println!("Directory: {}", cwd);
     println!("Terminal: {}", terminal);
-    if let Some(t) = tag {
+    if let Some(t) = preview.tag {
         println!("Tag: {} (names will be {}-*)", t, t);
+    }
+    for note in preview.notes {
+        println!("{note}");
     }
 
     // Args — only show if there's something to show
-    if !env_args.is_empty() || !args.is_empty() {
+    if !env_args.is_empty() || !preview.args.is_empty() {
         println!("\nArgs:");
         if !env_args.is_empty() {
             println!("  From config ({}): {}", args_key, env_args);
         }
-        if !args.is_empty() {
-            println!("  From CLI: {}", args.join(" "));
+        if !preview.args.is_empty() {
+            println!("  From CLI: {}", preview.args.join(" "));
         }
-        if !env_args.is_empty() && !args.is_empty() {
+        if !env_args.is_empty() && !preview.args.is_empty() {
             println!("  (CLI overrides config per-flag)");
         }
     }
 }
 
 /// Hcom-level flags extracted from launch argv.
-#[derive(Debug, Default)]
-struct HcomLaunchFlags {
-    tag: Option<String>,
-    terminal: Option<String>,
-    headless: bool,
-    system_prompt: Option<String>,
-    initial_prompt: Option<String>,
-    run_here: Option<bool>,
-    batch_id: Option<String>,
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct HcomLaunchFlags {
+    pub tag: Option<String>,
+    pub terminal: Option<String>,
+    pub headless: bool,
+    pub system_prompt: Option<String>,
+    pub initial_prompt: Option<String>,
+    pub run_here: Option<bool>,
+    pub batch_id: Option<String>,
 }
 
 /// Parse launch argv: extract count, tool name, hcom flags, and tool-specific args.
@@ -314,87 +301,13 @@ fn parse_launch_argv(argv: &[String]) -> Result<(usize, String, HcomLaunchFlags,
     let tool = argv[idx].to_string();
     idx += 1;
 
-    // Extract hcom flags from anywhere in remaining args (order-independent).
-    // Everything not recognized as an hcom flag is passed through as a tool arg.
-    let mut flags = HcomLaunchFlags::default();
-    let mut tool_args = Vec::new();
-    let remaining = &argv[idx..];
-    let mut i = 0;
-
-    while i < remaining.len() {
-        // Bare `--` separates hcom flags from tool args — pass the rest through
-        if remaining[i] == "--" {
-            tool_args.extend_from_slice(&remaining[i + 1..]);
-            break;
-        }
-        // Handle --tag=value and --terminal=value equals-form
-        if remaining[i].starts_with("--tag=") {
-            flags.tag = Some(remaining[i][6..].to_string());
-            i += 1;
-            continue;
-        }
-        if remaining[i].starts_with("--terminal=") {
-            flags.terminal = Some(remaining[i][11..].to_string());
-            i += 1;
-            continue;
-        }
-        match remaining[i].as_str() {
-            "--tag" if i + 1 < remaining.len() => {
-                flags.tag = Some(remaining[i + 1].clone());
-                i += 2;
-            }
-            "--terminal" if i + 1 < remaining.len() => {
-                flags.terminal = Some(remaining[i + 1].clone());
-                i += 2;
-            }
-            "--headless" => {
-                flags.headless = true;
-                i += 1;
-            }
-            "--hcom-system-prompt" if i + 1 < remaining.len() => {
-                flags.system_prompt = Some(remaining[i + 1].clone());
-                i += 2;
-            }
-            // Legacy alias
-            "--system" if i + 1 < remaining.len() => {
-                flags.system_prompt = Some(remaining[i + 1].clone());
-                i += 2;
-            }
-            "--hcom-prompt" if i + 1 < remaining.len() => {
-                flags.initial_prompt = Some(remaining[i + 1].clone());
-                i += 2;
-            }
-            "--batch-id" if i + 1 < remaining.len() => {
-                flags.batch_id = Some(remaining[i + 1].clone());
-                i += 2;
-            }
-            "--run-here" => {
-                flags.run_here = Some(true);
-                i += 1;
-            }
-            "--no-run-here" => {
-                flags.run_here = Some(false);
-                i += 1;
-            }
-            // Skip global flags (--name/--go) that weren't at the start of argv
-            "--name" if i + 1 < remaining.len() => {
-                i += 2;
-            }
-            "--go" => {
-                i += 1;
-            }
-            _ => {
-                tool_args.push(remaining[i].clone());
-                i += 1;
-            }
-        }
-    }
+    let (flags, tool_args) = extract_launch_flags(&argv[idx..]);
 
     Ok((count, tool, flags, tool_args))
 }
 
 /// Merge env config args with CLI args via tool-specific parsers.
-fn merge_tool_args(tool: &str, cli_args: &[String], config: &HcomConfig) -> Vec<String> {
+pub(crate) fn merge_tool_args(tool: &str, cli_args: &[String], config: &HcomConfig) -> Vec<String> {
     match tool {
         "claude" | "claude-pty" => {
             let env_str = &config.claude_args;
@@ -437,7 +350,7 @@ fn merge_tool_args(tool: &str, cli_args: &[String], config: &HcomConfig) -> Vec<
 }
 
 /// Check if args indicate background/headless mode.
-fn is_background_from_args(tool: &str, args: &[String]) -> bool {
+pub(crate) fn is_background_from_args(tool: &str, args: &[String]) -> bool {
     match tool {
         "claude" | "claude-pty" => {
             let spec = claude_args::resolve_claude_args(Some(args), None);
@@ -449,6 +362,164 @@ fn is_background_from_args(tool: &str, args: &[String]) -> bool {
         }
         _ => false,
     }
+}
+
+pub(crate) fn load_hcom_config() -> HcomConfig {
+    HcomConfig::load(None).unwrap_or_else(|_| {
+        let mut c = HcomConfig::default();
+        c.normalize();
+        c
+    })
+}
+
+pub(crate) fn extract_launch_flags(args: &[String]) -> (HcomLaunchFlags, Vec<String>) {
+    let mut flags = HcomLaunchFlags::default();
+    let mut tool_args = Vec::new();
+    let mut i = 0;
+
+    while i < args.len() {
+        if args[i] == "--" {
+            tool_args.extend_from_slice(&args[i + 1..]);
+            break;
+        }
+        if args[i].starts_with("--tag=") {
+            flags.tag = Some(args[i][6..].to_string());
+            i += 1;
+            continue;
+        }
+        if args[i].starts_with("--terminal=") {
+            flags.terminal = Some(args[i][11..].to_string());
+            i += 1;
+            continue;
+        }
+        match args[i].as_str() {
+            "--tag" if i + 1 < args.len() => {
+                flags.tag = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--terminal" if i + 1 < args.len() => {
+                flags.terminal = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--headless" => {
+                flags.headless = true;
+                i += 1;
+            }
+            "--hcom-system-prompt" if i + 1 < args.len() => {
+                flags.system_prompt = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--system" if i + 1 < args.len() => {
+                flags.system_prompt = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--hcom-prompt" if i + 1 < args.len() => {
+                flags.initial_prompt = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--batch-id" if i + 1 < args.len() => {
+                flags.batch_id = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--run-here" => {
+                flags.run_here = Some(true);
+                i += 1;
+            }
+            "--no-run-here" => {
+                flags.run_here = Some(false);
+                i += 1;
+            }
+            "--name" if i + 1 < args.len() => {
+                i += 2;
+            }
+            "--go" => {
+                i += 1;
+            }
+            _ => {
+                tool_args.push(args[i].clone());
+                i += 1;
+            }
+        }
+    }
+
+    (flags, tool_args)
+}
+
+pub(crate) struct LaunchOutputContext<'a> {
+    pub action: &'a str,
+    pub tool: &'a str,
+    pub requested_count: usize,
+    pub tag: Option<&'a str>,
+    pub launcher_name: &'a str,
+    pub terminal: Option<&'a str>,
+    pub background: bool,
+    pub run_here: Option<bool>,
+    pub hcom_config: &'a HcomConfig,
+}
+
+pub(crate) fn print_launch_feedback(
+    db: &HcomDb,
+    result: &LaunchResult,
+    ctx: &LaunchOutputContext<'_>,
+) -> Result<()> {
+    if result.failed > 0 {
+        for err in &result.errors {
+            if let Some(msg) = err.get("error").and_then(|v| v.as_str()) {
+                eprintln!("Error: {}", msg);
+            }
+        }
+    }
+
+    if result.launched == 0 && result.failed > 0 {
+        return Ok(());
+    }
+
+    let tool_label = capitalize(ctx.tool);
+    let plural = if ctx.requested_count != 1 { "s" } else { "" };
+    if result.failed > 0 {
+        println!(
+            "Started the {} process for {}/{} {} agent{} ({} failed)",
+            ctx.action, result.launched, ctx.requested_count, tool_label, plural, result.failed
+        );
+    } else {
+        let s = if result.launched != 1 { "s" } else { "" };
+        println!(
+            "Started the {} process for {} {} agent{}",
+            ctx.action, result.launched, tool_label, s
+        );
+    }
+
+    let instance_names: Vec<&str> = result
+        .handles
+        .iter()
+        .filter_map(|h| h.get("instance_name").and_then(|v| v.as_str()))
+        .collect();
+    if !instance_names.is_empty() {
+        println!("Names: {}", instance_names.join(", "));
+    }
+    println!("Batch id: {}", result.batch_id);
+    println!("To block until ready or fail (30s timeout), run: hcom events launch");
+
+    let launcher_participating = db.get_instance_full(ctx.launcher_name).ok().flatten().is_some();
+    let (terminal_mode, terminal_auto_detected) = crate::terminal::resolve_terminal_mode_for_tips(
+        ctx.terminal,
+        &ctx.hcom_config.terminal,
+        ctx.background,
+        ctx.run_here.unwrap_or(false),
+    );
+    tips::print_launch_tips(
+        db,
+        LaunchTipsContext {
+            launched: result.launched,
+            tag: ctx.tag,
+            launcher_name: Some(ctx.launcher_name),
+            launcher_participating,
+            background: ctx.background,
+            terminal_mode: &terminal_mode,
+            terminal_auto_detected,
+        },
+    );
+    Ok(())
 }
 
 #[cfg(test)]
