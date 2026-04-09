@@ -1785,9 +1785,17 @@ pub fn load_claude_settings(settings_path: &Path) -> Option<Value> {
     serde_json::from_str(&content).ok()
 }
 
-/// Get hook command string. Uses ${HCOM} env var set in settings.json.
-fn get_hook_command() -> String {
-    "${HCOM}".to_string()
+/// Build a hook command that silently exits 0 when hcom is not installed.
+///
+/// Uses the ${HCOM:-hcom} env var (set in settings.json env block) so it works
+/// for both direct `hcom` and `uvx hcom` invocations. When the binary is absent
+/// (e.g. after `brew uninstall hcom`), the hook exits 0 instead of emitting a
+/// "command not found" error inside the tool.
+fn build_hook_entry_command(cmd_suffix: &str) -> String {
+    format!(
+        "sh -c 'cmd=${{HCOM:-hcom}}; command -v \"${{cmd%% *}}\" >/dev/null 2>&1 && exec $cmd {} || exit 0'",
+        cmd_suffix
+    )
 }
 
 /// Format a single Claude permission pattern: `Bash(prefix cmd:*)`.
@@ -1819,7 +1827,7 @@ fn build_all_claude_permission_patterns() -> Vec<String> {
 /// Check if a hook command string matches any hcom hook pattern.
 fn is_hcom_hook_command(command: &str) -> bool {
     // Env var patterns: ${HCOM} or %HCOM%
-    if command.contains("${HCOM}") || command.contains("$HCOM") || command.contains("%HCOM%") {
+    if command.contains("${HCOM}") || command.contains("$HCOM") || command.contains("%HCOM%") || command.contains("${HCOM:-") {
         return true;
     }
 
@@ -2004,9 +2012,6 @@ pub fn setup_claude_hooks(include_permissions: bool) -> bool {
     // Remove existing hcom hooks
     remove_hcom_hooks_from_settings(&mut settings);
 
-    // Build hook commands from CLAUDE_HOOK_CONFIGS
-    let hook_cmd_base = get_hook_command();
-
     for &(hook_type, matcher, cmd_suffix, timeout) in CLAUDE_HOOK_CONFIGS {
         // Initialize or normalize hook_type to array
         if !settings["hooks"]
@@ -2018,7 +2023,7 @@ pub fn setup_claude_hooks(include_permissions: bool) -> bool {
 
         let mut hook_entry = serde_json::json!({
             "type": "command",
-            "command": format!("{} {}", hook_cmd_base, cmd_suffix),
+            "command": build_hook_entry_command(cmd_suffix),
         });
 
         if let Some(t) = timeout {
@@ -2705,9 +2710,8 @@ mod tests {
                     .collect();
             }
         };
-        let hook_cmd_base = get_hook_command();
         for &(hook_type, cmd_suffix) in expected {
-            let expected_full = format!("{} {}", hook_cmd_base, cmd_suffix);
+            let expected_full = build_hook_entry_command(cmd_suffix);
             let matchers = match hooks.get(hook_type).and_then(|v| v.as_array()) {
                 Some(a) => a,
                 None => {
@@ -2760,8 +2764,7 @@ mod tests {
             assert!(!arr.is_empty(), "{hook_type} should have entries");
 
             // Find the hcom hook entry with exact command match
-            let hook_cmd_base = get_hook_command();
-            let expected_command = format!("{} {}", hook_cmd_base, cmd_suffix);
+            let expected_command = build_hook_entry_command(cmd_suffix);
             let mut found = false;
             for entry in arr {
                 let hooks_list = entry.get("hooks").and_then(|v| v.as_array());

@@ -1078,12 +1078,16 @@ pub fn setup_gemini_hooks(include_permissions: bool) -> bool {
     if let Some(hooks) = settings.get_mut("hooks").and_then(|v| v.as_object_mut()) {
         for &(hook_type, matcher, cmd_suffix, timeout, description) in GEMINI_HOOK_CONFIGS {
             let hook_name = format!("hcom-{}", hook_type.to_lowercase());
+            let bin = hcom_cmd.split_whitespace().next().unwrap_or("hcom");
+            let hook_command = format!(
+                "sh -c 'command -v {bin} >/dev/null 2>&1 && exec {hcom_cmd} {cmd_suffix} || exit 0'"
+            );
             let hook_entry = serde_json::json!({
                 "matcher": matcher,
                 "hooks": [{
                     "name": hook_name,
                     "type": "command",
-                    "command": format!("{} {}", hcom_cmd, cmd_suffix),
+                    "command": hook_command,
                     "timeout": timeout,
                     "description": description,
                 }]
@@ -1943,7 +1947,10 @@ mod tests {
             }
         };
         for &(hook_type, cmd_suffix) in expected {
-            let expected_full = format!("{} {}", hcom_cmd, cmd_suffix);
+            let bin = hcom_cmd.split_whitespace().next().unwrap_or("hcom");
+            let expected_full = format!(
+                "sh -c 'command -v {bin} >/dev/null 2>&1 && exec {hcom_cmd} {cmd_suffix} || exit 0'"
+            );
             let matchers = match hooks.get(hook_type).and_then(|v| v.as_array()) {
                 Some(a) => a,
                 None => {
@@ -2043,10 +2050,10 @@ mod tests {
                 format!("hcom-{}", hook_type.to_lowercase())
             );
             assert_eq!(hook["timeout"].as_u64().unwrap(), expected_timeout as u64);
+            let hcom = crate::runtime_env::build_hcom_command();
+            let bin = hcom.split_whitespace().next().unwrap_or("hcom");
             let expected_command = format!(
-                "{} {}",
-                crate::runtime_env::build_hcom_command(),
-                cmd_suffix
+                "sh -c 'command -v {bin} >/dev/null 2>&1 && exec {hcom} {cmd_suffix} || exit 0'"
             );
             assert_eq!(
                 hook["command"].as_str().unwrap(),

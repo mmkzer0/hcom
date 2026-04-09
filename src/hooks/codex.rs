@@ -343,16 +343,22 @@ fn is_hcom_notify_line(line: &str) -> bool {
 
 /// Build the expected notify line for config.toml.
 ///
-/// Dynamically detects invocation mode (hcom vs uvx hcom) to match
+/// Wraps the command in `sh -c` so that a missing binary (e.g. after
+/// `brew uninstall hcom`) exits 0 instead of emitting an error in Codex.
+///
+/// Codex appends the JSON event payload as an extra argv token after the
+/// notify array. With `sh -c SCRIPT ARGV0 ARG...`, `--` becomes $0 and the
+/// JSON becomes $1; `"$@"` forwards it to hcom codex-notify unchanged.
 fn build_expected_notify_line() -> String {
-    let mut parts = crate::runtime_env::get_hcom_prefix();
-    parts.push("codex-notify".into());
-    let array_str = parts
-        .iter()
-        .map(|p| format!("\"{}\"", p))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("notify = [{}]", array_str)
+    let prefix = crate::runtime_env::get_hcom_prefix();
+    let hcom_cmd = prefix.join(" ");
+    let bin = prefix.first().map(|s| s.as_str()).unwrap_or("hcom");
+    let inner = format!(
+        "command -v {bin} >/dev/null 2>&1 && exec {hcom_cmd} codex-notify \"$@\" || exit 0"
+    );
+    // Use a TOML literal string (single-quoted) for the sh -c script so the
+    // double quotes in "$@" don't need escaping (TOML literal strings are verbatim).
+    format!("notify = [\"sh\", \"-c\", '{inner}', \"--\"]")
 }
 
 /// Extract the notify line from config content, or None if not found.
@@ -748,9 +754,9 @@ mod tests {
         // Must always end with "codex-notify" and be valid TOML array
         assert!(line.starts_with("notify = ["));
         assert!(line.ends_with(']'));
-        assert!(line.contains("\"codex-notify\""));
-        // Must contain "hcom" (either as standalone or after "uvx")
-        assert!(line.contains("\"hcom\""));
+        assert!(line.contains("codex-notify"));
+        // Must contain "hcom" (embedded in the sh -c command)
+        assert!(line.contains("hcom"));
     }
 
     // -- build_codex_rules --
@@ -793,7 +799,7 @@ mod tests {
 
         // Verify notify was inserted
         let content = std::fs::read_to_string(&config_path).unwrap();
-        assert!(content.contains("notify = [\"hcom\", \"codex-notify\"]"));
+        assert!(content.contains("notify = [\"sh\", \"-c\","));
         // Should be before [model] section
         let notify_pos = content.find("notify").unwrap();
         let model_pos = content.find("[model]").unwrap();
