@@ -1014,15 +1014,23 @@ mod tests {
 
     #[test]
     fn test_resume_system_prompt_codex_fork_does_not_tell_agent_to_rebind() {
-        let prompt = resume_system_prompt("codex", "luna", true);
+        let prompt = resume_system_prompt("codex", "luna", true, None);
         assert!(prompt.contains("already-assigned hcom identity"));
         assert!(!prompt.contains("Run hcom start"));
     }
 
     #[test]
-    fn test_resume_system_prompt_non_codex_fork_still_uses_start_guidance() {
-        let prompt = resume_system_prompt("claude", "luna", true);
-        assert!(prompt.contains("Run hcom start"));
+    fn test_resume_system_prompt_non_codex_fork_states_new_identity() {
+        let prompt = resume_system_prompt("claude", "luna", true, Some("feri"));
+        assert!(prompt.contains("feri"), "should name the new identity");
+        assert!(prompt.contains("--name feri"), "should state the --name flag");
+        assert!(!prompt.contains("Run hcom start"), "should not tell agent to rebind");
+        assert!(!prompt.contains("You are still 'luna'"), "should not resume as parent");
+
+        // None path falls back to already-assigned wording (no child name available)
+        let prompt_none = resume_system_prompt("claude", "luna", true, None);
+        assert!(prompt_none.contains("already-assigned hcom identity"));
+        assert!(!prompt_none.contains("Run hcom start"));
     }
 
     #[test]
