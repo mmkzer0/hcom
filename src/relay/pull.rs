@@ -25,6 +25,7 @@ pub fn handle_device_gone(db: &HcomDb, device_id: &str) {
         return;
     }
     safe_kv_set(db, &format!("relay_sync_time_{}", device_id), None);
+    safe_kv_set(db, &format!("relay_caps_{}", device_id), None);
     // Clear short_id mapping
     clear_short_id(db, device_id);
     log::log_info(
@@ -35,12 +36,12 @@ pub fn handle_device_gone(db: &HcomDb, device_id: &str) {
 }
 
 /// Handle a control message from the control topic.
-pub fn handle_control_message(db: &HcomDb, payload: &[u8], own_device: &str) {
+pub fn handle_control_message(db: &HcomDb, payload: &[u8], own_device: &str) -> bool {
     let data: Value = match serde_json::from_slice(payload) {
         Ok(v) => v,
         Err(e) => {
             log::log_warn("relay", "relay.bad_payload", &format!("{}", e));
-            return;
+            return false;
         }
     };
 
@@ -51,7 +52,7 @@ pub fn handle_control_message(db: &HcomDb, payload: &[u8], own_device: &str) {
 
     // Ignore own control messages
     if source_device == own_device {
-        return;
+        return false;
     }
 
     let own_short_id = device_short_id(own_device);
@@ -63,18 +64,23 @@ pub fn handle_control_message(db: &HcomDb, payload: &[u8], own_device: &str) {
         vec![]
     };
 
-    super::control::handle_control_events(db, &events, &own_short_id, source_device);
+    super::control::handle_control_events(db, &events, &own_short_id, source_device)
 }
 
 /// Handle a state message from a remote device.
-pub fn handle_state_message(db: &HcomDb, device_id: &str, payload: &[u8], own_device: &str) {
+pub fn handle_state_message(
+    db: &HcomDb,
+    device_id: &str,
+    payload: &[u8],
+    own_device: &str,
+) -> bool {
     let t0 = std::time::Instant::now();
 
     let data: Value = match serde_json::from_slice(payload) {
         Ok(v) => v,
         Err(e) => {
             log::log_warn("relay", "relay.bad_payload", &format!("{}", e));
-            return;
+            return false;
         }
     };
 
@@ -112,10 +118,24 @@ pub fn handle_state_message(db: &HcomDb, device_id: &str, payload: &[u8], own_de
                     &device_id[..8.min(device_id.len())]
                 ),
             );
-            return; // Skip to prevent data corruption
+            return false; // Skip to prevent data corruption
         }
     } else {
         safe_kv_set(db, &format!("relay_short_{}", short_id), Some(device_id));
+    }
+    // Cache the peer's advertised capabilities. Distinguish three states:
+    //   - "null"  → peer state arrived without a `capabilities` field at all
+    //               (legacy / pre-capability peer); treated as unknown by the
+    //               capability check so we don't hard-block it.
+    //   - "[]"    → peer explicitly advertised an empty list (e.g. remote
+    //               control disabled); capability check blocks every action.
+    //   - "[...]" → explicit advertisement.
+    // Missing KV key means "no state received yet" and is handled separately.
+    if let Some(caps) = state.get("capabilities").and_then(|v| v.as_array()) {
+        let serialized = serde_json::to_string(caps).unwrap_or_else(|_| "[]".to_string());
+        safe_kv_set(db, &format!("relay_caps_{}", device_id), Some(&serialized));
+    } else {
+        safe_kv_set(db, &format!("relay_caps_{}", device_id), Some("null"));
     }
 
     // Check for device reset — clean old data before importing
@@ -293,7 +313,7 @@ pub fn handle_state_message(db: &HcomDb, device_id: &str, payload: &[u8], own_de
     }
 
     // Handle control events in the events payload
-    super::control::handle_control_events(db, &events, &own_short_id, device_id);
+    let should_push = super::control::handle_control_events(db, &events, &own_short_id, device_id);
 
     // Import remote events with dedup
     import_remote_events(
@@ -344,6 +364,8 @@ pub fn handle_state_message(db: &HcomDb, device_id: &str, payload: &[u8], own_de
     // Wake local TCP instances so they see new messages immediately.
     //
     instance_lifecycle::notify_all_instances(db);
+
+    should_push
 }
 
 /// Import remote events with cursor-based dedup.
@@ -562,8 +584,10 @@ mod tests {
     use super::*;
     use crate::hooks::test_helpers::isolated_test_env;
     use serde_json::json;
+    use serial_test::serial;
 
     #[test]
+    #[serial]
     fn test_handle_state_message_drops_remote_unique_identity_fields() {
         let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
         let db = HcomDb::open().unwrap();
@@ -624,5 +648,68 @@ mod tests {
         assert_eq!(row.parent_session_id, None);
         assert_eq!(row.agent_id, None);
         assert_eq!(row.tool, "codex");
+    }
+
+    #[test]
+    #[serial]
+    fn test_handle_state_message_caches_remote_capabilities() {
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+
+        let payload = json!({
+            "state": {
+                "short_id": "ABCD",
+                "reset_ts": 0.0,
+                "capabilities": ["launch", "resume"],
+                "instances": {}
+            },
+            "events": []
+        });
+
+        assert!(!handle_state_message(
+            &db,
+            "device-1234",
+            &serde_json::to_vec(&payload).unwrap(),
+            "own-device-5678",
+        ));
+
+        assert_eq!(
+            safe_kv_get(&db, "relay_caps_device-1234").as_deref(),
+            Some(r#"["launch","resume"]"#)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_handle_state_message_caches_legacy_peer_without_capabilities() {
+        // Peers that predate the `capabilities` advertisement must be cached
+        // with the "null" sentinel, not "[]". The capability check in
+        // relay::control reads this sentinel as `CachedCapabilities::Legacy`
+        // and lets requests through optimistically so rolling upgrades don't
+        // break remote actions against older peers.
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+
+        let payload = json!({
+            "state": {
+                "short_id": "ABCD",
+                "reset_ts": 0.0,
+                "instances": {}
+            },
+            "events": []
+        });
+
+        assert!(!handle_state_message(
+            &db,
+            "device-1234",
+            &serde_json::to_vec(&payload).unwrap(),
+            "own-device-5678",
+        ));
+
+        assert_eq!(
+            safe_kv_get(&db, "relay_caps_device-1234").as_deref(),
+            Some("null"),
+            "legacy peer (no capabilities field) must be cached as the \"null\" sentinel"
+        );
     }
 }

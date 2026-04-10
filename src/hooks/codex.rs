@@ -666,6 +666,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_derive_transcript_finds_file() {
         let dir = tempfile::tempdir().unwrap();
         let sessions = dir.path().join("sessions").join("project");

@@ -6,16 +6,50 @@
 use anyhow::{Result, bail};
 use serde_json::json;
 
-use crate::db::HcomDb;
 use crate::commands::launch::{
     LaunchOutputContext, LaunchPreview, extract_launch_flags, is_background_from_args,
     load_hcom_config, print_launch_feedback, print_launch_preview, resolve_launcher_name,
 };
+use crate::db::HcomDb;
 use crate::hooks::claude_args;
-use crate::launcher::{self, LaunchParams};
+use crate::launcher::{self, LaunchParams, LaunchResult};
 use crate::log::log_info;
 use crate::router::GlobalFlags;
 use crate::tools::{codex_args, gemini_args};
+
+struct PreparedResume {
+    output: ResumeOutputContext,
+    launch: ResumeLaunchContext,
+    last_event_id: i64,
+    session_id: String,
+}
+
+struct ResumeOutputContext {
+    action: String,
+    tool: String,
+    tag: Option<String>,
+    terminal: Option<String>,
+    background: bool,
+    run_here: Option<bool>,
+    launcher_name: String,
+}
+
+struct ResumeLaunchContext {
+    tool: String,
+    args: Vec<String>,
+    tag: Option<String>,
+    system_prompt: String,
+    initial_prompt: Option<String>,
+    pty: bool,
+    background: bool,
+    cwd: String,
+    launcher_name: String,
+    run_here: Option<bool>,
+    batch_id: Option<String>,
+    name: Option<String>,
+    terminal: Option<String>,
+    append_reply_handoff: bool,
+}
 
 /// Run the resume command. `argv` is the full argv[1..].
 pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
@@ -64,10 +98,82 @@ pub fn do_resume(
     let db = HcomDb::open()?;
     let name = crate::instances::resolve_display_name_or_stopped(&db, name)
         .unwrap_or_else(|| name.to_string());
+    let hcom_config = load_hcom_config();
+    let ctx = crate::shared::HcomContext::from_os();
 
+    if let Some((base_name, device)) = crate::relay::control::split_device_suffix(&name) {
+        if ctx.is_inside_ai_tool() && !flags.go && should_preview_resume_rpc(extra_args) {
+            if let Ok(plan) = prepare_resume_plan(&db, &name, fork, extra_args, flags) {
+                print_resume_preview(&plan, &hcom_config, &name, fork);
+                return Ok(0);
+            }
+        }
+
+        let launcher_name =
+            resolve_launcher_name(&db, flags, std::env::var("HCOM_PROCESS_ID").ok().as_deref());
+        let inner = crate::relay::control::dispatch_remote(
+            &db,
+            device,
+            Some(&name),
+            "resume",
+            &json!({
+                "target": base_name,
+                "fork": fork,
+                "extra_args": extra_args,
+                "launcher": launcher_name,
+            }),
+            crate::relay::control::RPC_DEFAULT_TIMEOUT,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let launch_result =
+            crate::commands::launch::launch_result_from_json(&inner).map_err(anyhow::Error::msg)?;
+        let remote_output =
+            build_remote_resume_output(&db, &launch_result, extra_args, fork, flags);
+        let output = LaunchOutputContext {
+            action: &remote_output.action,
+            tool: &remote_output.tool,
+            requested_count: 1,
+            tag: remote_output.tag.as_deref(),
+            launcher_name: &remote_output.launcher_name,
+            terminal: remote_output.terminal.as_deref(),
+            background: remote_output.background,
+            run_here: remote_output.run_here,
+            hcom_config: &hcom_config,
+        };
+        print_launch_feedback(&db, &launch_result, &output)?;
+        return Ok(0);
+    }
+
+    let plan = prepare_resume_plan(&db, &name, fork, extra_args, flags)?;
+    if ctx.is_inside_ai_tool() && !flags.go && should_preview_resume_rpc(extra_args) {
+        print_resume_preview(&plan, &hcom_config, &name, fork);
+        return Ok(0);
+    }
+
+    execute_prepared_resume(&db, &name, fork, &plan, &hcom_config, true)
+}
+
+pub fn run_local_resume_result(
+    db: &HcomDb,
+    name: &str,
+    fork: bool,
+    extra_args: &[String],
+    flags: &GlobalFlags,
+) -> Result<LaunchResult> {
+    let plan = prepare_resume_plan(db, name, fork, extra_args, flags)?;
+    execute_prepared_resume_result(db, name, fork, &plan)
+}
+
+fn prepare_resume_plan(
+    db: &HcomDb,
+    name: &str,
+    fork: bool,
+    extra_args: &[String],
+    flags: &GlobalFlags,
+) -> Result<PreparedResume> {
     // For resume (not fork): reject if instance is still active
     if !fork {
-        if let Ok(Some(_)) = db.get_instance_full(&name) {
+        if let Ok(Some(_)) = db.get_instance_full(name) {
             bail!("'{}' is still active — run hcom stop {} first", name, name);
         }
     }
@@ -75,9 +181,9 @@ pub fn do_resume(
     // Load snapshot: from active instance (fork) or stopped event (resume)
     let (tool, session_id, launch_args_str, tag, background, last_event_id, snapshot_dir) = if fork
     {
-        load_instance_data(&db, &name)?
+        load_instance_data(db, name)?
     } else {
-        load_stopped_snapshot(&db, &name)?
+        load_stopped_snapshot(db, name)?
     };
 
     if session_id.is_empty() {
@@ -89,8 +195,6 @@ pub fn do_resume(
     }
 
     validate_resume_operation(&tool, fork)?;
-
-    let hcom_config = load_hcom_config();
     let inherited_tag = if tag.is_empty() {
         None
     } else {
@@ -130,8 +234,6 @@ pub fn do_resume(
             .unwrap_or_else(|_| ".".to_string())
     };
 
-    let should_preview = should_preview_resume(&launch_flags, &clean_extra);
-
     let mut cli_tool_args = build_resume_args(&tool, &session_id, fork);
     cli_tool_args.extend(clean_extra);
 
@@ -155,7 +257,8 @@ pub fn do_resume(
         bail!("--headless is only supported for Claude resume/fork launches");
     }
 
-    let is_headless = launch_flags.headless || is_background_from_args(&tool, &merged_args) || background;
+    let is_headless =
+        launch_flags.headless || is_background_from_args(&tool, &merged_args) || background;
     let use_pty = tool == "claude" && !is_headless && cfg!(unix);
 
     if tool == "claude" && is_headless {
@@ -164,34 +267,8 @@ pub fn do_resume(
         merged_args = updated.rebuild_tokens(true);
     }
 
-    let ctx = crate::shared::HcomContext::from_os();
-    if ctx.is_inside_ai_tool() && !flags.go && should_preview {
-        let action = if fork { "fork" } else { "resume" };
-        let identity_note = if fork {
-            format!("Fork source: {} (new identity)", name)
-        } else {
-            format!("Resume target: {} (same identity)", name)
-        };
-        let cwd_note = format!("Directory source: {}", effective_cwd);
-        let notes = [identity_note.as_str(), cwd_note.as_str()];
-        print_launch_preview(LaunchPreview {
-            action,
-            tool: &tool,
-            count: 1,
-            background: is_headless,
-            args: &merged_cli_args,
-            tag: launch_flags.tag.as_deref().or(inherited_tag.as_deref()),
-            cwd: Some(&effective_cwd),
-            terminal: launch_flags.terminal.as_deref(),
-            config: &hcom_config,
-            show_config_args: false,
-            notes: &notes,
-        });
-        return Ok(0);
-    }
-
     let launcher_name =
-        resolve_launcher_name(&db, flags, std::env::var("HCOM_PROCESS_ID").ok().as_deref());
+        resolve_launcher_name(db, flags, std::env::var("HCOM_PROCESS_ID").ok().as_deref());
     let launcher_name_for_output = launcher_name.clone();
     let fork_child_name = if fork {
         let (alive_names, taken_names) = crate::instance_names::collect_taken_names(&db)?;
@@ -239,69 +316,180 @@ pub fn do_resume(
         Some(custom) if !custom.trim().is_empty() => format!("{base_system_prompt}\n\n{custom}"),
         _ => base_system_prompt,
     };
-    let output = LaunchOutputContext {
-        action: if fork { "fork" } else { "resume" },
-        tool: &tool,
-        requested_count: 1,
-        tag: output_tag.as_deref(),
-        launcher_name: &launcher_name_for_output,
-        terminal: launch_flags.terminal.as_deref(),
-        background: is_headless,
-        run_here: launch_flags.run_here,
-        hcom_config: &hcom_config,
-    };
-
-    // Launch
-    let result = launcher::launch(
-        &db,
-        LaunchParams {
+    Ok(PreparedResume {
+        output: ResumeOutputContext {
+            action: if fork { "fork" } else { "resume" }.to_string(),
             tool: tool.clone(),
-            count: 1,
+            tag: output_tag,
+            terminal: launch_flags.terminal.clone(),
+            background: is_headless,
+            run_here: launch_flags.run_here,
+            launcher_name: launcher_name_for_output,
+        },
+        launch: ResumeLaunchContext {
+            tool: tool.clone(),
             args: merged_args,
             tag: launch_tag,
-            system_prompt: Some(effective_system_prompt),
+            system_prompt: effective_system_prompt,
+            initial_prompt: fork_initial_prompt,
             pty: use_pty,
             background: is_headless,
-            cwd: Some(effective_cwd),
-            env: None,
-            launcher: Some(launcher_name),
+            cwd: effective_cwd,
+            launcher_name,
             run_here: launch_flags.run_here,
-            initial_prompt: fork_initial_prompt,
             batch_id: launch_flags.batch_id.clone(),
-            name: if fork { fork_child_name } else { Some(name.clone()) },
-            skip_validation: false,
+            name: if fork {
+                fork_child_name
+            } else {
+                Some(name.to_string())
+            },
             terminal: launch_flags.terminal.clone(),
             append_reply_handoff: !(fork && tool == "codex"),
         },
-    )?;
+        last_event_id,
+        session_id,
+    })
+}
 
-    // For resume: restore cursor so pending messages are delivered
-    if !fork && last_event_id > 0 {
-        crate::instances::update_instance_position(
-            &db,
-            &name,
-            &serde_json::Map::from_iter([("last_event_id".to_string(), json!(last_event_id))]),
+fn execute_prepared_resume(
+    db: &HcomDb,
+    name: &str,
+    fork: bool,
+    plan: &PreparedResume,
+    hcom_config: &crate::config::HcomConfig,
+    print_feedback_now: bool,
+) -> Result<i32> {
+    let result = execute_prepared_resume_result(db, name, fork, plan)?;
+
+    if print_feedback_now {
+        let output = LaunchOutputContext {
+            action: &plan.output.action,
+            tool: &plan.output.tool,
+            requested_count: 1,
+            tag: plan.output.tag.as_deref(),
+            launcher_name: &plan.output.launcher_name,
+            terminal: plan.output.terminal.as_deref(),
+            background: plan.output.background,
+            run_here: plan.output.run_here,
+            hcom_config,
+        };
+        print_launch_feedback(db, &result, &output)?;
+        log_info(
+            if fork { "fork" } else { "resume" },
+            &format!("cmd.{}", if fork { "fork" } else { "resume" }),
+            &format!(
+                "name={} tool={} session={} launched={}",
+                name, plan.output.tool, plan.session_id, result.launched
+            ),
         );
     }
 
-    print_launch_feedback(&db, &result, &output)?;
-
-    log_info(
-        if fork { "fork" } else { "resume" },
-        &format!("cmd.{}", if fork { "fork" } else { "resume" }),
-        &format!(
-            "name={} tool={} session={} launched={}",
-            name, tool, session_id, result.launched
-        ),
-    );
-
     Ok(if result.launched > 0 { 0 } else { 1 })
+}
+
+fn execute_prepared_resume_result(
+    db: &HcomDb,
+    name: &str,
+    fork: bool,
+    plan: &PreparedResume,
+) -> Result<LaunchResult> {
+    let result = launcher::launch(
+        db,
+        LaunchParams {
+            tool: plan.launch.tool.clone(),
+            count: 1,
+            args: plan.launch.args.clone(),
+            tag: plan.launch.tag.clone(),
+            system_prompt: Some(plan.launch.system_prompt.clone()),
+            pty: plan.launch.pty,
+            background: plan.launch.background,
+            cwd: Some(plan.launch.cwd.clone()),
+            env: None,
+            launcher: Some(plan.launch.launcher_name.clone()),
+            run_here: plan.launch.run_here,
+            initial_prompt: plan.launch.initial_prompt.clone(),
+            batch_id: plan.launch.batch_id.clone(),
+            name: plan.launch.name.clone(),
+            skip_validation: false,
+            terminal: plan.launch.terminal.clone(),
+            append_reply_handoff: plan.launch.append_reply_handoff,
+        },
+    )?;
+
+    if !fork && plan.last_event_id > 0 {
+        crate::instances::update_instance_position(
+            db,
+            name,
+            &serde_json::Map::from_iter([("last_event_id".to_string(), json!(plan.last_event_id))]),
+        );
+    }
+    Ok(result)
+}
+
+fn build_remote_resume_output(
+    db: &HcomDb,
+    launch_result: &LaunchResult,
+    extra_args: &[String],
+    fork: bool,
+    flags: &GlobalFlags,
+) -> ResumeOutputContext {
+    let (_dir_override, launch_flags, _clean_extra) = extract_resume_flags(extra_args);
+    let launcher_name =
+        resolve_launcher_name(db, flags, std::env::var("HCOM_PROCESS_ID").ok().as_deref());
+
+    ResumeOutputContext {
+        action: if fork { "fork" } else { "resume" }.to_string(),
+        tool: launch_result.tool.clone(),
+        tag: launch_flags.tag,
+        terminal: launch_flags.terminal,
+        background: launch_result.background,
+        run_here: launch_flags.run_here,
+        launcher_name,
+    }
+}
+
+fn print_resume_preview(
+    plan: &PreparedResume,
+    hcom_config: &crate::config::HcomConfig,
+    name: &str,
+    fork: bool,
+) {
+    let identity_note = if fork {
+        format!("Fork source: {} (new identity)", name)
+    } else {
+        format!("Resume target: {} (same identity)", name)
+    };
+    let cwd_note = format!("Directory source: {}", plan.launch.cwd);
+    let notes = [identity_note.as_str(), cwd_note.as_str()];
+    print_launch_preview(LaunchPreview {
+        action: &plan.output.action,
+        tool: &plan.output.tool,
+        count: 1,
+        background: plan.output.background,
+        args: &plan.launch.args,
+        tag: plan.output.tag.as_deref(),
+        cwd: Some(&plan.launch.cwd),
+        terminal: plan.output.terminal.as_deref(),
+        config: hcom_config,
+        show_config_args: false,
+        notes: &notes,
+    });
+}
+
+fn should_preview_resume_rpc(extra_args: &[String]) -> bool {
+    let (dir_override, launch_flags, clean_extra) = extract_resume_flags(extra_args);
+    let _ = dir_override;
+    should_preview_resume(&launch_flags, &clean_extra)
 }
 
 /// Extract resume-only flags, then reuse the shared launch flag parser.
 fn extract_resume_flags(
     args: &[String],
-) -> (Option<String>, crate::commands::launch::HcomLaunchFlags, Vec<String>) {
+) -> (
+    Option<String>,
+    crate::commands::launch::HcomLaunchFlags,
+    Vec<String>,
+) {
     let mut dir = None;
     let mut filtered = Vec::new();
     let mut i = 0;
@@ -542,9 +730,20 @@ fn merge_opencode_args(original: &[String], resume: &[String]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::HcomDb;
 
     fn s(items: &[&str]) -> Vec<String> {
         items.iter().map(|i| i.to_string()).collect()
+    }
+
+    fn test_db() -> HcomDb {
+        crate::config::Config::init();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = HcomDb::open_raw(&db_path).unwrap();
+        db.init_db().unwrap();
+        std::mem::forget(dir);
+        db
     }
 
     #[test]
@@ -598,7 +797,9 @@ mod tests {
 
     #[test]
     fn test_validate_resume_operation_rejects_gemini_fork() {
-        let err = validate_resume_operation("gemini", true).unwrap_err().to_string();
+        let err = validate_resume_operation("gemini", true)
+            .unwrap_err()
+            .to_string();
         assert_eq!(err, "Gemini does not support session forking (hcom f)");
     }
 
@@ -668,7 +869,8 @@ mod tests {
 
     #[test]
     fn test_extract_resume_flags_terminal() {
-        let (dir, flags, remaining) = extract_resume_flags(&s(&["--terminal", "alacritty", "--model", "opus"]));
+        let (dir, flags, remaining) =
+            extract_resume_flags(&s(&["--terminal", "alacritty", "--model", "opus"]));
         assert_eq!(dir, None);
         assert_eq!(flags.terminal, Some("alacritty".to_string()));
         assert_eq!(remaining, s(&["--model", "opus"]));
@@ -676,7 +878,8 @@ mod tests {
 
     #[test]
     fn test_extract_resume_flags_tag_and_terminal() {
-        let (dir, flags, remaining) = extract_resume_flags(&s(&["--tag", "test", "--terminal", "kitty"]));
+        let (dir, flags, remaining) =
+            extract_resume_flags(&s(&["--tag", "test", "--terminal", "kitty"]));
         assert_eq!(dir, None);
         assert_eq!(flags.tag, Some("test".to_string()));
         assert_eq!(flags.terminal, Some("kitty".to_string()));
@@ -685,7 +888,8 @@ mod tests {
 
     #[test]
     fn test_extract_resume_flags_equals_form() {
-        let (dir, flags, remaining) = extract_resume_flags(&s(&["--tag=test", "--terminal=alacritty"]));
+        let (dir, flags, remaining) =
+            extract_resume_flags(&s(&["--tag=test", "--terminal=alacritty"]));
         assert_eq!(dir, None);
         assert_eq!(flags.tag, Some("test".to_string()));
         assert_eq!(flags.terminal, Some("alacritty".to_string()));
@@ -703,7 +907,8 @@ mod tests {
 
     #[test]
     fn test_extract_resume_flags_dir() {
-        let (dir, flags, remaining) = extract_resume_flags(&s(&["--dir", "/tmp/test", "--model", "opus"]));
+        let (dir, flags, remaining) =
+            extract_resume_flags(&s(&["--dir", "/tmp/test", "--model", "opus"]));
         assert_eq!(dir, Some("/tmp/test".to_string()));
         assert_eq!(flags.tag, None);
         assert_eq!(flags.terminal, None);
@@ -767,6 +972,11 @@ mod tests {
     }
 
     #[test]
+    fn test_should_preview_resume_rpc_true_for_hcom_flags() {
+        assert!(should_preview_resume_rpc(&s(&["--terminal", "kitty"])));
+    }
+
+    #[test]
     fn test_should_preview_resume_true_for_hcom_only_flags() {
         let flags = crate::commands::launch::HcomLaunchFlags {
             terminal: Some("kitty".to_string()),
@@ -786,5 +996,58 @@ mod tests {
     fn test_resume_system_prompt_non_codex_fork_still_uses_start_guidance() {
         let prompt = resume_system_prompt("claude", "luna", true);
         assert!(prompt.contains("Run hcom start"));
+    }
+
+    #[test]
+    fn test_build_remote_resume_output_uses_actual_launch_result_background() {
+        let db = test_db();
+        let output = build_remote_resume_output(
+            &db,
+            &LaunchResult {
+                tool: "claude".to_string(),
+                batch_id: "batch-1".to_string(),
+                launched: 1,
+                failed: 0,
+                background: true,
+                log_files: Vec::new(),
+                handles: Vec::new(),
+                errors: Vec::new(),
+            },
+            &s(&["--terminal", "kitty", "--tag", "ops", "--run-here"]),
+            false,
+            &GlobalFlags::default(),
+        );
+
+        assert_eq!(output.action, "resume");
+        assert_eq!(output.tool, "claude");
+        assert_eq!(output.tag.as_deref(), Some("ops"));
+        assert_eq!(output.terminal.as_deref(), Some("kitty"));
+        assert!(output.background);
+        assert_eq!(output.run_here, Some(true));
+    }
+
+    #[test]
+    fn test_build_remote_resume_output_marks_fork_action() {
+        let db = test_db();
+        let output = build_remote_resume_output(
+            &db,
+            &LaunchResult {
+                tool: "codex".to_string(),
+                batch_id: "batch-2".to_string(),
+                launched: 1,
+                failed: 0,
+                background: false,
+                log_files: Vec::new(),
+                handles: Vec::new(),
+                errors: Vec::new(),
+            },
+            &[],
+            true,
+            &GlobalFlags::default(),
+        );
+
+        assert_eq!(output.action, "fork");
+        assert_eq!(output.tool, "codex");
+        assert!(!output.background);
     }
 }

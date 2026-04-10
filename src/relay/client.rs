@@ -102,6 +102,8 @@ pub struct MqttRelay {
 }
 
 impl MqttRelay {
+    const INBOUND_PUSH_DEBOUNCE: Duration = Duration::from_millis(150);
+
     /// Create and connect the MQTT relay client.
     ///
     /// Returns (MqttRelay, Connection, command_sender). The Connection must be
@@ -205,6 +207,7 @@ impl MqttRelay {
         let mut backoff = Backoff::new();
         let mut backoff_until = Instant::now();
         let mut last_push = Instant::now();
+        let mut pending_push_at: Option<Instant> = None;
         let mut connected = false;
 
         // Initial subscribe
@@ -223,6 +226,7 @@ impl MqttRelay {
                 Ok(RelayCommand::Push) => {
                     self.do_push_cycle();
                     last_push = Instant::now();
+                    pending_push_at = None;
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     log::log_info("relay", "relay.shutdown", "command channel closed");
@@ -236,6 +240,13 @@ impl MqttRelay {
             if connected && last_push.elapsed() >= self.push_interval {
                 self.do_push_cycle();
                 last_push = Instant::now();
+                pending_push_at = None;
+            }
+
+            if connected && pending_push_at.is_some_and(|deadline| Instant::now() >= deadline) {
+                self.do_push_cycle();
+                last_push = Instant::now();
+                pending_push_at = None;
             }
 
             // During backoff, skip event processing and just sleep
@@ -248,7 +259,12 @@ impl MqttRelay {
             match event_rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(Ok(event)) => {
                     backoff.reset();
-                    self.handle_event(event, &mut connected);
+                    if self.handle_event(event, &mut connected) {
+                        let next_push = last_push + Self::INBOUND_PUSH_DEBOUNCE;
+                        pending_push_at = Some(
+                            pending_push_at.map_or(next_push, |existing| existing.min(next_push)),
+                        );
+                    }
                 }
                 Ok(Err(conn_err)) => {
                     if connected {
@@ -276,7 +292,7 @@ impl MqttRelay {
     }
 
     /// Handle a single MQTT event from the Connection iterator.
-    fn handle_event(&self, event: Event, connected: &mut bool) {
+    fn handle_event(&self, event: Event, connected: &mut bool) -> bool {
         match event {
             Event::Incoming(incoming) => match incoming {
                 Packet::ConnAck(_connack) => {
@@ -291,19 +307,21 @@ impl MqttRelay {
                     }
                     // Push immediately on connect to sync state
                     self.do_push_cycle();
+                    false
                 }
                 Packet::Publish(publish) => {
                     let topic = String::from_utf8_lossy(&publish.topic).to_string();
                     let payload = publish.payload.to_vec();
-                    self.handle_incoming_message(&topic, &payload);
+                    self.handle_incoming_message(&topic, &payload)
                 }
                 Packet::Disconnect(_) => {
                     *connected = false;
                     log::log_info("relay", "relay.disconnected", "server disconnect");
+                    false
                 }
-                _ => {} // PingResp, SubAck, PubAck — ignore
+                _ => false, // PingResp, SubAck, PubAck — ignore
             },
-            Event::Outgoing(_) => {} // Outgoing events — ignore
+            Event::Outgoing(_) => false, // Outgoing events — ignore
         }
     }
 
@@ -312,10 +330,10 @@ impl MqttRelay {
     /// Topic layout: `{relay_id}/{device_uuid}` for state snapshots,
     /// `{relay_id}/control` for control events. Empty payload on a state topic
     /// means "device gone" (LWT or graceful cleanup).
-    fn handle_incoming_message(&self, topic: &str, payload: &[u8]) {
+    fn handle_incoming_message(&self, topic: &str, payload: &[u8]) -> bool {
         let prefix = format!("{}/", self.relay_id);
         if !topic.starts_with(&prefix) {
-            return; // Not our relay group
+            return false; // Not our relay group
         }
         let suffix = &topic[prefix.len()..];
 
@@ -323,7 +341,7 @@ impl MqttRelay {
             Ok(db) => db,
             Err(e) => {
                 log::log_error("relay", "relay.db_err", &format!("{}", e));
-                return;
+                return false;
             }
         };
 
@@ -332,18 +350,18 @@ impl MqttRelay {
             if !suffix.is_empty() && suffix != "control" {
                 super::pull::handle_device_gone(&db, suffix);
             }
-            return;
+            return false;
         }
 
         if suffix == "control" {
-            super::pull::handle_control_message(&db, payload, &self.device_uuid);
+            super::pull::handle_control_message(&db, payload, &self.device_uuid)
         } else {
             // State message from a remote device
             let device_id = suffix;
             if device_id == self.device_uuid {
-                return; // Ignore own messages
+                return false; // Ignore own messages
             }
-            super::pull::handle_state_message(&db, device_id, payload, &self.device_uuid);
+            super::pull::handle_state_message(&db, device_id, payload, &self.device_uuid)
         }
     }
 

@@ -5,8 +5,6 @@
 
 use std::collections::HashSet;
 
-use anyhow::{Result, bail};
-
 use crate::db::HcomDb;
 use crate::hooks::common::stop_instance;
 use crate::identity;
@@ -16,6 +14,7 @@ use crate::paths;
 use crate::pidtrack;
 use crate::router::GlobalFlags;
 use crate::terminal;
+use anyhow::{Result, bail};
 
 /// Parsed arguments for `hcom kill`.
 #[derive(clap::Parser, Debug)]
@@ -25,6 +24,17 @@ pub struct KillArgs {
     pub targets: Vec<String>,
 }
 
+pub struct KillTrackedResult {
+    pub target: String,
+    pub pid: u32,
+    pub kill_result: terminal::KillResult,
+    pub pane_closed: bool,
+    pub preset_name: String,
+    pub pane_id: String,
+}
+
+const EPERM_RECHECK_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// Resolve who initiated the kill
 fn resolve_initiator(db: &HcomDb, explicit_name: Option<&str>) -> String {
     if let Some(name) = explicit_name {
@@ -33,6 +43,122 @@ fn resolve_initiator(db: &HcomDb, explicit_name: Option<&str>) -> String {
     match identity::resolve_identity(db, None, None, None, None, None, None) {
         Ok(id) if matches!(id.kind, crate::shared::SenderKind::Instance) => id.name,
         _ => "cli".to_string(),
+    }
+}
+
+fn normalize_kill_result(
+    name: &str,
+    pid: u32,
+    result: terminal::KillResult,
+) -> terminal::KillResult {
+    if !matches!(result, terminal::KillResult::PermissionDenied) {
+        return result;
+    }
+
+    let pid_str = pid.to_string();
+    log_info(
+        "kill",
+        "kill.eperm",
+        &format!(
+            "kill(2) returned EPERM for name={} pid={}; checking if process already exited",
+            name, pid
+        ),
+    );
+    std::thread::sleep(EPERM_RECHECK_DELAY);
+    if !pidtrack::is_alive(pid) {
+        log_info(
+            "kill",
+            "kill.eperm_resolved",
+            &format!("name={} pid={} resolved to already_dead", name, pid_str),
+        );
+        terminal::KillResult::AlreadyDead
+    } else {
+        terminal::KillResult::PermissionDenied
+    }
+}
+
+pub fn kill_tracked_instance(
+    db: &HcomDb,
+    name: &str,
+    initiator: &str,
+) -> Result<KillTrackedResult, String> {
+    let inst = db
+        .get_instance_full(name)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Agent '{}' not found", name))?;
+    let pid = inst
+        .pid
+        .ok_or_else(|| format!("No tracked PID for '{}'", name))? as u32;
+    let is_headless = inst.background != 0;
+    let (result, pane_closed, preset_name, pane_id) =
+        kill_instance(db, name, pid, &inst, is_headless);
+    stop_instance(db, name, initiator, "killed");
+
+    Ok(KillTrackedResult {
+        target: name.to_string(),
+        pid,
+        kill_result: result,
+        pane_closed,
+        preset_name,
+        pane_id,
+    })
+}
+
+fn handle_remote_kill_response(name: &str, response: &serde_json::Value) -> Result<i32> {
+    let result = &response["result"];
+    let kill_result = result["kill_result"].as_str();
+
+    // No kill_result means an RPC-level failure (e.g. timeout, protocol error).
+    if kill_result.is_none() {
+        crate::relay::control::require_successful_rpc_result(response.clone())
+            .map_err(anyhow::Error::msg)?;
+        bail!("Remote kill returned no kill_result");
+    }
+    let kill_result = kill_result.unwrap();
+
+    let pid = result["pid"].as_u64().unwrap_or(0);
+    let pane_closed = result["pane_closed"].as_bool().unwrap_or(false);
+    let preset_name = result["preset_name"].as_str().unwrap_or("");
+    let pane_id = result["pane_id"].as_str().unwrap_or("");
+    let pane_info = pane_info_str(pane_closed, preset_name, pane_id);
+
+    if kill_result == "permission_denied" {
+        eprintln!(
+            "Permission denied to kill process group {} for '{}'",
+            pid, name
+        );
+        return Ok(1);
+    }
+
+    let lines = render_remote_kill_feedback(name, pid, kill_result, &pane_info)?;
+    for line in lines {
+        println!("{line}");
+    }
+    Ok(0)
+}
+
+fn render_remote_kill_feedback(
+    name: &str,
+    pid: u64,
+    kill_result: &str,
+    pane_info: &str,
+) -> Result<Vec<String>> {
+    match kill_result {
+        "sent" => Ok(vec![
+            format!(
+                "Sent SIGTERM to process group {} for '{}'{}",
+                pid, name, pane_info
+            ),
+            format!("  To resume: hcom r {}", name),
+        ]),
+        "already_dead" => Ok(vec![
+            format!(
+                "Process group {} not found for '{}' (already terminated){}",
+                pid, name, pane_info
+            ),
+            format!("  To resume: hcom r {}", name),
+        ]),
+        other => bail!("Remote kill failed for {name}: unexpected kill_result {other}"),
     }
 }
 
@@ -373,19 +499,37 @@ fn kill_single(
         }
     };
 
-    let pid = match inst.pid {
-        Some(pid) => pid as u32,
-        None => bail!(
+    if inst.origin_device_id.is_some() {
+        if let Some((base_name, device_short_id)) =
+            crate::relay::control::split_device_suffix(&name)
+        {
+            let result = crate::relay::control::dispatch_remote_raw(
+                db,
+                device_short_id,
+                Some(&name),
+                "kill",
+                &serde_json::json!({ "target": base_name }),
+                crate::relay::control::RPC_DEFAULT_TIMEOUT,
+            )
+            .map_err(anyhow::Error::msg)?;
+            return handle_remote_kill_response(&name, &result);
+        }
+        bail!("Cannot kill remote '{name}' - missing device suffix");
+    }
+
+    if inst.pid.is_none() {
+        bail!(
             "No tracked PID for '{}' — use 'hcom stop {}' instead",
             name,
             name
-        ),
-    };
-
-    let is_headless = inst.background != 0;
-    let (result, pane_closed, preset_name, pane_id) =
-        kill_instance(db, &name, pid, &inst, is_headless);
-    stop_instance(db, &name, initiator, "killed");
+        );
+    }
+    let kill_result = kill_tracked_instance(db, &name, initiator).map_err(anyhow::Error::msg)?;
+    let pid = kill_result.pid;
+    let pane_closed = kill_result.pane_closed;
+    let preset_name = kill_result.preset_name;
+    let pane_id = kill_result.pane_id;
+    let result = kill_result.kill_result;
 
     let pane_info = pane_info_str(pane_closed, &preset_name, &pane_id);
     match result {
@@ -427,6 +571,7 @@ fn kill_instance(
     // Headless instances have no terminal pane — skip pane close
     if is_headless {
         let (result, pane_closed) = terminal::kill_process(pid, "", "", "", "", "");
+        let result = normalize_kill_result(name, pid, result);
         log_info(
             "kill",
             "lifecycle.kill",
@@ -451,6 +596,7 @@ fn kill_instance(
         &ti.kitty_listen_on,
         &ti.terminal_id,
     );
+    let result = normalize_kill_result(name, pid, result);
 
     log_info(
         "kill",
@@ -472,6 +618,7 @@ fn kill_instance(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn test_kill_no_target_fails() {
@@ -501,5 +648,87 @@ mod tests {
         use clap::Parser;
         let args = KillArgs::try_parse_from(["kill"]).unwrap();
         assert!(args.targets.is_empty());
+    }
+
+    #[test]
+    fn test_handle_remote_kill_response_permission_denied_returns_nonzero() {
+        let result = handle_remote_kill_response(
+            "luna:ABCD",
+            &json!({
+                "result": {
+                    "pid": 42,
+                    "kill_result": "permission_denied",
+                    "pane_closed": false,
+                    "preset_name": "",
+                    "pane_id": ""
+                }
+            }),
+        )
+        .unwrap();
+        assert_eq!(result, 1);
+    }
+
+    #[test]
+    fn test_handle_remote_kill_response_permission_denied_with_closed_pane_succeeds() {
+        let result = handle_remote_kill_response(
+            "luna:ABCD",
+            &json!({
+                "ok": true,
+                "result": {
+                    "pid": 42,
+                    "kill_result": "already_dead",
+                    "pane_closed": true,
+                    "preset_name": "kitty",
+                    "pane_id": "@1"
+                }
+            }),
+        )
+        .unwrap();
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn test_render_remote_kill_feedback_sent_matches_cli_contract() {
+        let lines = render_remote_kill_feedback("luna:ABCD", 42, "sent", " (closed kitty pane @1)")
+            .unwrap();
+        assert_eq!(
+            lines,
+            vec![
+                "Sent SIGTERM to process group 42 for 'luna:ABCD' (closed kitty pane @1)"
+                    .to_string(),
+                "  To resume: hcom r luna:ABCD".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_render_remote_kill_feedback_already_dead_matches_cli_contract() {
+        let lines = render_remote_kill_feedback("luna:ABCD", 42, "already_dead", "").unwrap();
+        assert_eq!(
+            lines,
+            vec![
+                "Process group 42 not found for 'luna:ABCD' (already terminated)".to_string(),
+                "  To resume: hcom r luna:ABCD".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_handle_remote_kill_response_unknown_result_errors() {
+        let err = handle_remote_kill_response(
+            "luna:ABCD",
+            &json!({
+                "result": {
+                    "pid": 42,
+                    "kill_result": "mystery",
+                    "pane_closed": false,
+                    "preset_name": "",
+                    "pane_id": ""
+                }
+            }),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unexpected kill_result mystery"));
     }
 }

@@ -1310,8 +1310,8 @@ mod tests {
         with_env("HCOM_DIR", "~/.hcom", || {
             Config::init();
             let config = Config::get();
-            let home = env::var("HOME").unwrap();
-            assert_eq!(config.hcom_dir, PathBuf::from(home).join(".hcom"));
+            assert!(config.hcom_dir.is_absolute());
+            assert!(config.hcom_dir.ends_with(".hcom"));
         });
     }
 

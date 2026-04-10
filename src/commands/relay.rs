@@ -608,6 +608,7 @@ pub fn cmd_relay(db: &HcomDb, args: &RelayArgs, _ctx: Option<&CommandContext>) -
 mod tests {
     use super::*;
     use crate::hooks::test_helpers::isolated_test_env;
+    use serial_test::serial;
 
     #[test]
     fn test_encode_decode_public_broker_token() {
@@ -669,6 +670,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_persist_relay_config_clears_stale_token_when_password_omitted() {
         let _ = isolated_test_env();
         let contents = render_relay_config_content(
@@ -685,6 +687,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_relay_push_subcommand_exists() {
         let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
         let db = HcomDb::open().unwrap();

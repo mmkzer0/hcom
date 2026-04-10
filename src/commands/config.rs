@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::db::DEV_ROOT_KV_KEY;
 use crate::db::HcomDb;
@@ -264,7 +264,7 @@ fn get_nested_toml(table: &toml::Table, dotted_path: &str) -> Option<toml::Value
 
 /// Set a config key in the TOML file (preserving comments via toml_edit).
 /// Uses nested TOML paths
-fn config_set(key: &str, value: &str) -> Result<(), String> {
+pub fn config_set(key: &str, value: &str) -> Result<(), String> {
     let path = config_path();
     let content = std::fs::read_to_string(&path).unwrap_or_default();
 
@@ -297,7 +297,7 @@ fn config_set(key: &str, value: &str) -> Result<(), String> {
 }
 
 /// Get a config value (checks env var, then TOML nested path, then default).
-fn config_get(key: &str) -> (String, &'static str) {
+pub fn config_get(key: &str) -> (String, &'static str) {
     // Check env var first
     if let Ok(val) = std::env::var(key) {
         return (val, "env");
@@ -482,37 +482,8 @@ fn config_instance(
     // No key: show instance settings
     if args.is_empty() {
         let full_name = crate::instances::get_full_name(&instance);
-        if json_mode {
-            let config = serde_json::json!({
-                "name": inst_name,
-                "full_name": full_name,
-                "tag": instance.tag.as_deref().filter(|s| !s.is_empty()),
-                "timeout": instance.wait_timeout,
-                "hints": instance.hints.as_deref().filter(|s| !s.is_empty()),
-                "subagent_timeout": instance.subagent_timeout,
-            });
-            println!("{}", serde_json::to_string(&config).unwrap_or_default());
-        } else {
-            println!("Agent: {full_name}");
-            println!("  tag: {}", instance.tag.as_deref().unwrap_or("(none)"));
-            println!(
-                "  timeout: {}s",
-                instance
-                    .wait_timeout
-                    .map(|t| t.to_string())
-                    .unwrap_or_else(|| "(default)".into())
-            );
-            let hints = instance.hints.as_deref().unwrap_or("");
-            println!(
-                "  hints: {}",
-                if hints.is_empty() { "(none)" } else { hints }
-            );
-            let sat = instance.subagent_timeout.map(|t| format!("{t}s"));
-            println!(
-                "  subagent_timeout: {}",
-                sat.as_deref().unwrap_or("(default)")
-            );
-        }
+        let config = build_instance_config_json(&instance, &full_name);
+        println!("{}", render_config_instance_get(&config, None, json_mode));
         return 0;
     }
 
@@ -547,25 +518,20 @@ fn config_instance(
 
     // No value: show current
     let Some(value) = value else {
-        match key {
-            "tag" => println!("{}", instance.tag.as_deref().unwrap_or("")),
-            "timeout" => println!(
-                "{}",
-                instance
-                    .wait_timeout
-                    .map(|t| t.to_string())
-                    .unwrap_or_default()
-            ),
-            "hints" => println!("{}", instance.hints.as_deref().unwrap_or("")),
-            "subagent_timeout" => println!(
-                "{}",
-                instance
-                    .subagent_timeout
-                    .map(|t| t.to_string())
-                    .unwrap_or_default()
-            ),
-            _ => {}
-        }
+        let current = match key {
+            "tag" => serde_json::json!({"value": instance.tag.as_deref().unwrap_or("")}),
+            "timeout" => serde_json::json!({"value": instance.wait_timeout.unwrap_or(86400)}),
+            "hints" => serde_json::json!({"value": instance.hints.as_deref().unwrap_or("")}),
+            "subagent_timeout" => match instance.subagent_timeout {
+                Some(value) => serde_json::json!({"value": value}),
+                None => serde_json::json!({"value": serde_json::Value::Null}),
+            },
+            _ => serde_json::json!({"value": ""}),
+        };
+        println!(
+            "{}",
+            render_config_instance_get(&current, Some(key), json_mode)
+        );
         return 0;
     };
 
@@ -586,11 +552,10 @@ fn config_instance(
                 "UPDATE instances SET tag = ? WHERE name = ?",
                 rusqlite::params![tag, inst_name],
             );
-            if tag.is_empty() {
-                println!("Cleared tag for {inst_name}");
-            } else {
-                println!("Set tag for {inst_name}: {tag}");
-            }
+            println!(
+                "{}",
+                render_config_instance_set_feedback(inst_name, "tag", tag)
+            );
             // Notify for display update
             instance_lifecycle::notify_all_instances(db);
         }
@@ -600,7 +565,10 @@ fn config_instance(
                     "UPDATE instances SET wait_timeout = 86400 WHERE name = ?",
                     rusqlite::params![inst_name],
                 );
-                println!("Reset timeout for {inst_name}");
+                println!(
+                    "{}",
+                    render_config_instance_set_feedback(inst_name, "timeout", value)
+                );
             } else {
                 match value.parse::<i64>() {
                     Ok(secs) if secs > 0 => {
@@ -608,7 +576,14 @@ fn config_instance(
                             "UPDATE instances SET wait_timeout = ? WHERE name = ?",
                             rusqlite::params![secs, inst_name],
                         );
-                        println!("Set timeout for {inst_name}: {secs}s");
+                        println!(
+                            "{}",
+                            render_config_instance_set_feedback(
+                                inst_name,
+                                "timeout",
+                                &secs.to_string()
+                            )
+                        );
                     }
                     _ => {
                         eprintln!("Error: timeout must be a positive integer (seconds)");
@@ -622,25 +597,37 @@ fn config_instance(
             if value.is_empty() {
                 updates.insert("hints".into(), serde_json::Value::Null);
                 instances::update_instance_position(db, inst_name, &updates);
-                println!("Cleared hints for {inst_name}");
             } else {
                 updates.insert("hints".into(), serde_json::json!(value));
                 instances::update_instance_position(db, inst_name, &updates);
-                println!("Set hints for {inst_name}");
             }
+            println!(
+                "{}",
+                render_config_instance_set_feedback(inst_name, "hints", value)
+            );
         }
         "subagent_timeout" => {
             let mut updates = serde_json::Map::new();
             if value.is_empty() || value.eq_ignore_ascii_case("default") {
                 updates.insert("subagent_timeout".into(), serde_json::Value::Null);
                 instances::update_instance_position(db, inst_name, &updates);
-                println!("Cleared subagent_timeout for {inst_name}");
+                println!(
+                    "{}",
+                    render_config_instance_set_feedback(inst_name, "subagent_timeout", value)
+                );
             } else {
                 match value.parse::<i64>() {
                     Ok(secs) if secs > 0 => {
                         updates.insert("subagent_timeout".into(), serde_json::json!(secs));
                         instances::update_instance_position(db, inst_name, &updates);
-                        println!("Set subagent_timeout for {inst_name}: {value}s");
+                        println!(
+                            "{}",
+                            render_config_instance_set_feedback(
+                                inst_name,
+                                "subagent_timeout",
+                                &secs.to_string()
+                            )
+                        );
                     }
                     _ => {
                         eprintln!("Error: subagent_timeout must be a positive integer (seconds)");
@@ -659,6 +646,216 @@ fn config_instance(
     trigger_relay_push();
 
     0
+}
+
+pub fn render_config_instance_get(value: &Value, key: Option<&str>, json_mode: bool) -> String {
+    if json_mode {
+        return serde_json::to_string(value).unwrap_or_default();
+    }
+
+    match key {
+        None => {
+            // Prefer full_name for the human header; fall back to name for
+            // backwards compatibility with older payloads that only had `name`.
+            let display = value
+                .get("full_name")
+                .and_then(|v| v.as_str())
+                .or_else(|| value.get("name").and_then(|v| v.as_str()))
+                .unwrap_or("");
+            let tag = value.get("tag").and_then(|v| v.as_str()).unwrap_or("");
+            let timeout = value
+                .get("timeout")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(86400);
+            let hints = value.get("hints").and_then(|v| v.as_str()).unwrap_or("");
+            let subagent_timeout = value
+                .get("subagent_timeout")
+                .and_then(|v| v.as_i64())
+                .map(|t| format!("{t}s"))
+                .unwrap_or_else(|| "(default)".to_string());
+            format!(
+                "Agent: {display}\n  tag: {}\n  timeout: {timeout}s\n  hints: {}\n  subagent_timeout: {subagent_timeout}",
+                if tag.is_empty() { "(none)" } else { tag },
+                if hints.is_empty() { "(none)" } else { hints },
+            )
+        }
+        Some(_) => value
+            .get("value")
+            .map(|v| match v {
+                Value::String(s) => s.clone(),
+                Value::Null => String::new(),
+                other => other.to_string(),
+            })
+            .unwrap_or_default(),
+    }
+}
+
+pub fn render_config_instance_set_feedback(instance_name: &str, key: &str, value: &str) -> String {
+    match key {
+        "tag" => {
+            if value.is_empty() {
+                format!("Cleared tag for {instance_name}")
+            } else {
+                format!("Set tag for {instance_name}: {value}")
+            }
+        }
+        "timeout" => {
+            if value.is_empty() || value.eq_ignore_ascii_case("default") {
+                format!("Reset timeout for {instance_name}")
+            } else {
+                format!("Set timeout for {instance_name}: {value}s")
+            }
+        }
+        "hints" => {
+            if value.is_empty() {
+                format!("Cleared hints for {instance_name}")
+            } else {
+                format!("Set hints for {instance_name}")
+            }
+        }
+        "subagent_timeout" => {
+            if value.is_empty() || value.eq_ignore_ascii_case("default") {
+                format!("Cleared subagent_timeout for {instance_name}")
+            } else {
+                format!("Set subagent_timeout for {instance_name}: {value}s")
+            }
+        }
+        _ => format!("Updated {key} for {instance_name}"),
+    }
+}
+
+/// Build the canonical JSON shape returned by both local and remote no-key
+/// instance config reads. Stable contract for scripts consuming
+/// `hcom config -i <name> --json`:
+///   `name`            — base name
+///   `full_name`       — tag-prefixed display name
+///   `tag` / `hints`   — null when unset (not "")
+///   `timeout`         — null when unset (server-side default applies elsewhere)
+///   `subagent_timeout`— null when unset
+fn build_instance_config_json(
+    instance: &crate::db::InstanceRow,
+    full_name: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "name": instance.name,
+        "full_name": full_name,
+        "tag": instance.tag.as_deref().filter(|s| !s.is_empty()),
+        "timeout": instance.wait_timeout,
+        "hints": instance.hints.as_deref().filter(|s| !s.is_empty()),
+        "subagent_timeout": instance.subagent_timeout,
+    })
+}
+
+pub fn config_instance_get(
+    db: &HcomDb,
+    instance_arg: &str,
+    key: Option<&str>,
+) -> Result<Value, String> {
+    let name = instances::resolve_display_name(db, instance_arg)
+        .unwrap_or_else(|| instance_arg.to_string());
+    let instance = db
+        .get_instance_full(&name)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Agent '{}' not found", name))?;
+
+    Ok(match key {
+        None => {
+            let full_name = crate::instances::get_full_name(&instance);
+            build_instance_config_json(&instance, &full_name)
+        }
+        Some("tag") => serde_json::json!({"value": instance.tag.as_deref().unwrap_or("")}),
+        Some("timeout") => serde_json::json!({"value": instance.wait_timeout.unwrap_or(86400)}),
+        Some("hints") => serde_json::json!({"value": instance.hints.as_deref().unwrap_or("")}),
+        Some("subagent_timeout") => match instance.subagent_timeout {
+            Some(value) => serde_json::json!({"value": value}),
+            None => serde_json::json!({"value": serde_json::Value::Null}),
+        },
+        Some(other) => return Err(format!("Unknown instance config key '{}'", other)),
+    })
+}
+
+pub fn config_instance_set(
+    db: &HcomDb,
+    instance_arg: &str,
+    key: &str,
+    value: &str,
+) -> Result<Value, String> {
+    let name = instances::resolve_display_name(db, instance_arg)
+        .unwrap_or_else(|| instance_arg.to_string());
+    let instance = db
+        .get_instance_full(&name)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Agent '{}' not found", name))?;
+    let inst_name = &instance.name;
+
+    match key {
+        "tag" => {
+            if !value.is_empty()
+                && !value
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+            {
+                return Err("Tag must be alphanumeric (hyphens and underscores allowed)".into());
+            }
+            db.conn()
+                .execute(
+                    "UPDATE instances SET tag = ? WHERE name = ?",
+                    rusqlite::params![value, inst_name],
+                )
+                .map_err(|e| e.to_string())?;
+        }
+        "timeout" => {
+            if value.is_empty() || value.eq_ignore_ascii_case("default") {
+                db.conn()
+                    .execute(
+                        "UPDATE instances SET wait_timeout = 86400 WHERE name = ?",
+                        rusqlite::params![inst_name],
+                    )
+                    .map_err(|e| e.to_string())?;
+            } else {
+                let secs = value
+                    .parse::<i64>()
+                    .map_err(|_| "timeout must be a positive integer (seconds)".to_string())?;
+                if secs <= 0 {
+                    return Err("timeout must be a positive integer (seconds)".to_string());
+                }
+                db.conn()
+                    .execute(
+                        "UPDATE instances SET wait_timeout = ? WHERE name = ?",
+                        rusqlite::params![secs, inst_name],
+                    )
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        "hints" => {
+            let mut updates = serde_json::Map::new();
+            if value.is_empty() {
+                updates.insert("hints".into(), serde_json::Value::Null);
+            } else {
+                updates.insert("hints".into(), serde_json::json!(value));
+            }
+            instances::update_instance_position(db, inst_name, &updates);
+        }
+        "subagent_timeout" => {
+            let mut updates = serde_json::Map::new();
+            if value.is_empty() || value.eq_ignore_ascii_case("default") {
+                updates.insert("subagent_timeout".into(), serde_json::Value::Null);
+            } else {
+                let secs = value.parse::<i64>().map_err(|_| {
+                    "subagent_timeout must be a positive integer (seconds)".to_string()
+                })?;
+                if secs <= 0 {
+                    return Err("subagent_timeout must be a positive integer (seconds)".to_string());
+                }
+                updates.insert("subagent_timeout".into(), serde_json::json!(secs));
+            }
+            instances::update_instance_position(db, inst_name, &updates);
+        }
+        other => return Err(format!("Unknown instance config key '{}'", other)),
+    }
+
+    instance_lifecycle::notify_all_instances(db);
+    Ok(serde_json::json!({"instance": inst_name, "field": key, "value": value}))
 }
 
 // ── Main Entry Point ─────────────────────────────────────────────────────
@@ -696,6 +893,61 @@ pub fn cmd_config(db: &HcomDb, args: &ConfigArgs, ctx: Option<&CommandContext>) 
 
     // Instance config mode
     if let Some(ref inst) = instance_name {
+        let resolved =
+            instances::resolve_display_name(db, inst).unwrap_or_else(|| inst.to_string());
+        if let Some((base_name, device)) = crate::relay::control::split_device_suffix(&resolved) {
+            let action = if argv.len() >= 2 {
+                "config_set"
+            } else {
+                "config_get"
+            };
+            let params = if argv.len() >= 2 {
+                json!({
+                    "instance": base_name,
+                    "field": argv[0],
+                    "value": argv[1..].join(" "),
+                })
+            } else {
+                json!({
+                    "instance": base_name,
+                    "field": argv.first(),
+                })
+            };
+            return match crate::relay::control::dispatch_remote(
+                db,
+                device,
+                Some(&resolved),
+                action,
+                &params,
+                crate::relay::control::RPC_DEFAULT_TIMEOUT,
+            ) {
+                Ok(inner) => {
+                    if action == "config_get" {
+                        println!(
+                            "{}",
+                            render_config_instance_get(
+                                &inner,
+                                argv.first().map(|s| s.as_str()),
+                                json_mode
+                            )
+                        );
+                    } else {
+                        let field = argv.first().map(|s| s.as_str()).unwrap_or("");
+                        let value = argv.get(1..).map(|v| v.join(" ")).unwrap_or_default();
+                        let instance_name = inner["instance"].as_str().unwrap_or(base_name);
+                        println!(
+                            "{}",
+                            render_config_instance_set_feedback(instance_name, field, &value)
+                        );
+                    }
+                    0
+                }
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    1
+                }
+            };
+        }
         return config_instance(db, inst, &argv, ctx, json_mode);
     }
 
@@ -1875,5 +2127,263 @@ mod tests {
 
         assert!(managed.contains("cmux"));
         assert!(!other.contains("cmux"));
+    }
+
+    #[test]
+    fn test_config_instance_set_timeout_default_resets() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at, wait_timeout) VALUES (?1, ?2, ?3)",
+                rusqlite::params!["luna", crate::shared::time::now_epoch_f64(), 15],
+            )
+            .unwrap();
+
+        config_instance_set(&db, "luna", "timeout", "default").unwrap();
+        let timeout: i64 = db
+            .conn()
+            .query_row(
+                "SELECT wait_timeout FROM instances WHERE name = 'luna'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(timeout, 86400);
+    }
+
+    #[test]
+    fn test_config_instance_set_empty_hints_clears() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at, hints) VALUES (?1, ?2, ?3)",
+                rusqlite::params!["luna", crate::shared::time::now_epoch_f64(), "keep me"],
+            )
+            .unwrap();
+
+        config_instance_set(&db, "luna", "hints", "").unwrap();
+        let hints: Option<String> = db
+            .conn()
+            .query_row(
+                "SELECT hints FROM instances WHERE name = 'luna'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(hints, None);
+    }
+
+    #[test]
+    fn test_config_instance_set_subagent_timeout_default_clears() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at, subagent_timeout) VALUES (?1, ?2, ?3)",
+                rusqlite::params!["luna", crate::shared::time::now_epoch_f64(), 20],
+            )
+            .unwrap();
+
+        config_instance_set(&db, "luna", "subagent_timeout", "default").unwrap();
+        let timeout: Option<i64> = db
+            .conn()
+            .query_row(
+                "SELECT subagent_timeout FROM instances WHERE name = 'luna'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(timeout, None);
+    }
+
+    #[test]
+    fn test_render_config_instance_get_scalar_matches_local_style() {
+        let rendered =
+            render_config_instance_get(&serde_json::json!({"value": 42}), Some("timeout"), false);
+        assert_eq!(rendered, "42");
+    }
+
+    #[test]
+    fn test_render_config_instance_get_null_renders_empty_string() {
+        let rendered = render_config_instance_get(
+            &serde_json::json!({"value": serde_json::Value::Null}),
+            Some("timeout"),
+            false,
+        );
+        assert_eq!(rendered, "");
+    }
+
+    #[test]
+    fn test_render_config_instance_get_full_output_contract() {
+        let rendered = render_config_instance_get(
+            &serde_json::json!({
+                "name": "team-luna",
+                "tag": "team",
+                "timeout": 120,
+                "hints": "ship it",
+                "subagent_timeout": 45,
+            }),
+            None,
+            false,
+        );
+        assert_eq!(
+            rendered,
+            "Agent: team-luna\n  tag: team\n  timeout: 120s\n  hints: ship it\n  subagent_timeout: 45s"
+        );
+    }
+
+    #[test]
+    fn test_render_config_instance_get_full_output_uses_empty_state_labels() {
+        let rendered = render_config_instance_get(
+            &serde_json::json!({
+                "name": "luna",
+                "tag": "",
+                "timeout": 86400,
+                "hints": "",
+                "subagent_timeout": serde_json::Value::Null,
+            }),
+            None,
+            false,
+        );
+        assert_eq!(
+            rendered,
+            "Agent: luna\n  tag: (none)\n  timeout: 86400s\n  hints: (none)\n  subagent_timeout: (default)"
+        );
+    }
+
+    #[test]
+    fn test_render_config_instance_get_json_mode_passthrough() {
+        let rendered = render_config_instance_get(
+            &serde_json::json!({"value": 42, "name": "luna"}),
+            Some("timeout"),
+            true,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(parsed["value"], 42);
+        assert_eq!(parsed["name"], "luna");
+    }
+
+    #[test]
+    fn test_config_instance_get_full_output_uses_display_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at, tag) VALUES (?1, ?2, ?3)",
+                rusqlite::params!["luna", crate::shared::time::now_epoch_f64(), "team"],
+            )
+            .unwrap();
+
+        let config = config_instance_get(&db, "team-luna", None).unwrap();
+        // Stable shape: name is the base name, full_name is tag-prefixed.
+        assert_eq!(config["name"], "luna");
+        assert_eq!(config["full_name"], "team-luna");
+    }
+
+    #[test]
+    fn test_config_instance_get_timeout_uses_default_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES (?1, ?2)",
+                rusqlite::params!["luna", crate::shared::time::now_epoch_f64()],
+            )
+            .unwrap();
+
+        let config = config_instance_get(&db, "luna", Some("timeout")).unwrap();
+        assert_eq!(config["value"], 86400);
+    }
+
+    #[test]
+    fn test_config_instance_get_full_output_schema() {
+        // Stable JSON contract for `hcom config -i <name> --json`. Keep the
+        // local and remote (RPC) paths emitting identical shapes:
+        //   - name: base name (no tag prefix)
+        //   - full_name: tag-prefixed display name
+        //   - tag / hints: null when empty or unset (not "")
+        //   - timeout: number when set (schema default 86400); null when the
+        //     row has an explicit NULL (legacy/migrated rows)
+        //   - subagent_timeout: null when unset
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at, tag) VALUES (?1, ?2, ?3)",
+                rusqlite::params!["luna", crate::shared::time::now_epoch_f64(), "team"],
+            )
+            .unwrap();
+
+        let config = config_instance_get(&db, "team-luna", None).unwrap();
+        assert_eq!(config["name"], "luna");
+        assert_eq!(config["full_name"], "team-luna");
+        assert_eq!(config["tag"], "team");
+        // Schema default kicks in on INSERT without an explicit value.
+        assert_eq!(config["timeout"], 86400);
+        assert!(
+            config["hints"].is_null(),
+            "unset hints must serialize as null"
+        );
+        assert!(
+            config["subagent_timeout"].is_null(),
+            "unset subagent_timeout must serialize as null"
+        );
+    }
+
+    #[test]
+    fn test_config_instance_get_full_output_nullifies_empty_strings_and_null_timeout() {
+        // Scripts consume these as `tag in (null, "<value>")` so empty
+        // strings must be normalized to null. Also covers the legacy case
+        // where wait_timeout was explicitly NULL before the schema default
+        // existed.
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at, tag, hints, wait_timeout) \
+                 VALUES (?1, ?2, ?3, ?4, NULL)",
+                rusqlite::params!["luna", crate::shared::time::now_epoch_f64(), "", ""],
+            )
+            .unwrap();
+
+        let config = config_instance_get(&db, "luna", None).unwrap();
+        assert!(config["tag"].is_null(), "empty tag must serialize as null");
+        assert!(
+            config["hints"].is_null(),
+            "empty hints must serialize as null"
+        );
+        assert!(
+            config["timeout"].is_null(),
+            "explicit NULL wait_timeout must serialize as null"
+        );
+    }
+
+    #[test]
+    fn test_config_instance_get_subagent_timeout_unset_returns_null_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES (?1, ?2)",
+                rusqlite::params!["luna", crate::shared::time::now_epoch_f64()],
+            )
+            .unwrap();
+
+        let config = config_instance_get(&db, "luna", Some("subagent_timeout")).unwrap();
+        assert_eq!(config["value"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn test_render_config_instance_set_feedback_timeout_reset() {
+        let rendered = render_config_instance_set_feedback("luna", "timeout", "default");
+        assert_eq!(rendered, "Reset timeout for luna");
+    }
+
+    #[test]
+    fn test_render_config_instance_set_feedback_subagent_timeout_contract() {
+        let rendered = render_config_instance_set_feedback("team-luna", "subagent_timeout", "30");
+        assert_eq!(rendered, "Set subagent_timeout for team-luna: 30s");
     }
 }

@@ -8,6 +8,7 @@ use rumqttc::v5::mqttbytes::QoS;
 use serde_json::{Value, json};
 use std::time::Instant;
 
+use crate::config::HcomConfig;
 use crate::db::HcomDb;
 use crate::log;
 
@@ -97,11 +98,14 @@ pub fn build_state(db: &HcomDb) -> Value {
         .flatten()
         .and_then(|ts| parse_iso_timestamp_to_epoch(&ts))
         .unwrap_or(0.0);
+    let config = HcomConfig::load(None).unwrap_or_default();
+    let capabilities = json!(super::control::advertised_remote_capabilities(&config));
 
     json!({
         "instances": instances,
         "short_id": short_id,
         "reset_ts": reset_ts,
+        "capabilities": capabilities,
     })
 }
 

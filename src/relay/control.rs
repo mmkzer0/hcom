@@ -1,27 +1,28 @@
-//! Control events — remote stop/kill via MQTT control topic.
+//! Control events — remote RPC over the MQTT control topic.
 //!
-//! Control messages are published to {relay_id}/control (non-retained).
-//! Used for cross-device instance management (stop/kill remote agents).
+//! Control messages are published to `{relay_id}/control` (non-retained) and
+//! currently carry request/response style remote actions.
 
-use rumqttc::v5::Client;
 use rumqttc::v5::mqttbytes::QoS;
 use serde_json::{Value, json};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::config::HcomConfig;
 use crate::db::HcomDb;
+use crate::launcher::{self, LaunchParams};
 use crate::log;
 
 use super::{
     control_topic, device_short_id, is_relay_enabled, read_device_uuid, safe_kv_get, safe_kv_set,
 };
 
-/// Build control payload JSON bytes. Returns (topic, payload_bytes) or None.
-fn build_control_payload(
+/// Build RPC control payload JSON bytes. Returns (topic, payload_bytes) or None.
+pub fn build_rpc_control_payload(
     config: &HcomConfig,
     action: &str,
-    target: &str,
     target_device_short_id: &str,
+    request_id: &str,
+    params: &serde_json::Value,
 ) -> Option<(String, Vec<u8>)> {
     if !is_relay_enabled(config) {
         return None;
@@ -34,7 +35,6 @@ fn build_control_payload(
 
     let device_id = read_device_uuid();
     let short_id = device_short_id(&device_id);
-
     let now = crate::shared::time::now_epoch_f64();
 
     let control_payload = json!({
@@ -45,10 +45,11 @@ fn build_control_payload(
             "instance": "_control",
             "data": {
                 "action": action,
-                "target": target,
                 "target_device": target_device_short_id,
                 "from": format!("_:{}", short_id),
                 "from_device": device_id,
+                "request_id": request_id,
+                "params": params,
             },
         }],
     });
@@ -58,51 +59,17 @@ fn build_control_payload(
     Some((topic, payload_bytes))
 }
 
-/// Send a control command to a remote device via MQTT using the daemon's long-lived client.
-pub fn send_control(
-    config: &HcomConfig,
-    client: &Client,
-    action: &str,
-    target: &str,
-    target_device_short_id: &str,
-) -> bool {
-    let (topic, payload_bytes) =
-        match build_control_payload(config, action, target, target_device_short_id) {
-            Some(v) => v,
-            None => return false,
-        };
-
-    match client.publish(&topic, QoS::AtLeastOnce, false, payload_bytes) {
-        Ok(_) => {
-            log::log_with_fields(
-                "INFO",
-                "relay",
-                "relay.control",
-                "",
-                &[
-                    ("action", action),
-                    ("target", &format!("{}:{}", target, target_device_short_id)),
-                ],
-            );
-            true
-        }
-        Err(e) => {
-            log::log_warn("relay", "relay.network", &format!("control: {}", e));
-            false
-        }
-    }
-}
-
-/// Send a control command via an ephemeral client, waiting for PUBACK (5s timeout).
-fn send_control_via_ephemeral(
+fn send_rpc_control_via_ephemeral(
     config: &HcomConfig,
     client: &super::client::EphemeralClient,
     action: &str,
-    target: &str,
     target_device_short_id: &str,
+    request_id: &str,
+    params: &serde_json::Value,
 ) -> bool {
     let (topic, payload_bytes) =
-        match build_control_payload(config, action, target, target_device_short_id) {
+        match build_rpc_control_payload(config, action, target_device_short_id, request_id, params)
+        {
             Some(v) => v,
             None => return false,
         };
@@ -123,7 +90,8 @@ fn send_control_via_ephemeral(
             "",
             &[
                 ("action", action),
-                ("target", &format!("{}:{}", target, target_device_short_id)),
+                ("target", target_device_short_id),
+                ("request_id", request_id),
             ],
         );
     } else {
@@ -133,24 +101,637 @@ fn send_control_via_ephemeral(
     result
 }
 
-/// Send a control command using an ephemeral client (for CLI callers without
-/// a long-lived relay connection). Waits for PUBACK (up to 5s) before disconnecting.
-pub fn send_control_ephemeral(
+/// Send an RPC control command using an ephemeral client.
+pub fn send_rpc_control_ephemeral(
     config: &HcomConfig,
     action: &str,
-    target: &str,
     target_device_short_id: &str,
+    request_id: &str,
+    params: &serde_json::Value,
 ) -> bool {
     let ephemeral = match super::client::create_ephemeral_client(config) {
         Some(c) => c,
         None => return false,
     };
 
-    let result =
-        send_control_via_ephemeral(config, &ephemeral, action, target, target_device_short_id);
+    let result = send_rpc_control_via_ephemeral(
+        config,
+        &ephemeral,
+        action,
+        target_device_short_id,
+        request_id,
+        params,
+    );
 
     ephemeral.disconnect();
     result
+}
+
+pub fn get_rpc_result(db: &HcomDb, request_id: &str) -> Option<Value> {
+    let data: String = db
+        .conn()
+        .query_row(
+            "SELECT data FROM events
+             WHERE type = 'rpc_result'
+             AND json_extract(data, '$.request_id') = ?
+             ORDER BY id DESC LIMIT 1",
+            rusqlite::params![request_id],
+            |row| row.get(0),
+        )
+        .ok()?;
+    serde_json::from_str(&data).ok()
+}
+
+fn delete_rpc_result(db: &HcomDb, request_id: &str) {
+    // rpc_result rows are single-use rendezvous points. Deleting on consume prevents
+    // accumulation and keeps _rpc events out of the push loop entirely.
+    let _ = db.conn().execute(
+        "DELETE FROM events WHERE type = 'rpc_result' AND json_extract(data, '$.request_id') = ?",
+        rusqlite::params![request_id],
+    );
+}
+
+pub fn wait_for_rpc_result_with_db(
+    db: &HcomDb,
+    request_id: &str,
+    timeout: Duration,
+) -> Result<Value, String> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Some(result) = get_rpc_result(db, request_id) {
+            delete_rpc_result(db, request_id);
+            return Ok(result);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Err(format!("timed out waiting for rpc_result {}", request_id))
+}
+
+/// Send an RPC request and wait for the result, reusing an existing HcomDb connection.
+/// Prefer this over `send_rpc_request_and_wait` when the caller already holds a db.
+pub fn send_rpc_request_and_wait_with_db(
+    db: &HcomDb,
+    config: &HcomConfig,
+    action: &str,
+    target_device_short_id: &str,
+    target_name: Option<&str>,
+    params: &serde_json::Value,
+    timeout: Duration,
+) -> Result<Value, String> {
+    if !super::worker::is_relay_worker_running() {
+        return Err("relay worker not running - start with: hcom relay on".to_string());
+    }
+    ensure_remote_action_supported(target_device_short_id, action, target_name)?;
+    let request_id = uuid::Uuid::new_v4().to_string();
+    if !send_rpc_control_ephemeral(config, action, target_device_short_id, &request_id, params) {
+        return Err(format!("failed to send {} request", action));
+    }
+    wait_for_rpc_result_with_db(db, &request_id, timeout)
+}
+
+pub fn require_successful_rpc_result(response: Value) -> Result<Value, String> {
+    if response.get("ok").and_then(|v| v.as_bool()).unwrap_or(true) {
+        return Ok(response);
+    }
+
+    let action = response
+        .get("action")
+        .and_then(|v| v.as_str())
+        .unwrap_or("remote command");
+    let result = response.get("result").unwrap_or(&Value::Null);
+    let detail = result
+        .get("error")
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            let rendered = serde_json::to_string(result).unwrap_or_default();
+            if rendered.is_empty() || rendered == "null" {
+                "unknown remote error".to_string()
+            } else {
+                rendered
+            }
+        });
+    Err(format!("{action} failed: {detail}"))
+}
+
+/// Send an RPC request and return the raw response envelope
+/// (`{ok, action, result}`). Loads config internally.
+///
+/// Prefer [`dispatch_remote`] unless the caller needs to inspect custom
+/// fields on a failed response (e.g. kill's `permission_denied` path).
+pub fn dispatch_remote_raw(
+    db: &HcomDb,
+    device_short_id: &str,
+    target_name: Option<&str>,
+    action: &str,
+    params: &Value,
+    timeout: Duration,
+) -> Result<Value, String> {
+    let config = HcomConfig::load(None).unwrap_or_default();
+    send_rpc_request_and_wait_with_db(
+        db,
+        &config,
+        action,
+        device_short_id,
+        target_name,
+        params,
+        timeout,
+    )
+}
+
+/// Send an RPC request, require success, and return the unwrapped inner
+/// `result` field. This is the default for CLI callers: on success you get
+/// the handler's output value; on failure you get a user-facing error string.
+pub fn dispatch_remote(
+    db: &HcomDb,
+    device_short_id: &str,
+    target_name: Option<&str>,
+    action: &str,
+    params: &Value,
+    timeout: Duration,
+) -> Result<Value, String> {
+    let response = dispatch_remote_raw(db, device_short_id, target_name, action, params, timeout)?;
+    let response = require_successful_rpc_result(response)?;
+    Ok(response.get("result").cloned().unwrap_or(Value::Null))
+}
+
+/// Default timeout for remote RPC commands (kill, resume, term, transcript, config).
+pub const RPC_DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Longer timeout for remote launch, which may need to pull a model and start a process.
+pub const RPC_LAUNCH_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Split a target name like "luna:ABCD" into ("luna", "ABCD").
+/// Only returns Some when the suffix is exactly 4 uppercase alphanumeric characters —
+/// the format used for device short IDs. This prevents plain colons in agent names
+/// (e.g. "tag:value") from being misidentified as remote targets.
+pub fn split_device_suffix(name: &str) -> Option<(&str, &str)> {
+    let (base, suffix) = name.rsplit_once(':')?;
+    if suffix.len() == 4
+        && suffix
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+    {
+        Some((base, suffix))
+    } else {
+        None
+    }
+}
+
+type RemoteRpcHandler = fn(&HcomDb, &Value, &str, &HcomConfig) -> Result<Value, String>;
+
+const REMOTE_RPC_HANDLERS: &[(&str, RemoteRpcHandler)] = &[
+    ("launch", handle_remote_launch),
+    ("kill", handle_remote_kill),
+    ("resume", handle_remote_resume),
+    ("config_get", handle_remote_config_get),
+    ("config_set", handle_remote_config_set),
+    ("term_screen", handle_remote_term_screen),
+    ("term_inject", handle_remote_term_inject),
+    ("transcript", handle_remote_transcript),
+];
+
+pub fn advertised_remote_capabilities(_config: &HcomConfig) -> Vec<&'static str> {
+    REMOTE_RPC_HANDLERS
+        .iter()
+        .map(|(action, _)| *action)
+        .collect()
+}
+
+fn find_remote_rpc_handler(action: &str) -> Option<RemoteRpcHandler> {
+    REMOTE_RPC_HANDLERS
+        .iter()
+        .find(|(name, _)| *name == action)
+        .map(|(_, handler)| *handler)
+}
+
+/// Three distinct states a remote peer's capability advertisement can be in.
+/// Keeping these separate is load-bearing for mixed-version relays:
+/// a peer that predates the capability field (`Legacy`) must NOT be
+/// hard-blocked like one that explicitly advertises `[]`.
+#[derive(Debug, PartialEq, Eq)]
+enum CachedCapabilities {
+    /// No state message from this peer yet — caller should retry briefly.
+    NotSynced,
+    /// State arrived but had no `capabilities` field. Pre-capability peer;
+    /// let the request through and rely on the RPC timeout if unsupported.
+    Legacy,
+    /// Peer explicitly advertised a (possibly empty) capability list.
+    Advertised(Vec<String>),
+}
+
+fn read_remote_capabilities(
+    db: &HcomDb,
+    target_device_short_id: &str,
+) -> Result<CachedCapabilities, String> {
+    let Some(device_id) = safe_kv_get(db, &format!("relay_short_{}", target_device_short_id))
+    else {
+        return Ok(CachedCapabilities::NotSynced);
+    };
+    let Some(raw) = safe_kv_get(db, &format!("relay_caps_{}", device_id)) else {
+        return Ok(CachedCapabilities::NotSynced);
+    };
+    if raw == "null" {
+        return Ok(CachedCapabilities::Legacy);
+    }
+    let parsed = serde_json::from_str::<Vec<String>>(&raw).map_err(|e| {
+        format!("failed to parse remote capabilities for {target_device_short_id}: {e}")
+    })?;
+    Ok(CachedCapabilities::Advertised(parsed))
+}
+
+fn check_remote_action_for_db(
+    db: &HcomDb,
+    target_device_short_id: &str,
+    action: &str,
+    target_name: Option<&str>,
+) -> Result<(), String> {
+    let detail = target_name
+        .map(|n| format!(" (target {})", n))
+        .unwrap_or_default();
+    match read_remote_capabilities(db, target_device_short_id)? {
+        CachedCapabilities::Advertised(capabilities) => {
+            if capabilities.iter().any(|cap| cap == action) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "device {target_device_short_id}{detail} does not advertise remote action '{action}'"
+                ))
+            }
+        }
+        // Pre-capability peer: forward the request optimistically. If the
+        // peer can't handle it, the RPC wait will time out and surface a
+        // clear "timed out waiting for rpc_result" error.
+        CachedCapabilities::Legacy => Ok(()),
+        CachedCapabilities::NotSynced => Err(format!(
+            "device {target_device_short_id}{detail} has not yet synced remote capabilities — try again in a few seconds"
+        )),
+    }
+}
+
+fn ensure_remote_action_supported(
+    target_device_short_id: &str,
+    action: &str,
+    target_name: Option<&str>,
+) -> Result<(), String> {
+    const RETRY_DELAY: Duration = Duration::from_millis(500);
+
+    let db = HcomDb::open().map_err(|e| e.to_string())?;
+    for attempt in 0..3u32 {
+        if attempt > 0 {
+            std::thread::sleep(RETRY_DELAY);
+        }
+        match read_remote_capabilities(&db, target_device_short_id)? {
+            CachedCapabilities::Advertised(_) | CachedCapabilities::Legacy => {
+                // Cache is warm (explicit list or legacy sentinel) — no point retrying.
+                return check_remote_action_for_db(
+                    &db,
+                    target_device_short_id,
+                    action,
+                    target_name,
+                );
+            }
+            CachedCapabilities::NotSynced => {
+                // Capabilities not yet synced; keep retrying
+                if attempt < 2 {
+                    continue;
+                }
+                return check_remote_action_for_db(
+                    &db,
+                    target_device_short_id,
+                    action,
+                    target_name,
+                );
+            }
+        }
+    }
+    unreachable!()
+}
+
+fn emit_rpc_result(
+    db: &HcomDb,
+    request_id: &str,
+    action: &str,
+    ok: bool,
+    result: &serde_json::Value,
+) {
+    let data = json!({
+        "request_id": request_id,
+        "action": action,
+        "ok": ok,
+        "result": result,
+    });
+    let _ = db.log_event("rpc_result", "_rpc", &data);
+}
+
+fn resolve_remote_cwd(requested: Option<&str>) -> Result<String, String> {
+    let requested = requested.unwrap_or("");
+    if !requested.is_empty() {
+        if std::path::Path::new(requested).is_dir() {
+            return Ok(requested.to_string());
+        }
+        return Err(format!(
+            "requested cwd does not exist or is not a directory: {}",
+            requested
+        ));
+    }
+    let home = std::env::var("HOME")
+        .ok()
+        .filter(|p| std::path::Path::new(p).is_dir())
+        .ok_or_else(|| {
+            "remote launch needs a working directory but $HOME is not usable".to_string()
+        })?;
+    Ok(home)
+}
+
+fn required_param<'a>(params: &'a Value, key: &str) -> Result<&'a str, String> {
+    params
+        .get(key)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("missing {key}"))
+}
+
+fn optional_param<'a>(params: &'a Value, key: &str) -> Option<&'a str> {
+    params.get(key).and_then(|v| v.as_str())
+}
+
+fn bool_param(params: &Value, key: &str, default: bool) -> bool {
+    params.get(key).and_then(|v| v.as_bool()).unwrap_or(default)
+}
+
+fn usize_param(params: &Value, key: &str, default: usize) -> usize {
+    params
+        .get(key)
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or(default)
+}
+
+fn string_list_param(params: &Value, key: &str) -> Vec<String> {
+    params
+        .get(key)
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+        .collect()
+}
+
+fn normalize_config_field(field: &str) -> String {
+    if field.starts_with("HCOM_") {
+        field.to_string()
+    } else {
+        format!("HCOM_{}", field.to_uppercase())
+    }
+}
+
+struct RemoteLaunchRequest {
+    tool: String,
+    count: usize,
+    args: Vec<String>,
+    tag: Option<String>,
+    launcher: Option<String>,
+    system_prompt: Option<String>,
+    initial_prompt: Option<String>,
+    background: bool,
+    terminal: Option<String>,
+    cwd: Option<String>,
+}
+
+impl RemoteLaunchRequest {
+    fn from_params(params: &Value) -> Result<Self, String> {
+        let count = usize_param(params, "count", 1);
+        if count == 0 {
+            return Err("count must be at least 1".to_string());
+        }
+        Ok(Self {
+            tool: required_param(params, "tool")?.to_string(),
+            count,
+            args: string_list_param(params, "args"),
+            tag: optional_param(params, "tag").map(ToString::to_string),
+            launcher: optional_param(params, "launcher").map(ToString::to_string),
+            system_prompt: optional_param(params, "system_prompt").map(ToString::to_string),
+            initial_prompt: optional_param(params, "initial_prompt").map(ToString::to_string),
+            background: bool_param(params, "background", false),
+            terminal: optional_param(params, "terminal").map(ToString::to_string),
+            cwd: optional_param(params, "cwd").map(ToString::to_string),
+        })
+    }
+}
+
+struct PreparedRemoteLaunch {
+    args: Vec<String>,
+    background: bool,
+    pty: bool,
+}
+
+fn prepare_remote_launch(
+    request: &RemoteLaunchRequest,
+    config: &HcomConfig,
+) -> PreparedRemoteLaunch {
+    let (args, background, pty) = crate::commands::launch::prepare_launch_execution(
+        &request.tool,
+        &request.args,
+        config,
+        request.background,
+    );
+    PreparedRemoteLaunch {
+        args,
+        background,
+        pty,
+    }
+}
+
+struct RemoteResumeRequest {
+    target: String,
+    fork: bool,
+    extra_args: Vec<String>,
+    launcher: Option<String>,
+}
+
+impl RemoteResumeRequest {
+    fn from_params(params: &Value) -> Result<Self, String> {
+        Ok(Self {
+            target: required_param(params, "target")?.to_string(),
+            fork: bool_param(params, "fork", false),
+            extra_args: string_list_param(params, "extra_args"),
+            launcher: optional_param(params, "launcher").map(ToString::to_string),
+        })
+    }
+}
+
+fn handle_remote_launch(
+    db: &HcomDb,
+    params: &Value,
+    _initiated_by: &str,
+    config: &HcomConfig,
+) -> Result<Value, String> {
+    let request = RemoteLaunchRequest::from_params(params)?;
+    let prepared = prepare_remote_launch(&request, config);
+    let cwd = resolve_remote_cwd(request.cwd.as_deref())?;
+
+    let result = launcher::launch(
+        db,
+        LaunchParams {
+            tool: request.tool.clone(),
+            count: request.count,
+            args: prepared.args,
+            tag: request.tag,
+            system_prompt: request.system_prompt,
+            initial_prompt: request.initial_prompt,
+            pty: prepared.pty,
+            background: prepared.background,
+            cwd: Some(cwd.clone()),
+            env: None,
+            launcher: request.launcher.or_else(|| Some("user".to_string())),
+            // Remote launch runs inside the relay worker, so current-terminal exec
+            // is not safe even for single interactive launches.
+            run_here: Some(false),
+            batch_id: None,
+            name: None,
+            skip_validation: false,
+            terminal: request.terminal,
+            append_reply_handoff: false,
+        },
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(crate::commands::launch::launch_result_to_json(&result))
+}
+
+fn handle_remote_kill(
+    db: &HcomDb,
+    params: &Value,
+    initiated_by: &str,
+    _config: &HcomConfig,
+) -> Result<Value, String> {
+    let target = required_param(params, "target")?;
+    let result = crate::commands::kill::kill_tracked_instance(db, target, initiated_by)?;
+    Ok(json!({
+        "target": result.target,
+        "pid": result.pid,
+        "kill_result": match result.kill_result {
+            crate::terminal::KillResult::Sent => "sent",
+            crate::terminal::KillResult::AlreadyDead => "already_dead",
+            crate::terminal::KillResult::PermissionDenied => "permission_denied",
+        },
+        "pane_closed": result.pane_closed,
+        "preset_name": result.preset_name,
+        "pane_id": result.pane_id,
+        "ok": !matches!(result.kill_result, crate::terminal::KillResult::PermissionDenied),
+    }))
+}
+
+fn handle_remote_resume(
+    db: &HcomDb,
+    params: &Value,
+    _initiated_by: &str,
+    _config: &HcomConfig,
+) -> Result<Value, String> {
+    let request = RemoteResumeRequest::from_params(params)?;
+    let mut flags = crate::router::GlobalFlags::default();
+    flags.name = request.launcher;
+    let result = crate::commands::resume::run_local_resume_result(
+        db,
+        &request.target,
+        request.fork,
+        &request.extra_args,
+        &flags,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(crate::commands::launch::launch_result_to_json(&result))
+}
+
+fn handle_remote_config_get(
+    db: &HcomDb,
+    params: &Value,
+    _initiated_by: &str,
+    _config: &HcomConfig,
+) -> Result<Value, String> {
+    if let Some(instance) = optional_param(params, "instance") {
+        let key = optional_param(params, "field");
+        return crate::commands::config::config_instance_get(db, instance, key);
+    }
+    let fields = params
+        .get("fields")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut values = serde_json::Map::new();
+    for field in fields {
+        if let Some(field_str) = field.as_str() {
+            let normalized = normalize_config_field(field_str);
+            let (value, source) = crate::commands::config::config_get(&normalized);
+            values.insert(
+                field_str.to_string(),
+                json!({"value": value, "source": source}),
+            );
+        }
+    }
+    Ok(Value::Object(values))
+}
+
+fn handle_remote_config_set(
+    db: &HcomDb,
+    params: &Value,
+    _initiated_by: &str,
+    _config: &HcomConfig,
+) -> Result<Value, String> {
+    if let Some(instance) = optional_param(params, "instance") {
+        let field = required_param(params, "field")?;
+        let value = required_param(params, "value")?;
+        return crate::commands::config::config_instance_set(db, instance, field, value);
+    }
+    let field = required_param(params, "field")?;
+    let value = required_param(params, "value")?;
+    let normalized = normalize_config_field(field);
+    crate::commands::config::config_set(&normalized, value)?;
+    Ok(json!({"field": field, "value": value}))
+}
+
+fn handle_remote_term_screen(
+    db: &HcomDb,
+    params: &Value,
+    _initiated_by: &str,
+    _config: &HcomConfig,
+) -> Result<Value, String> {
+    let target = required_param(params, "target")?;
+    let raw_json = bool_param(params, "json", false);
+    let content = crate::commands::term::read_instance_screen(db, target, raw_json)?;
+    Ok(json!({"target": target, "content": content}))
+}
+
+fn handle_remote_term_inject(
+    db: &HcomDb,
+    params: &Value,
+    _initiated_by: &str,
+    _config: &HcomConfig,
+) -> Result<Value, String> {
+    let target = required_param(params, "target")?;
+    let text = optional_param(params, "text").unwrap_or("");
+    let enter = bool_param(params, "enter", false);
+    let message = crate::commands::term::inject_text_remote_result(db, target, text, enter)?;
+    Ok(json!({"target": target, "message": message}))
+}
+
+fn handle_remote_transcript(
+    db: &HcomDb,
+    params: &Value,
+    _initiated_by: &str,
+    _config: &HcomConfig,
+) -> Result<Value, String> {
+    let target = required_param(params, "target")?;
+    let last_n = usize_param(params, "last", 10);
+    let range = optional_param(params, "range");
+    let json_mode = bool_param(params, "json", false);
+    let full_mode = bool_param(params, "full", false);
+    let detailed = bool_param(params, "detailed", false);
+    let content = crate::commands::transcript::render_instance_transcript_with_options_no_retry(
+        db, target, range, last_n, json_mode, full_mode, detailed,
+    )?;
+    Ok(json!({"target": target, "content": content}))
 }
 
 /// Process incoming control events targeting this device.
@@ -160,12 +741,14 @@ pub fn handle_control_events(
     events: &[Value],
     own_short_id: &str,
     source_device: &str,
-) {
+) -> bool {
+    let config = HcomConfig::load(None).unwrap_or_default();
     let last_ctrl_ts: f64 = safe_kv_get(db, &format!("relay_ctrl_{}", source_device))
         .and_then(|s| s.parse().ok())
         .unwrap_or(0.0);
 
     let mut max_ctrl_ts = last_ctrl_ts;
+    let mut produced_rpc_results = false;
 
     for event in events {
         if event.get("type").and_then(|v| v.as_str()) != Some("control") {
@@ -196,47 +779,41 @@ pub fn handle_control_events(
         }
 
         let action = data.get("action").and_then(|v| v.as_str()).unwrap_or("");
-        let target = match data.get("target").and_then(|v| v.as_str()) {
-            Some(t) => t,
-            None => continue,
-        };
+        let request_id = data
+            .get("request_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let params = data.get("params").cloned().unwrap_or_else(|| {
+            json!({
+                "target": data.get("target").and_then(|v| v.as_str()).unwrap_or("")
+            })
+        });
 
         match action {
-            "stop" => {
+            action => {
+                let Some(handler) = find_remote_rpc_handler(action) else {
+                    continue;
+                };
+                if request_id.is_empty() {
+                    continue;
+                }
+                produced_rpc_results = true;
                 let initiated_by = data
                     .get("from")
                     .and_then(|v| v.as_str())
                     .unwrap_or("remote");
-                crate::hooks::common::stop_instance(db, target, initiated_by, "remote");
-                log::log_with_fields(
-                    "INFO",
-                    "relay",
-                    "relay.control_recv",
-                    "",
-                    &[
-                        ("action", "stop"),
-                        ("target", target),
-                        ("from", initiated_by),
-                    ],
-                );
+                let rpc_result = handler(db, &params, initiated_by, &config);
+
+                match rpc_result {
+                    Ok(result) => {
+                        let ok = result.get("ok").and_then(|v| v.as_bool()).unwrap_or(true);
+                        emit_rpc_result(db, request_id, action, ok, &result);
+                    }
+                    Err(error) => {
+                        emit_rpc_result(db, request_id, action, false, &json!({ "error": error }));
+                    }
+                }
             }
-            "start" => {
-                // Older clients may still send remote start requests; keep rejecting
-                // them explicitly so the behavior is visible in logs instead of
-                // looking like a successful no-op.
-                log::log_with_fields(
-                    "WARN",
-                    "relay",
-                    "relay.control_unsupported",
-                    "",
-                    &[
-                        ("action", "start"),
-                        ("target", target),
-                        ("reason", "unsupported"),
-                    ],
-                );
-            }
-            _ => {}
         }
     }
 
@@ -248,12 +825,67 @@ pub fn handle_control_events(
             Some(&max_ctrl_ts.to_string()),
         );
     }
+
+    produced_rpc_results
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn test_db() -> HcomDb {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = HcomDb::open_raw(&db_path).unwrap();
+        db.init_db().unwrap();
+        std::mem::forget(dir);
+        db
+    }
+
+    fn latest_rpc_result(db: &HcomDb) -> serde_json::Value {
+        let payload: String = db
+            .conn()
+            .query_row(
+                "SELECT data FROM events WHERE type = 'rpc_result' ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        serde_json::from_str(&payload).unwrap()
+    }
+
+    #[test]
+    fn test_split_device_suffix_valid() {
+        assert_eq!(split_device_suffix("luna:ABCD"), Some(("luna", "ABCD")));
+        assert_eq!(
+            split_device_suffix("myagent:XY12"),
+            Some(("myagent", "XY12"))
+        );
+        assert_eq!(split_device_suffix("a:B3C4"), Some(("a", "B3C4")));
+        // All digits
+        assert_eq!(split_device_suffix("foo:1234"), Some(("foo", "1234")));
+    }
+
+    #[test]
+    fn test_split_device_suffix_invalid() {
+        // Lowercase in suffix
+        assert_eq!(split_device_suffix("luna:abcd"), None);
+        // Mixed case
+        assert_eq!(split_device_suffix("luna:ABCd"), None);
+        // Too short
+        assert_eq!(split_device_suffix("luna:ABC"), None);
+        // Too long
+        assert_eq!(split_device_suffix("luna:ABCDE"), None);
+        // No colon
+        assert_eq!(split_device_suffix("luna"), None);
+        // tag:value pattern should not match
+        assert_eq!(split_device_suffix("tag:something"), None);
+        // Hyphen in suffix
+        assert_eq!(split_device_suffix("foo:AB-D"), None);
+        // Empty base
+        assert_eq!(split_device_suffix(":ABCD"), Some(("", "ABCD")));
+    }
 
     #[test]
     fn test_handle_control_events_filters_by_target() {
@@ -262,18 +894,289 @@ mod tests {
             "type": "control",
             "ts": 1000.0,
             "data": {
-                "action": "stop",
-                "target": "luna",
+                "action": "kill",
                 "target_device": "ABCD",
                 "from": "_:EFGH",
+                "request_id": "req-other-device",
+                "params": {
+                    "target": "luna",
+                }
             }
         })];
 
         // own_short_id is "WXYZ" — event targets "ABCD", so nothing should happen
-        let db =
-            HcomDb::open_raw(&tempfile::NamedTempFile::new().unwrap().into_temp_path()).unwrap();
-        handle_control_events(&db, &events, "WXYZ", "device-123");
+        let db = test_db();
+        assert!(!handle_control_events(&db, &events, "WXYZ", "device-123"));
 
         // No crash, no panic — event was filtered
+    }
+
+    #[test]
+    fn test_resolve_remote_cwd_rejects_missing_requested_directory() {
+        let err = resolve_remote_cwd(Some("/definitely/missing")).unwrap_err();
+        assert!(err.contains("requested cwd does not exist or is not a directory"));
+    }
+
+    #[test]
+    fn test_build_rpc_control_payload_includes_request_id_and_params() {
+        let mut config = HcomConfig::default();
+        config.relay_id = "relay-1".to_string();
+        let (_, payload) = build_rpc_control_payload(
+            &config,
+            "launch",
+            "WXYZ",
+            "req-launch",
+            &json!({"tool": "claude", "count": 1}),
+        )
+        .expect("payload");
+        let parsed: Value = serde_json::from_slice(&payload).unwrap();
+        let data = &parsed["events"][0]["data"];
+        assert_eq!(data["action"], "launch");
+        assert_eq!(data["target_device"], "WXYZ");
+        assert_eq!(data["request_id"], "req-launch");
+        assert_eq!(data["params"]["tool"], "claude");
+    }
+
+    #[test]
+    fn test_remote_launch_request_from_params_defaults_optional_fields() {
+        let request =
+            RemoteLaunchRequest::from_params(&json!({"tool": "claude", "count": 2})).unwrap();
+        assert_eq!(request.tool, "claude");
+        assert_eq!(request.count, 2);
+        assert!(request.args.is_empty());
+        assert_eq!(request.tag, None);
+        assert_eq!(request.launcher, None);
+        assert_eq!(request.system_prompt, None);
+        assert_eq!(request.initial_prompt, None);
+        assert!(!request.background);
+        assert_eq!(request.terminal, None);
+        assert_eq!(request.cwd, None);
+    }
+
+    #[test]
+    fn test_remote_launch_request_from_params_collects_terminal() {
+        let request = RemoteLaunchRequest::from_params(&json!({
+            "tool": "codex",
+            "count": 1,
+            "terminal": "kitty-tab",
+            "launcher": "rega",
+        }))
+        .unwrap();
+        assert_eq!(request.terminal.as_deref(), Some("kitty-tab"));
+        assert_eq!(request.launcher.as_deref(), Some("rega"));
+    }
+
+    #[test]
+    fn test_prepare_remote_launch_supports_interactive_pty() {
+        let request = RemoteLaunchRequest::from_params(&json!({
+            "tool": "codex",
+            "count": 1,
+            "args": ["--model", "gpt-5.4"],
+            "background": false,
+        }))
+        .unwrap();
+        let prepared = prepare_remote_launch(&request, &HcomConfig::default());
+        assert!(!prepared.background);
+        assert!(prepared.pty);
+        assert_eq!(prepared.args, vec!["--model", "gpt-5.4"]);
+    }
+
+    #[test]
+    fn test_prepare_remote_launch_keeps_background_detection() {
+        let request = RemoteLaunchRequest::from_params(&json!({
+            "tool": "claude",
+            "count": 1,
+            "args": ["-p"],
+            "background": false,
+        }))
+        .unwrap();
+        let prepared = prepare_remote_launch(&request, &HcomConfig::default());
+        assert!(prepared.background);
+        assert!(!prepared.pty);
+    }
+
+    #[test]
+    fn test_remote_resume_request_from_params_collects_extra_args() {
+        let request = RemoteResumeRequest::from_params(&json!({
+            "target": "luna",
+            "fork": true,
+            "extra_args": ["--terminal", "kitty", "--model", "opus"],
+            "launcher": "rega",
+        }))
+        .unwrap();
+        assert_eq!(request.target, "luna");
+        assert!(request.fork);
+        assert_eq!(request.launcher.as_deref(), Some("rega"));
+        assert_eq!(
+            request.extra_args,
+            vec!["--terminal", "kitty", "--model", "opus"]
+        );
+    }
+
+    #[test]
+    fn test_handle_control_events_kill_emits_rpc_result() {
+        let db = test_db();
+        let events = vec![json!({
+            "type": "control",
+            "ts": 1002.0,
+            "data": {
+                "action": "kill",
+                "target_device": "WXYZ",
+                "from": "_:EFGH",
+                "request_id": "req-kill",
+                "params": {
+                    "target": "missing-agent",
+                }
+            }
+        })];
+
+        assert!(handle_control_events(&db, &events, "WXYZ", "device-123"));
+        let result = latest_rpc_result(&db);
+        assert_eq!(result["request_id"], "req-kill");
+        assert_eq!(result["action"], "kill");
+        assert_eq!(result["ok"], false);
+    }
+
+    #[test]
+    fn test_handle_control_events_ignores_unknown_actions() {
+        let db = test_db();
+        let events = vec![json!({
+            "type": "control",
+            "ts": 1004.0,
+            "data": {
+                "action": "mystery",
+                "target_device": "WXYZ",
+                "from": "_:EFGH",
+                "request_id": "req-unknown",
+                "params": {},
+            }
+        })];
+
+        assert!(!handle_control_events(&db, &events, "WXYZ", "device-123"));
+        let count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'rpc_result'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_require_successful_rpc_result_returns_error_for_failed_response() {
+        let err = require_successful_rpc_result(json!({
+            "action": "resume",
+            "ok": false,
+            "result": { "error": "boom" }
+        }))
+        .unwrap_err();
+        assert_eq!(err, "resume failed: boom");
+    }
+
+    #[test]
+    fn test_check_remote_action_for_db_accepts_advertised_action() {
+        let db = test_db();
+        safe_kv_set(&db, "relay_short_WXYZ", Some("device-123"));
+        safe_kv_set(
+            &db,
+            "relay_caps_device-123",
+            Some(r#"["launch","resume","config_get"]"#),
+        );
+
+        assert!(check_remote_action_for_db(&db, "WXYZ", "resume", None).is_ok());
+    }
+
+    #[test]
+    fn test_check_remote_action_for_db_rejects_unadvertised_action() {
+        let db = test_db();
+        safe_kv_set(&db, "relay_short_WXYZ", Some("device-123"));
+        safe_kv_set(&db, "relay_caps_device-123", Some(r#"["launch"]"#));
+
+        let err = check_remote_action_for_db(&db, "WXYZ", "resume", None).unwrap_err();
+        assert_eq!(err, "device WXYZ does not advertise remote action 'resume'");
+    }
+
+    #[test]
+    fn test_check_remote_action_for_db_rejects_unadvertised_action_with_target_name() {
+        let db = test_db();
+        safe_kv_set(&db, "relay_short_WXYZ", Some("device-123"));
+        safe_kv_set(&db, "relay_caps_device-123", Some(r#"["launch"]"#));
+
+        let err = check_remote_action_for_db(&db, "WXYZ", "kill", Some("luna:WXYZ")).unwrap_err();
+        assert_eq!(
+            err,
+            "device WXYZ (target luna:WXYZ) does not advertise remote action 'kill'"
+        );
+    }
+
+    #[test]
+    fn test_check_remote_action_for_db_rejects_missing_capabilities() {
+        let db = test_db();
+        safe_kv_set(&db, "relay_short_WXYZ", Some("device-123"));
+
+        let err = check_remote_action_for_db(&db, "WXYZ", "resume", None).unwrap_err();
+        assert!(
+            err.contains("has not yet synced remote capabilities"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_check_remote_action_for_db_accepts_legacy_peer() {
+        // Pre-capability peers (pull.rs stores "null" when the state message
+        // carries no `capabilities` field) must be allowed through. Blocking
+        // them here would break rolling upgrades: the user would see
+        // "does not advertise remote action 'launch'" against a peer that
+        // simply predates the capability vocabulary.
+        let db = test_db();
+        safe_kv_set(&db, "relay_short_WXYZ", Some("device-123"));
+        safe_kv_set(&db, "relay_caps_device-123", Some("null"));
+
+        assert_eq!(
+            read_remote_capabilities(&db, "WXYZ").unwrap(),
+            CachedCapabilities::Legacy
+        );
+        assert!(check_remote_action_for_db(&db, "WXYZ", "launch", None).is_ok());
+        assert!(check_remote_action_for_db(&db, "WXYZ", "kill", None).is_ok());
+    }
+
+    #[test]
+    fn test_check_remote_action_for_db_rejects_explicit_empty_capabilities() {
+        // A modern peer that explicitly advertises an empty list should still
+        // be hard-blocked. The legacy carve-out only applies when the field is
+        // MISSING.
+        let db = test_db();
+        safe_kv_set(&db, "relay_short_WXYZ", Some("device-123"));
+        safe_kv_set(&db, "relay_caps_device-123", Some("[]"));
+
+        assert_eq!(
+            read_remote_capabilities(&db, "WXYZ").unwrap(),
+            CachedCapabilities::Advertised(Vec::new())
+        );
+        let err = check_remote_action_for_db(&db, "WXYZ", "launch", None).unwrap_err();
+        assert!(
+            err.contains("does not advertise remote action"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_advertised_remote_capabilities_lists_all_handlers() {
+        let config = HcomConfig::default();
+        assert_eq!(
+            advertised_remote_capabilities(&config),
+            vec![
+                "launch",
+                "kill",
+                "resume",
+                "config_get",
+                "config_set",
+                "term_screen",
+                "term_inject",
+                "transcript",
+            ]
+        );
     }
 }

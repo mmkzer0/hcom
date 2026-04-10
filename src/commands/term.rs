@@ -104,6 +104,32 @@ fn inject_text(db: &HcomDb, name: &str, text: &str, enter: bool) -> i32 {
     0
 }
 
+pub fn inject_text_remote_result(
+    db: &HcomDb,
+    name: &str,
+    text: &str,
+    enter: bool,
+) -> Result<String, String> {
+    let port = get_inject_port(db, name).ok_or_else(|| format!("No inject port for '{name}'."))?;
+
+    if !text.is_empty() {
+        inject_raw(port, text.as_bytes())?;
+    }
+    if enter {
+        if !text.is_empty() {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        inject_raw(port, b"\r")?;
+    }
+
+    let label = match (text.is_empty(), enter) {
+        (false, true) => format!("Injected {} chars + enter to {}", text.len(), name),
+        (false, false) => format!("Injected {} chars to {}", text.len(), name),
+        (true, _) => format!("Injected enter to {}", name),
+    };
+    Ok(label)
+}
+
 /// Send screen query to inject port, get back parsed JSON.
 fn query_screen(port: i32) -> Option<serde_json::Value> {
     let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).ok()?;
@@ -118,6 +144,22 @@ fn query_screen(port: i32) -> Option<serde_json::Value> {
         return None;
     }
     serde_json::from_slice(&data).ok()
+}
+
+pub fn read_instance_screen(db: &HcomDb, name: &str, raw_json: bool) -> Result<String, String> {
+    let port = get_inject_port(db, name).ok_or_else(|| {
+        format!(
+            "No inject port for '{}'. Instance not running or not PTY-managed.",
+            name
+        )
+    })?;
+    let result = query_screen(port)
+        .ok_or_else(|| format!("No response from '{}' (port {}).", name, port))?;
+    if raw_json {
+        Ok(serde_json::to_string(&result).unwrap_or_default())
+    } else {
+        Ok(format_screen(&result))
+    }
 }
 
 /// Format screen JSON as readable text.
@@ -355,11 +397,67 @@ pub fn cmd_term(db: &HcomDb, args: &TermArgs, _ctx: Option<&CommandContext>) -> 
             println!("Nothing to inject (provide text or --enter)");
             return 1;
         }
+        if let Some((base_name, device)) = crate::relay::control::split_device_suffix(&name) {
+            return match crate::relay::control::dispatch_remote(
+                db,
+                device,
+                Some(&name),
+                "term_inject",
+                &serde_json::json!({"target": base_name, "text": text, "enter": enter}),
+                crate::relay::control::RPC_DEFAULT_TIMEOUT,
+            ) {
+                Ok(inner) => {
+                    println!(
+                        "{}",
+                        inner["message"]
+                            .as_str()
+                            .unwrap_or("Remote term inject completed")
+                    );
+                    0
+                }
+                Err(e) => {
+                    eprintln!("Remote term inject failed: {e}");
+                    1
+                }
+            };
+        }
         return inject_text(db, &name, &text, enter);
     }
 
     if sub == Some("debug") {
         return handle_debug(&argv[1..]);
+    }
+
+    // Find the first non-flag positional to check for a `name:DEVICE` remote
+    // target. `hcom term --json luna:ABCD` must route through the RPC path
+    // just like `hcom term luna:ABCD --json`.
+    if let Some(name_arg) = argv.iter().find(|arg| !arg.starts_with('-')) {
+        let name = resolve_display_name(db, name_arg).unwrap_or_else(|| name_arg.clone());
+        if let Some((base_name, device)) = crate::relay::control::split_device_suffix(&name) {
+            let raw_json = argv.iter().any(|a| a == "--json");
+            return match crate::relay::control::dispatch_remote(
+                db,
+                device,
+                Some(&name),
+                "term_screen",
+                &serde_json::json!({"target": base_name, "json": raw_json}),
+                crate::relay::control::RPC_DEFAULT_TIMEOUT,
+            ) {
+                Ok(inner) => {
+                    println!(
+                        "{}",
+                        inner["content"]
+                            .as_str()
+                            .unwrap_or("No remote screen content")
+                    );
+                    0
+                }
+                Err(e) => {
+                    eprintln!("Remote term screen failed: {e}");
+                    1
+                }
+            };
+        }
     }
 
     // Screen query
@@ -369,6 +467,18 @@ pub fn cmd_term(db: &HcomDb, args: &TermArgs, _ctx: Option<&CommandContext>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    fn test_db() -> HcomDb {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = HcomDb::open_raw(&db_path).unwrap();
+        db.init_db().unwrap();
+        std::mem::forget(dir);
+        db
+    }
 
     #[test]
     fn test_format_screen() {
@@ -392,5 +502,104 @@ mod tests {
         // Just verify it returns something sensible
         let path = flag_path();
         assert!(path.to_string_lossy().contains("pty_debug_on"));
+    }
+
+    #[test]
+    fn test_remote_term_screen_positional_detection_skips_leading_flags() {
+        // The remote fast-path in cmd_term must locate the `name:DEVICE`
+        // positional even when flags (e.g. `--json`) precede it. Mirrors the
+        // scan used at the top of cmd_term's term_screen branch.
+        fn first_positional<'a>(argv: &'a [String]) -> Option<&'a String> {
+            argv.iter().find(|arg| !arg.starts_with('-'))
+        }
+
+        let name_only = vec!["luna:ABCD".to_string()];
+        assert_eq!(
+            first_positional(&name_only).map(String::as_str),
+            Some("luna:ABCD")
+        );
+
+        let json_first = vec!["--json".to_string(), "luna:ABCD".to_string()];
+        assert_eq!(
+            first_positional(&json_first).map(String::as_str),
+            Some("luna:ABCD")
+        );
+
+        let json_after = vec!["luna:ABCD".to_string(), "--json".to_string()];
+        assert_eq!(
+            first_positional(&json_after).map(String::as_str),
+            Some("luna:ABCD")
+        );
+
+        let flags_only = vec!["--json".to_string()];
+        assert_eq!(first_positional(&flags_only), None);
+    }
+
+    #[test]
+    fn test_inject_text_remote_result_matches_cli_feedback() {
+        let db = test_db();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port() as i32;
+        db.conn()
+            .execute(
+                "INSERT INTO notify_endpoints (instance, kind, port, updated_at) VALUES (?1, 'inject', ?2, 0)",
+                rusqlite::params!["luna", port],
+            )
+            .unwrap();
+
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = String::new();
+            stream.read_to_string(&mut buf).unwrap();
+            buf
+        });
+
+        let result = inject_text_remote_result(&db, "luna", "status", false).unwrap();
+        let received = handle.join().unwrap();
+
+        assert_eq!(result, "Injected 6 chars to luna");
+        assert_eq!(received, "status");
+    }
+
+    #[test]
+    fn test_read_instance_screen_formats_contract_output() {
+        let db = test_db();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port() as i32;
+        db.conn()
+            .execute(
+                "INSERT INTO notify_endpoints (instance, kind, port, updated_at) VALUES (?1, 'inject', ?2, 0)",
+                rusqlite::params!["luna", port],
+            )
+            .unwrap();
+
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).unwrap();
+            assert_eq!(request, b"\x00SCREEN\n");
+            stream
+                .write_all(
+                    serde_json::json!({
+                        "lines": ["hello", "", "world"],
+                        "cursor": [2, 5],
+                        "size": [24, 80],
+                        "ready": true,
+                        "prompt_empty": false,
+                        "input_text": "status",
+                    })
+                    .to_string()
+                    .as_bytes(),
+                )
+                .unwrap();
+        });
+
+        let rendered = read_instance_screen(&db, "luna", false).unwrap();
+        handle.join().unwrap();
+
+        assert!(rendered.contains("Screen 24x80  cursor (2,5)"));
+        assert!(rendered.contains("ready=true  prompt_empty=false  input_text=\"status\""));
+        assert!(rendered.contains("  0: hello"));
+        assert!(rendered.contains("  2: world"));
     }
 }

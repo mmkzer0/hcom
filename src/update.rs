@@ -293,6 +293,7 @@ pub fn get_update_notice() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn test_parse_version() {
@@ -318,6 +319,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_user_site_pip_detection() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
@@ -340,6 +342,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_user_site_pip_detection_ignores_plain_local_bin() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();

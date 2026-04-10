@@ -1504,6 +1504,7 @@ pub fn resolve_terminal_info_from_launch_context(launch_context_json: &str) -> T
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn test_shell_quote_empty() {
@@ -1602,6 +1603,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_normalize_terminal_mode_for_launch_resolves_socket_for_auto_detected_kitty() {
         let saved_window = std::env::var("KITTY_WINDOW_ID").ok();
         let saved_listen = std::env::var("KITTY_LISTEN_ON").ok();
@@ -1630,6 +1632,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_resolve_terminal_mode_for_tips_uses_normalized_auto_detected_mode() {
         let saved_window = std::env::var("KITTY_WINDOW_ID").ok();
         let saved_listen = std::env::var("KITTY_LISTEN_ON").ok();

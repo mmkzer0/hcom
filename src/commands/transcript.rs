@@ -1738,6 +1738,32 @@ fn read_file_lossy(path: &Path) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
+fn should_retry_codex_transcript(exchanges: &[Exchange]) -> bool {
+    exchanges
+        .last()
+        .map(|ex| is_no_response_action(&ex.action))
+        .unwrap_or(false)
+}
+
+fn retry_codex_transcript(
+    path: &Path,
+    last: usize,
+    detailed: bool,
+    mut exchanges: Vec<Exchange>,
+) -> Result<Vec<Exchange>, String> {
+    for _ in 0..4 {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let retried = parse_codex_jsonl(path, last, detailed)?;
+        if !should_retry_codex_transcript(&retried) {
+            return Ok(retried);
+        }
+        if retried.len() > exchanges.len() {
+            exchanges = retried;
+        }
+    }
+    Ok(exchanges)
+}
+
 /// Get exchanges from a transcript file.
 fn get_exchanges(
     path: &str,
@@ -1745,13 +1771,14 @@ fn get_exchanges(
     last: usize,
     detailed: bool,
     session_id: Option<&str>,
+    retry_codex: bool,
 ) -> Result<Vec<Exchange>, String> {
     let p = Path::new(path);
     if !p.exists() {
         return Err(format!("Transcript not found: {path}"));
     }
 
-    match agent {
+    let mut exchanges = match agent {
         "claude" => parse_claude_jsonl(p, last, detailed),
         "gemini" => parse_gemini_json(p, last),
         "codex" => parse_codex_jsonl(p, last, detailed),
@@ -1776,7 +1803,17 @@ fn get_exchanges(
                 parse_claude_jsonl(p, last, detailed)
             }
         }
+    }?;
+
+    if agent == "codex" && retry_codex && should_retry_codex_transcript(&exchanges) {
+        // Codex rollout JSONL can briefly contain the user turn before the
+        // assistant text for that same turn lands. Local transcript reads do a
+        // short retry; RPC handlers opt out so they do not block the relay
+        // reader thread.
+        exchanges = retry_codex_transcript(p, last, detailed, exchanges)?;
     }
+
+    Ok(exchanges)
 }
 
 // ── Formatting ───────────────────────────────────────────────────────────
@@ -2377,7 +2414,9 @@ fn cmd_transcript_timeline(db: &HcomDb, args: &TranscriptTimelineArgs) -> i32 {
         }) {
             for (name, path, tool, sid) in rows.flatten() {
                 seen.insert(name.clone());
-                if let Ok(exchanges) = get_exchanges(&path, &tool, last_n, detailed, sid.as_deref()) {
+                if let Ok(exchanges) =
+                    get_exchanges(&path, &tool, last_n, detailed, sid.as_deref(), true)
+                {
                     for ex in exchanges {
                         all_entries.push(json!({
                             "instance": name,
@@ -2408,7 +2447,9 @@ fn cmd_transcript_timeline(db: &HcomDb, args: &TranscriptTimelineArgs) -> i32 {
             for (name, path, tool, sid) in rows.flatten() {
                 if seen.contains(&name) { continue; }
                 seen.insert(name.clone());
-                if let Ok(exchanges) = get_exchanges(&path, &tool, last_n, detailed, sid.as_deref()) {
+                if let Ok(exchanges) =
+                    get_exchanges(&path, &tool, last_n, detailed, sid.as_deref(), true)
+                {
                     for ex in exchanges {
                         all_entries.push(json!({
                             "instance": name,
@@ -2533,6 +2574,43 @@ pub fn cmd_transcript(db: &HcomDb, args: &TranscriptArgs, ctx: Option<&CommandCo
     let detailed = args.detailed;
     let last_n = args.last.unwrap_or(10);
 
+    if let Some(ref name) = args.name {
+        let stripped = name.strip_prefix('@').unwrap_or(name);
+        let resolved = crate::instances::resolve_display_name_or_stopped(db, stripped)
+            .unwrap_or_else(|| stripped.to_string());
+        if let Some((base_name, device)) = crate::relay::control::split_device_suffix(&resolved) {
+            return match crate::relay::control::dispatch_remote(
+                db,
+                device,
+                Some(&resolved),
+                "transcript",
+                &json!({
+                    "target": base_name,
+                    "last": last_n,
+                    "range": args.range_flag.as_ref().or(args.range_positional.as_ref()),
+                    "json": json_mode,
+                    "full": full_mode,
+                    "detailed": detailed,
+                }),
+                crate::relay::control::RPC_DEFAULT_TIMEOUT,
+            ) {
+                Ok(inner) => {
+                    println!(
+                        "{}",
+                        inner["content"]
+                            .as_str()
+                            .unwrap_or("No remote transcript content")
+                    );
+                    0
+                }
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    1
+                }
+            };
+        }
+    }
+
     // Resolve target and range from positional args
     let mut target = None;
     let mut range_str: Option<String> = args.range_flag.clone();
@@ -2601,6 +2679,7 @@ pub fn cmd_transcript(db: &HcomDb, args: &TranscriptArgs, ctx: Option<&CommandCo
         effective_last,
         detailed,
         session_id.as_deref(),
+        true,
     ) {
         Ok(e) => e,
         Err(e) => {
@@ -2688,6 +2767,144 @@ pub fn cmd_transcript(db: &HcomDb, args: &TranscriptArgs, ctx: Option<&CommandCo
     0
 }
 
+pub fn render_instance_transcript(
+    db: &HcomDb,
+    name: &str,
+    last_n: usize,
+) -> Result<String, String> {
+    render_instance_transcript_with_options(db, name, None, last_n, false, false, false)
+}
+
+pub fn render_instance_transcript_with_options_no_retry(
+    db: &HcomDb,
+    name: &str,
+    range: Option<&str>,
+    last_n: usize,
+    json_mode: bool,
+    full_mode: bool,
+    detailed: bool,
+) -> Result<String, String> {
+    render_instance_transcript_with_options_internal(
+        db, name, range, last_n, json_mode, full_mode, detailed, false,
+    )
+}
+
+pub fn render_instance_transcript_with_options(
+    db: &HcomDb,
+    name: &str,
+    range: Option<&str>,
+    last_n: usize,
+    json_mode: bool,
+    full_mode: bool,
+    detailed: bool,
+) -> Result<String, String> {
+    render_instance_transcript_with_options_internal(
+        db, name, range, last_n, json_mode, full_mode, detailed, true,
+    )
+}
+
+fn render_instance_transcript_with_options_internal(
+    db: &HcomDb,
+    name: &str,
+    range: Option<&str>,
+    last_n: usize,
+    json_mode: bool,
+    full_mode: bool,
+    detailed: bool,
+    retry_codex: bool,
+) -> Result<String, String> {
+    let (instance_name, transcript_path, agent_type, session_id) =
+        resolve_instance_transcript(db, name)
+            .ok_or_else(|| format!("Agent '{}' not found or has no transcript", name))?;
+    let (range_start, range_end) = if let Some(r) = range {
+        parse_range(r)
+    } else {
+        (None, None)
+    };
+    let effective_last = if range_start.is_some() {
+        usize::MAX
+    } else {
+        last_n
+    };
+    let exchanges = get_exchanges(
+        &transcript_path,
+        &agent_type,
+        effective_last,
+        detailed,
+        session_id.as_deref(),
+        retry_codex,
+    )
+    .map_err(|e| e.to_string())?;
+
+    let filtered: Vec<&Exchange> = if let Some(start) = range_start {
+        let end = range_end.unwrap_or(start);
+        exchanges
+            .iter()
+            .filter(|e| e.position >= start && e.position <= end)
+            .collect()
+    } else {
+        exchanges.iter().collect()
+    };
+
+    if json_mode {
+        let json_output: Vec<Value> = filtered
+            .iter()
+            .map(|ex| {
+                let mut obj = json!({
+                    "position": ex.position,
+                    "user": ex.user,
+                    "action": ex.action,
+                    "files": ex.files,
+                    "timestamp": ex.timestamp,
+                });
+                if detailed {
+                    obj["tools"] = json!(
+                        ex.tools
+                            .iter()
+                            .map(|t| {
+                                let mut tool = json!({
+                                    "name": t.name,
+                                    "is_error": t.is_error,
+                                });
+                                if let Some(ref f) = t.file {
+                                    tool["file"] = json!(f);
+                                }
+                                if let Some(ref c) = t.command {
+                                    tool["command"] = json!(c);
+                                }
+                                tool
+                            })
+                            .collect::<Vec<_>>()
+                    );
+                    obj["edits"] = json!(ex.edits);
+                    obj["errors"] = json!(ex.errors);
+                    obj["ended_on_error"] = json!(ex.ended_on_error);
+                }
+                obj
+            })
+            .collect();
+        return serde_json::to_string_pretty(&json_output).map_err(|e| e.to_string());
+    }
+
+    if filtered.is_empty() {
+        return Ok("No exchanges found".to_string());
+    }
+
+    let first_pos = filtered.first().map(|e| e.position).unwrap_or(1);
+    let last_pos = filtered.last().map(|e| e.position).unwrap_or(1);
+    let owned: Vec<Exchange> = filtered.into_iter().cloned().collect();
+    let formatted = format_exchanges(&owned, &instance_name, full_mode, detailed);
+    Ok(format!(
+        "Recent conversation ({} exchanges, {}-{} of {}) - @{}:\n\n{}",
+        owned.len(),
+        first_pos,
+        last_pos,
+        exchanges.len(),
+        instance_name,
+        formatted
+    ))
+}
+
 /// Resolve instance name to (name, transcript_path, agent_type, session_id).
 fn resolve_instance_transcript(
     db: &HcomDb,
@@ -2763,7 +2980,7 @@ pub struct TranscriptQuery<'a> {
 
 /// Public wrapper for get_exchanges (used by bundle prepare/cat).
 pub fn get_exchanges_pub(q: &TranscriptQuery) -> Result<Vec<Value>, String> {
-    let exchanges = get_exchanges(q.path, q.agent, q.last, q.detailed, q.session_id)?;
+    let exchanges = get_exchanges(q.path, q.agent, q.last, q.detailed, q.session_id, true)?;
     Ok(exchanges
         .iter()
         .map(|ex| {
@@ -2784,7 +3001,7 @@ pub fn format_exchanges_pub(
     instance: &str,
     full: bool,
 ) -> Result<String, String> {
-    let exchanges = get_exchanges(q.path, q.agent, q.last, q.detailed, q.session_id)?;
+    let exchanges = get_exchanges(q.path, q.agent, q.last, q.detailed, q.session_id, true)?;
     Ok(format_exchanges(&exchanges, instance, full, q.detailed))
 }
 
@@ -2794,6 +3011,15 @@ pub fn format_exchanges_pub(
 mod tests {
     use super::*;
     use std::fs;
+
+    fn test_db() -> HcomDb {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = HcomDb::open_raw(&db_path).unwrap();
+        db.init_db().unwrap();
+        std::mem::forget(dir);
+        db
+    }
 
     #[test]
     fn test_normalize_tool_name() {
@@ -3251,6 +3477,207 @@ mod tests {
         assert_eq!(exchanges.len(), 1);
         assert_eq!(exchanges[0].user, "user prompt");
         assert_eq!(exchanges[0].action, "real assistant answer");
+    }
+
+    #[test]
+    fn test_render_instance_transcript_with_options_range_matches_cli_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript_path = dir.path().join("rollout.jsonl");
+        let db = test_db();
+        let now = crate::shared::time::now_epoch_f64();
+        let lines = [
+            json!({
+                "type": "response_item",
+                "timestamp": "2026-03-27T10:00:00Z",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "first user"}]
+                }
+            }),
+            json!({
+                "type": "response_item",
+                "timestamp": "2026-03-27T10:00:01Z",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "first answer"}]
+                }
+            }),
+            json!({
+                "type": "response_item",
+                "timestamp": "2026-03-27T10:01:00Z",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "second user"}]
+                }
+            }),
+            json!({
+                "type": "response_item",
+                "timestamp": "2026-03-27T10:01:01Z",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "second answer"}]
+                }
+            }),
+        ];
+        fs::write(
+            &transcript_path,
+            lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let mut data = serde_json::Map::new();
+        data.insert("created_at".into(), json!(now));
+        data.insert("tool".into(), json!("codex"));
+        data.insert(
+            "transcript_path".into(),
+            json!(transcript_path.to_string_lossy().to_string()),
+        );
+        db.save_instance_named("luna", &data).unwrap();
+
+        let rendered = render_instance_transcript_with_options(
+            &db,
+            "luna",
+            Some("2"),
+            10,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+
+        assert!(rendered.contains("Recent conversation (1 exchanges, 2-2 of 2) - @luna:"));
+        assert!(rendered.contains("second user"));
+        assert!(rendered.contains("second answer"));
+        assert!(!rendered.contains("first user"));
+    }
+
+    #[test]
+    fn test_render_instance_transcript_with_options_json_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript_path = dir.path().join("rollout.jsonl");
+        let db = test_db();
+        let now = crate::shared::time::now_epoch_f64();
+        let lines = [
+            json!({
+                "type": "response_item",
+                "timestamp": "2026-03-27T10:00:00Z",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "user prompt"}]
+                }
+            }),
+            json!({
+                "type": "response_item",
+                "timestamp": "2026-03-27T10:00:01Z",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "assistant answer"}]
+                }
+            }),
+        ];
+        fs::write(
+            &transcript_path,
+            lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let mut data = serde_json::Map::new();
+        data.insert("created_at".into(), json!(now));
+        data.insert("tool".into(), json!("codex"));
+        data.insert(
+            "transcript_path".into(),
+            json!(transcript_path.to_string_lossy().to_string()),
+        );
+        db.save_instance_named("luna", &data).unwrap();
+
+        let rendered =
+            render_instance_transcript_with_options(&db, "luna", None, 10, true, false, false)
+                .unwrap();
+        let parsed: Value = serde_json::from_str(&rendered).unwrap();
+        let first = parsed.as_array().unwrap().first().unwrap();
+
+        assert_eq!(first["position"], 1);
+        assert_eq!(first["user"], "user prompt");
+        assert_eq!(first["action"], "assistant answer");
+    }
+
+    #[test]
+    fn test_get_exchanges_retries_transient_codex_no_response_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript_path = dir.path().join("rollout.jsonl");
+        fs::write(
+            &transcript_path,
+            json!({
+                "type": "response_item",
+                "timestamp": "2026-03-27T10:00:00Z",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "user prompt"}]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let path_for_thread = transcript_path.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            fs::write(
+                &path_for_thread,
+                [
+                    json!({
+                        "type": "response_item",
+                        "timestamp": "2026-03-27T10:00:00Z",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "user prompt"}]
+                        }
+                    }),
+                    json!({
+                        "type": "response_item",
+                        "timestamp": "2026-03-27T10:00:01Z",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "assistant answer"}]
+                        }
+                    }),
+                ]
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+            )
+            .unwrap();
+        });
+
+        let exchanges = get_exchanges(
+            transcript_path.to_str().unwrap(),
+            "codex",
+            10,
+            false,
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(exchanges.len(), 1);
+        assert_eq!(exchanges[0].action, "assistant answer");
     }
 
     #[test]

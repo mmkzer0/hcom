@@ -6,10 +6,9 @@
 //! - `--orphan`: recover orphaned PTY process
 //! - `--as`: rebind session identity
 
-use std::collections::HashSet;
-
 use anyhow::{Result, bail};
 use serde_json::json;
+use std::collections::HashSet;
 
 use crate::bootstrap;
 use crate::config::HcomConfig;
@@ -721,8 +720,8 @@ fn start_bare(
         instance_names::generate_unique_name(db)?
     };
 
-    // Remote instances are relay mirrors. We can stop them remotely, but starting
-    // them would require remote launch semantics that hcom doesn't implement.
+    // Remote instances are relay mirrors. Starting them remotely is intentionally
+    // unsupported because the useful remote lifecycle operations are launch/resume/kill.
     if let Ok(Some(ref existing)) = db.get_instance_full(&name) {
         if crate::instances::is_remote_instance(existing) {
             bail!(
@@ -810,7 +809,7 @@ mod tests {
     use super::*;
     use clap::Parser;
     use rusqlite::params;
-
+    use serial_test::serial;
     #[test]
     fn test_start_args_bare() {
         let args = StartArgs::try_parse_from(["start"]).unwrap();
@@ -851,6 +850,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_start_rejects_remote_instances() {
         let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
         let db = HcomDb::open().unwrap();

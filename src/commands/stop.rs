@@ -262,8 +262,7 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
             if let Some(ref id) = c.identity {
                 Some(id.clone())
             } else {
-                identity::resolve_identity(db, explicit_name, None, None, None, None, None)
-                    .ok()
+                identity::resolve_identity(db, explicit_name, None, None, None, None, None).ok()
             }
         } else {
             identity::resolve_identity(db, None, None, None, None, None, None).ok()
@@ -306,21 +305,12 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
         }
     };
 
-    // Remote instance — send control via relay
+    // Remote instances are mirrors only. Stopping them remotely would strand the
+    // agent from hcom without giving a useful way to recover/control it remotely.
     if is_remote_instance(&position) {
-        if instance_name.contains(':') {
-            let (name, device_short_id) = instance_name.rsplit_once(':').unwrap();
-            let config = crate::config::HcomConfig::load(None).unwrap_or_default();
-            if crate::relay::control::send_control_ephemeral(&config, "stop", name, device_short_id)
-            {
-                println!("Stop sent to {instance_name}");
-                return 0;
-            } else {
-                eprintln!("Error: Failed to send stop to {instance_name} - relay unavailable");
-                return 1;
-            }
-        }
-        eprintln!("Error: Cannot stop remote '{instance_name}' - missing device suffix");
+        eprintln!(
+            "Error: Remote stop is not supported for '{instance_name}'. Use remote kill or ask the agent to stop itself locally."
+        );
         return 1;
     }
 
