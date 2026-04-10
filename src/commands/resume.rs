@@ -311,7 +311,8 @@ fn prepare_resume_plan(
     };
     let output_tag = effective_tag.clone();
     let launch_tag = effective_tag.clone();
-    let base_system_prompt = resume_system_prompt(&tool, &name, fork);
+    let base_system_prompt =
+        resume_system_prompt(&tool, &name, fork, fork_child_name.as_deref());
     let effective_system_prompt = match launch_flags.system_prompt.as_deref() {
         Some(custom) if !custom.trim().is_empty() => format!("{base_system_prompt}\n\n{custom}"),
         _ => base_system_prompt,
@@ -423,6 +424,22 @@ fn execute_prepared_resume_result(
             &serde_json::Map::from_iter([("last_event_id".to_string(), json!(plan.last_event_id))]),
         );
     }
+    if fork {
+        // Anchor fork child's cursor at current position so it doesn't replay
+        // historical broadcasts. Pre-registration may inherit a stale
+        // HCOM_LAUNCH_EVENT_ID from the parent environment.
+        let current_max = db.get_last_event_id();
+        if let Some(ref child_name) = plan.launch.name {
+            crate::instances::update_instance_position(
+                db,
+                child_name,
+                &serde_json::Map::from_iter([(
+                    "last_event_id".to_string(),
+                    json!(current_max),
+                )]),
+            );
+        }
+    }
     Ok(result)
 }
 
@@ -526,7 +543,7 @@ fn validate_resume_operation(tool: &str, fork: bool) -> Result<()> {
     Ok(())
 }
 
-fn resume_system_prompt(tool: &str, name: &str, fork: bool) -> String {
+fn resume_system_prompt(tool: &str, name: &str, fork: bool, child_name: Option<&str>) -> String {
     if fork {
         if tool == "codex" {
             format!(
@@ -536,12 +553,22 @@ fn resume_system_prompt(tool: &str, name: &str, fork: bool) -> String {
                 name
             )
         } else {
-            format!(
-                "YOU ARE A FORK of agent '{}'. \
-                 You have the same session history but are a NEW agent. \
-                 Run hcom start to get your own identity.",
-                name
-            )
+            // Claude gets its identity from the SessionStart hook bootstrap.
+            // State the new name explicitly so it overrides the inherited history.
+            match child_name {
+                Some(child) => format!(
+                    "YOU ARE A FORK of agent '{name}'. \
+                     You have the same session history but are a NEW agent. \
+                     Your new hcom identity is '{child}'. \
+                     Use '--name {child}' for all hcom commands. \
+                     Do NOT use '{name}'s identity, even if it appears in the inherited history.",
+                ),
+                None => format!(
+                    "YOU ARE A FORK of agent '{name}'. \
+                     You have the same session history but are a NEW agent with an already-assigned hcom identity. \
+                     Use that assigned identity for all hcom commands.",
+                ),
+            }
         }
     } else {
         format!("YOUR SESSION HAS BEEN RESUMED! You are still '{}'.", name)
