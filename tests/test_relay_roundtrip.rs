@@ -23,11 +23,74 @@
 //!     cargo test -p hcom --test test_relay_roundtrip -- --ignored --nocapture
 
 use std::cell::RefCell;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::thread;
 use std::time::{Duration, Instant};
+
+// ── Logging ────────────────────────────────────────────────────────────
+
+macro_rules! logln {
+    ($log:expr, $($arg:tt)*) => {{
+        let _msg = format!($($arg)*);
+        println!("[{:.1?}] {}", $log.start.elapsed(), _msg);
+        $log.log(&_msg);
+    }};
+}
+
+struct TestLog {
+    timestamped: PathBuf,
+    latest: PathBuf,
+    pub start: Instant,
+}
+
+impl TestLog {
+    fn new() -> Self {
+        let log_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/test-logs");
+        fs::create_dir_all(&log_dir).ok();
+
+        let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
+        let timestamped = log_dir.join(format!("relay_roundtrip_{ts}.log"));
+        let latest = log_dir.join("test_relay_roundtrip.latest.log");
+
+        let start = Instant::now();
+        let header = format!(
+            "[{}] Relay roundtrip test\nlog: {}\n",
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+            timestamped.display(),
+        );
+        for path in [&timestamped, &latest] {
+            let _ = fs::write(path, &header);
+        }
+        println!("{header}");
+
+        TestLog { timestamped, latest, start }
+    }
+
+    fn log(&self, text: &str) {
+        let elapsed = self.start.elapsed();
+        for path in [&self.timestamped, &self.latest] {
+            if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
+                let _ = writeln!(f, "[{elapsed:.1?}] {text}");
+            }
+        }
+    }
+}
+
+impl Drop for TestLog {
+    fn drop(&mut self) {
+        let elapsed = self.start.elapsed();
+        if std::thread::panicking() {
+            self.log(&format!("TEST FAILED after {elapsed:.1?}"));
+            println!("log: {}", self.latest.display());
+        } else {
+            self.log(&format!("TEST COMPLETE after {elapsed:.1?}"));
+            println!("log: {}", self.latest.display());
+        }
+    }
+}
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
@@ -486,21 +549,22 @@ fn test_relay_roundtrip() {
     let path_a = dir_a_path.to_string_lossy().to_string();
     let path_b = dir_b_path.to_string_lossy().to_string();
 
-    eprintln!("{}", "=".repeat(60));
-    eprintln!("Relay Roundtrip: two real hcom instances via MQTT");
-    eprintln!("{}", "=".repeat(60));
-    eprintln!("\n  Device A: {path_a}");
-    eprintln!("  Device B: {path_b}");
+    let log = TestLog::new();
+
+    logln!(log, "{}", "=".repeat(60));
+    logln!(log, "Relay Roundtrip: two real hcom instances via MQTT");
+    logln!(log, "{}", "=".repeat(60));
+    logln!(log, "\n  Device A: {path_a}");
+    logln!(log, "  Device B: {path_b}");
 
     // ── Phase 1: Device A creates relay group ────────────────────
-    eprintln!("\n[Phase 1] Device A: relay new...");
+    logln!(log, "\n[Phase 1] Device A: relay new...");
 
     let output = check("A", "relay new", &path_a);
-    eprint!("{}", output.trim_end());
-    eprintln!();
+    logln!(log, "{}", output.trim_end());
 
     let token = parse_token(&output).expect("Could not parse token from relay new output");
-    eprintln!("  OK: Token: {}...", &token[..token.len().min(24)]);
+    logln!(log, "  OK: Token: {}...", &token[..token.len().min(24)]);
 
     // relay new auto-starts the daemon via ensure_worker; wait for it to connect
     // Wait for connected
@@ -519,15 +583,15 @@ fn test_relay_roundtrip() {
         Duration::from_secs(20),
         Duration::from_secs(1),
     );
-    eprintln!("  OK: Device A connected to broker");
+    logln!(log, "  OK: Device A connected to broker");
 
     let status_a =
         String::from_utf8_lossy(&hcom_with_dir("relay status", &path_a).stdout).to_string();
     let short_a = parse_device_id(&status_a).expect("Could not parse Device A short ID");
-    eprintln!("  OK: Device A short ID: {short_a}");
+    logln!(log, "  OK: Device A short ID: {short_a}");
 
     // ── Phase 2: Device A sends test message ─────────────────────
-    eprintln!("\n[Phase 2] Device A: sending test message...");
+    logln!(log, "\n[Phase 2] Device A: sending test message...");
 
     let marker = format!("relay-rt-{}", &uuid::Uuid::new_v4().to_string()[..8]);
     check(
@@ -535,7 +599,7 @@ fn test_relay_roundtrip() {
         &format!("send --from relaytest -- \"{marker}\""),
         &path_a,
     );
-    eprintln!("  OK: Sent: {marker}");
+    logln!(log, "  OK: Sent: {marker}");
 
     poll_until(
         || {
@@ -560,14 +624,13 @@ fn test_relay_roundtrip() {
         Duration::from_secs(30),
         Duration::from_secs(2),
     );
-    eprintln!("  OK: Device A: pushed to broker");
+    logln!(log, "  OK: Device A: pushed to broker");
 
     // ── Phase 3: Device B joins ──────────────────────────────────
-    eprintln!("\n[Phase 3] Device B: relay connect...");
+    logln!(log, "\n[Phase 3] Device B: relay connect...");
 
     let output = check("B", &format!("relay connect {token}"), &path_b);
-    eprint!("{}", output.trim_end());
-    eprintln!();
+    logln!(log, "{}", output.trim_end());
 
     // relay connect auto-starts the daemon via ensure_worker; wait for it to connect
     poll_until(
@@ -585,10 +648,10 @@ fn test_relay_roundtrip() {
         Duration::from_secs(20),
         Duration::from_secs(1),
     );
-    eprintln!("  OK: Device B connected to broker");
+    logln!(log, "  OK: Device B connected to broker");
 
     // ── Phase 4: Device B sees relayed event ─────────────────────
-    eprintln!("\n[Phase 4] Device B: checking for relayed event...");
+    logln!(log, "\n[Phase 4] Device B: checking for relayed event...");
 
     let (ev, data) = poll_until(
         || {
@@ -628,7 +691,7 @@ fn test_relay_roundtrip() {
         Duration::from_secs(30),
         Duration::from_secs(2),
     );
-    eprintln!("  OK: Event received: type={}", ev["type"]);
+    logln!(log, "  OK: Event received: type={}", ev["type"]);
 
     // Verify sender namespaced with Device A's short ID
     let expected_from = format!("relaytest:{short_a}");
@@ -637,7 +700,7 @@ fn test_relay_roundtrip() {
         actual_from, expected_from,
         "from={actual_from}, expected {expected_from}"
     );
-    eprintln!("  OK: from namespaced: {actual_from}");
+    logln!(log, "  OK: from namespaced: {actual_from}");
 
     // Verify _relay marker points back to Device A
     let actual_uuid_a = read_device_uuid(&path_a).expect("Could not read Device A UUID");
@@ -648,7 +711,8 @@ fn test_relay_roundtrip() {
         "_relay.device={}, expected {actual_uuid_a}",
         relay_marker["device"]
     );
-    eprintln!(
+    logln!(
+        log,
         "  OK: _relay.device = Device A ({}...)",
         &actual_uuid_a[..actual_uuid_a.len().min(8)]
     );
@@ -659,15 +723,15 @@ fn test_relay_roundtrip() {
         "_relay.short={}, expected {short_a}",
         relay_marker["short"]
     );
-    eprintln!("  OK: _relay.short = {short_a}");
+    logln!(log, "  OK: _relay.short = {short_a}");
 
     // ── Phase 5: Device A sees Device B as remote ────────────────
-    eprintln!("\n[Phase 5] Device A: checking for Device B as remote...");
+    logln!(log, "\n[Phase 5] Device A: checking for Device B as remote...");
 
     let status_b =
         String::from_utf8_lossy(&hcom_with_dir("relay status", &path_b).stdout).to_string();
     let short_b = parse_device_id(&status_b).expect("Could not parse Device B short ID");
-    eprintln!("  OK: Device B short ID: {short_b}");
+    logln!(log, "  OK: Device B short ID: {short_b}");
 
     let remote_line: String = poll_until(
         || {
@@ -695,10 +759,10 @@ fn test_relay_roundtrip() {
         Duration::from_secs(30),
         Duration::from_secs(2),
     );
-    eprintln!("  OK: {remote_line}");
+    logln!(log, "  OK: {remote_line}");
 
     // ── Phase 6: Device B → Device A (bidirectional) ─────────────
-    eprintln!("\n[Phase 6] Device B: sending test message to Device A...");
+    logln!(log, "\n[Phase 6] Device B: sending test message to Device A...");
 
     let marker_b = format!("relay-rt-b-{}", &uuid::Uuid::new_v4().to_string()[..8]);
     check(
@@ -706,7 +770,7 @@ fn test_relay_roundtrip() {
         &format!("send --from relaytest -- \"{marker_b}\""),
         &path_b,
     );
-    eprintln!("  OK: Sent: {marker_b}");
+    logln!(log, "  OK: Sent: {marker_b}");
 
     poll_until(
         || {
@@ -723,7 +787,7 @@ fn test_relay_roundtrip() {
         Duration::from_secs(30),
         Duration::from_secs(2),
     );
-    eprintln!("  OK: Device B: pushed to broker");
+    logln!(log, "  OK: Device B: pushed to broker");
 
     let actual_uuid_b = read_device_uuid(&path_b).expect("Could not read Device B UUID");
     let short_b_for_ns = short_b.clone();
@@ -758,7 +822,7 @@ fn test_relay_roundtrip() {
         Duration::from_secs(30),
         Duration::from_secs(2),
     );
-    eprintln!("  OK: B→A event received");
+    logln!(log, "  OK: B→A event received");
 
     let expected_from_b = format!("relaytest:{short_b_for_ns}");
     let actual_from_b = data_b["from"].as_str().unwrap_or("");
@@ -766,7 +830,7 @@ fn test_relay_roundtrip() {
         actual_from_b, expected_from_b,
         "from={actual_from_b}, expected {expected_from_b}"
     );
-    eprintln!("  OK: from namespaced: {actual_from_b}");
+    logln!(log, "  OK: from namespaced: {actual_from_b}");
 
     assert_eq!(
         data_b["_relay"]["device"].as_str().unwrap_or(""),
@@ -774,36 +838,31 @@ fn test_relay_roundtrip() {
         "_relay.device={}, expected {actual_uuid_b}",
         data_b["_relay"]["device"]
     );
-    eprintln!(
+    logln!(
+        log,
         "  OK: _relay.device = Device B ({}...)",
         &actual_uuid_b[..actual_uuid_b.len().min(8)]
     );
 
     // ── Phase 7: Device A remotely launches on Device B ──────────
-    eprintln!("\n[Phase 7] Device A: remote launch on Device B...");
+    logln!(log, "\n[Phase 7] Device A: remote launch on Device B...");
 
-    if !tool_installed("claude") || !tool_installed("tmux") {
-        eprintln!("  SKIP: claude or tmux not installed — skipping Phases 7-14");
-        eprintln!("\n{}", "=".repeat(60));
-        eprintln!("PHASES 1-6 PASSED (Phases 7-14 skipped: binaries missing)");
-        eprintln!("{}", "=".repeat(60));
-        return; // guard Drop handles cleanup
-    }
+    assert!(
+        tool_installed("claude"),
+        "Phase 7 requires claude to be installed"
+    );
+    assert!(
+        tool_installed("tmux"),
+        "Phase 7 requires tmux to be installed"
+    );
 
     let baseline_event_b = last_event_id(&path_b);
-    let (launched_name, launch_output) = match try_remote_launch_claude_tmux(&path_a, &short_b) {
-        Ok(result) => result,
-        Err(e) => {
-            eprintln!("  SKIP: Remote launch failed: {e}");
-            eprintln!("\n{}", "=".repeat(60));
-            eprintln!("PHASES 1-6 PASSED (Phase 7 skipped: launch error)");
-            eprintln!("{}", "=".repeat(60));
-            return;
-        }
-    };
-    eprint!("{}", launch_output.trim_end());
-    eprintln!();
-    eprintln!("  OK: Remote launch succeeded with claude/tmux: {launched_name}");
+    let (launched_name, launch_output) =
+        try_remote_launch_claude_tmux(&path_a, &short_b).unwrap_or_else(|e| {
+            panic!("Phase 7: remote launch failed: {e}");
+        });
+    logln!(log, "{}", launch_output.trim_end());
+    logln!(log, "  OK: Remote launch succeeded with claude/tmux: {launched_name}");
     guard.register_local_b(launched_name.clone());
     let launched_tool = "claude".to_string();
     let remote_name = format!("{launched_name}:{short_b}");
@@ -814,7 +873,7 @@ fn test_relay_roundtrip() {
         Duration::from_secs(30),
         Duration::from_secs(1),
     );
-    eprintln!("  OK: Device B lists local launched instance: {launched_name}");
+    logln!(log, "  OK: Device B lists local launched instance: {launched_name}");
 
     poll_until(
         || has_instance(&path_a, &remote_name).then_some(()),
@@ -822,7 +881,7 @@ fn test_relay_roundtrip() {
         Duration::from_secs(30),
         Duration::from_secs(2),
     );
-    eprintln!("  OK: Device A mirrors launched remote instance: {remote_name}");
+    logln!(log, "  OK: Device A mirrors launched remote instance: {remote_name}");
 
     // Wait for the launched claude on Device B to actually be usable.
     // Without this, the rest of the phases race the tool's boot and see
@@ -830,22 +889,23 @@ fn test_relay_roundtrip() {
     // assertions. The lifecycle ready event is the canonical signal —
     // screen["ready"] is unreliable when the user has dontAsk mode on, but
     // the life event fires from hooks regardless.
-    eprintln!("  Waiting for claude lifecycle ready event on Device B...");
+    logln!(log, "  Waiting for claude lifecycle ready event on Device B...");
     let _ready_event_id = wait_for_ready_event(
         &path_b,
         &launched_name,
         baseline_event_b,
         Duration::from_secs(90),
     );
-    eprintln!("  OK: Device B life action=ready event for {launched_name}");
+    logln!(log, "  OK: Device B life action=ready event for {launched_name}");
     let initial_screen = wait_for_screen_drawn(&path_b, &launched_name, Duration::from_secs(30));
     assert_eq!(initial_screen["prompt_empty"].as_bool(), Some(true));
-    eprintln!(
+    logln!(
+        log,
         "  OK: claude TUI drawn (prompt marker '{CLAUDE_PROMPT_MARKER}' present, prompt empty)"
     );
 
     // ── Phase 8: term_screen on live instance ─────────────────────
-    eprintln!("\n[Phase 8] Device A: remote term_screen on Device B ({remote_name})...");
+    logln!(log, "\n[Phase 8] Device A: remote term_screen on Device B ({remote_name})...");
 
     // Plain-text remote call: should print the formatted screen (containing
     // the claude ready banner). Fails closed if the RPC errored.
@@ -864,7 +924,7 @@ fn test_relay_roundtrip() {
         term_screen_stdout.contains(CLAUDE_PROMPT_MARKER),
         "remote term_screen stdout missing claude prompt marker '{CLAUDE_PROMPT_MARKER}':\n{term_screen_stdout}"
     );
-    eprintln!("  OK: remote term_screen stdout contains claude prompt marker");
+    logln!(log, "  OK: remote term_screen stdout contains claude prompt marker");
 
     let rpc_screen = poll_rpc_result_on_device(&path_b, "term_screen");
     assert_eq!(
@@ -882,10 +942,10 @@ fn test_relay_roundtrip() {
         rpc_content.contains(CLAUDE_PROMPT_MARKER),
         "term_screen rpc_result.content missing claude prompt marker: {rpc_content}"
     );
-    eprintln!("  OK: term_screen rpc_result ok=true, content has prompt marker");
+    logln!(log, "  OK: term_screen rpc_result ok=true, content has prompt marker");
 
     // ── Phase 9: term_inject on live instance ─────────────────────
-    eprintln!("\n[Phase 9] Device A: remote term_inject on Device B ({remote_name})...");
+    logln!(log, "\n[Phase 9] Device A: remote term_inject on Device B ({remote_name})...");
 
     // Baseline: prompt should be empty on the claude home screen.
     let before =
@@ -911,7 +971,7 @@ fn test_relay_roundtrip() {
         !inject_stdout.contains("Remote term inject failed"),
         "remote term_inject reported failure:\n{inject_stdout}"
     );
-    eprintln!("  OK: remote term_inject (text) CLI succeeded");
+    logln!(log, "  OK: remote term_inject (text) CLI succeeded");
 
     let rpc_inject_text = poll_rpc_result_on_device(&path_b, "term_inject");
     assert_eq!(
@@ -940,7 +1000,8 @@ fn test_relay_roundtrip() {
         Some(false),
         "prompt_empty should be false while marker sits in input"
     );
-    eprintln!(
+    logln!(
+        log,
         "  OK: marker visible in input_text: {:?}",
         screen_with_marker["input_text"]
     );
@@ -973,10 +1034,10 @@ fn test_relay_roundtrip() {
         Duration::from_secs(15),
         Duration::from_millis(500),
     );
-    eprintln!("  OK: marker consumed from input after enter; both inject RPCs ok=true");
+    logln!(log, "  OK: marker consumed from input after enter; both inject RPCs ok=true");
 
     // ── Phase 10: real send+reply, then remote transcript ────────
-    eprintln!("\n[Phase 10] Device A: send real question and verify reply via transcript...");
+    logln!(log, "\n[Phase 10] Device A: send real question and verify reply via transcript...");
 
     let question = "Reply with exactly the single word PONG then stop.";
     let send_out = hcom_with_dir(
@@ -990,7 +1051,7 @@ fn test_relay_roundtrip() {
         "hcom send failed: {}",
         String::from_utf8_lossy(&send_out.stderr)
     );
-    eprintln!("  OK: sent question to @{launched_name}:{short_b}");
+    logln!(log, "  OK: sent question to @{launched_name}:{short_b}");
 
     // Wait for the instance to process the message: status goes active
     // (while claude is thinking) then back to listening. We can't rely on
@@ -1036,7 +1097,7 @@ fn test_relay_roundtrip() {
         Duration::from_secs(120),
         Duration::from_secs(2),
     );
-    eprintln!("  OK: {launched_name} processed the message and returned to listening");
+    logln!(log, "  OK: {launched_name} processed the message and returned to listening");
 
     // Device A's worker has likely auto-exited during the long wait above
     // (watchdog exits after ~60s with no local instances). Re-arm before
@@ -1046,41 +1107,36 @@ fn test_relay_roundtrip() {
     // Remote transcript: must contain PONG. Claude's response is in the
     // session JSONL, rendered by render_instance_transcript. We also verify
     // the incoming question landed via the deliver event above.
-    let start = Instant::now();
     let mut last_seen_len = 0usize;
-    let tx_content: String = loop {
-        let transcript_out = hcom_with_dir(
-            &format!("transcript {remote_name} --last 5 --full"),
-            &path_a,
-        );
-        if transcript_out.status.success() {
-            let rpc = poll_rpc_result_on_device(&path_b, "transcript");
-            if rpc["ok"].as_bool() == Some(true) {
-                let content = rpc["result"]["content"].as_str().unwrap_or("").to_string();
-                if content.to_uppercase().contains("PONG") {
-                    break content;
-                }
-                if content.len() != last_seen_len {
-                    last_seen_len = content.len();
-                    eprintln!("    transcript now {} bytes, no PONG yet", content.len());
-                }
-            }
-        }
-        if start.elapsed() >= Duration::from_secs(60) {
+    let tx_content: String = poll_until(
+        || {
             let transcript_out = hcom_with_dir(
-                &format!("transcript {remote_name} --last 10 --full"),
+                &format!("transcript {remote_name} --last 5 --full"),
                 &path_a,
             );
-            let stdout = String::from_utf8_lossy(&transcript_out.stdout).to_string();
-            let stderr = String::from_utf8_lossy(&transcript_out.stderr).to_string();
-            panic!(
-                "Timeout: remote transcript never contained PONG.\n\
-                 CLI stdout:\n{stdout}\nCLI stderr:\n{stderr}"
-            );
-        }
-        thread::sleep(Duration::from_secs(2));
-    };
-    eprintln!(
+            if !transcript_out.status.success() {
+                return None;
+            }
+            let rpc = poll_rpc_result_on_device(&path_b, "transcript");
+            if rpc["ok"].as_bool() != Some(true) {
+                return None;
+            }
+            let content = rpc["result"]["content"].as_str().unwrap_or("").to_string();
+            if content.to_uppercase().contains("PONG") {
+                return Some(content);
+            }
+            if content.len() != last_seen_len {
+                last_seen_len = content.len();
+                eprintln!("    transcript now {} bytes, no PONG yet", content.len());
+            }
+            None
+        },
+        "remote transcript contains PONG",
+        Duration::from_secs(60),
+        Duration::from_secs(2),
+    );
+    logln!(
+        log,
         "  OK: remote transcript contains PONG reply ({} bytes). \
          Incoming question already verified via deliver:relaytest status event.",
         tx_content.len()
@@ -1091,7 +1147,7 @@ fn test_relay_roundtrip() {
     // JSONL reflects the assistant reply; combined, both sides are proven.
 
     // ── Phase 11: config_get on live instance ─────────────────────
-    eprintln!("\n[Phase 11] Device A: remote config_get on Device B ({remote_name})...");
+    logln!(log, "\n[Phase 11] Device A: remote config_get on Device B ({remote_name})...");
 
     ensure_relay_worker(&path_a);
     let config_get_out = hcom_with_dir(&format!("config -i {remote_name} --json"), &path_a);
@@ -1132,10 +1188,10 @@ fn test_relay_roundtrip() {
         Some(true),
         "config_get rpc not ok: {rpc_config_get}"
     );
-    eprintln!("  OK: config_get fields verified (name, full_name, tag, timeout, subagent_timeout)");
+    logln!(log, "  OK: config_get fields verified (name, full_name, tag, timeout, subagent_timeout)");
 
     // ── Phase 12: config_set + verify persisted ───────────────────
-    eprintln!("\n[Phase 12] Device A: remote config_set tag on Device B ({remote_name})...");
+    logln!(log, "\n[Phase 12] Device A: remote config_set tag on Device B ({remote_name})...");
 
     let config_set_out = hcom_with_dir(
         &format!("config -i {remote_name} tag test-relay-tag"),
@@ -1164,7 +1220,7 @@ fn test_relay_roundtrip() {
         Some("test-relay-tag"),
         "tag not persisted in refetched config: {refetch_json}"
     );
-    eprintln!("  OK: refetched config has tag=test-relay-tag");
+    logln!(log, "  OK: refetched config has tag=test-relay-tag");
 
     // Double-check directly against Device B's SQLite DB.
     let db_path_b = Path::new(&path_b).join("hcom.db");
@@ -1185,22 +1241,21 @@ fn test_relay_roundtrip() {
         sql_tag, "test-relay-tag",
         "Device B DB tag column != test-relay-tag: {sql_tag:?}"
     );
-    eprintln!("  OK: Device B DB tag column = test-relay-tag");
+    logln!(log, "  OK: Device B DB tag column = test-relay-tag");
 
     // ── Phase 13: Device A remotely kills Device B instance ───────
-    eprintln!("\n[Phase 13] Device A: remote kill on Device B...");
+    logln!(log, "\n[Phase 13] Device A: remote kill on Device B...");
 
     ensure_relay_worker(&path_a);
     let kill_output = check("A", &format!("kill {remote_name}"), &path_a);
-    eprint!("{}", kill_output.trim_end());
-    eprintln!();
+    logln!(log, "{}", kill_output.trim_end());
     assert!(
         kill_output.contains("Sent SIGTERM")
             || kill_output.contains("already terminated")
             || kill_output.contains("already_dead"),
         "Unexpected remote kill output:\n{kill_output}"
     );
-    eprintln!("  OK: Remote kill RPC acknowledged for {remote_name}");
+    logln!(log, "  OK: Remote kill RPC acknowledged for {remote_name}");
 
     poll_until(
         || (!has_instance(&path_b, &launched_name)).then_some(()),
@@ -1208,7 +1263,7 @@ fn test_relay_roundtrip() {
         Duration::from_secs(30),
         Duration::from_secs(1),
     );
-    eprintln!("  OK: Device B removed launched instance after remote kill");
+    logln!(log, "  OK: Device B removed launched instance after remote kill");
 
     poll_until(
         || (!has_instance(&path_a, &remote_name)).then_some(()),
@@ -1216,7 +1271,7 @@ fn test_relay_roundtrip() {
         Duration::from_secs(30),
         Duration::from_secs(2),
     );
-    eprintln!("  OK: Device A removed mirrored remote instance after kill");
+    logln!(log, "  OK: Device A removed mirrored remote instance after kill");
 
     // After the kill, a remote term_screen must fail (no inject port).
     let post_kill_term = hcom_with_dir(&format!("term {remote_name}"), &path_a);
@@ -1225,22 +1280,24 @@ fn test_relay_roundtrip() {
         post_kill_stdout.contains("Remote term screen failed") || !post_kill_term.status.success(),
         "term_screen should fail after kill, got stdout:\n{post_kill_stdout}"
     );
-    eprintln!("  OK: term_screen after kill fails as expected");
+    logln!(log, "  OK: term_screen after kill fails as expected");
 
     // ── Phase 14: resume the killed instance on Device B ──────────
-    eprintln!("\n[Phase 14] Device A: remote resume on Device B ({remote_name})...");
+    logln!(log, "\n[Phase 14] Device A: remote resume on Device B ({remote_name})...");
 
     // Model pinned via HCOM_CLAUDE_ARGS in hcom_with_dir (haiku).
     ensure_relay_worker(&path_a);
     let resume_out = hcom_with_dir(&format!("r {remote_name}"), &path_a);
     let resume_stdout = String::from_utf8_lossy(&resume_out.stdout).to_string();
     let resume_stderr = String::from_utf8_lossy(&resume_out.stderr).to_string();
-    eprintln!(
+    logln!(
+        log,
         "  resume stdout: {}",
         resume_stdout.lines().next().unwrap_or("(empty)")
     );
     if !resume_stderr.is_empty() {
-        eprintln!(
+        logln!(
+            log,
             "  resume stderr: {}",
             resume_stderr.lines().next().unwrap_or("")
         );
@@ -1282,7 +1339,7 @@ fn test_relay_roundtrip() {
         .as_str()
         .expect("resume handle missing instance_name")
         .to_string();
-    eprintln!("  OK: resume rpc ok=true, resumed instance: {resumed_name}");
+    logln!(log, "  OK: resume rpc ok=true, resumed instance: {resumed_name}");
 
     // Wait for the resumed instance to appear in Device B's list + reach
     // claude ready again (lifecycle event + drawn TUI). The resume RPC
@@ -1291,34 +1348,25 @@ fn test_relay_roundtrip() {
     // a tag on the instance — the resume inherits it, so the new full
     // name is `{tag}-{base}` rather than the plain base name. Match by
     // base_name to find it.
-    let resumed_full_name: String = {
-        let list_start = Instant::now();
-        let mut last_list_report = Instant::now();
-        loop {
-            if let Some(inst) = find_instance_by_base(&path_b, &resumed_name) {
-                break inst["name"].as_str().unwrap_or(&resumed_name).to_string();
-            }
-            if list_start.elapsed() >= Duration::from_secs(60) {
-                let list = hcom_with_dir("list --json", &path_b);
-                let stdout = String::from_utf8_lossy(&list.stdout).to_string();
-                panic!(
-                    "Timeout (60s): Device B has resumed instance base='{resumed_name}'.\n\
-                     list --json:\n{stdout}"
-                );
-            }
-            if last_list_report.elapsed() >= Duration::from_secs(10) {
-                last_list_report = Instant::now();
-                let list = hcom_with_dir("list --names", &path_b);
-                let names = String::from_utf8_lossy(&list.stdout).trim().to_string();
-                eprintln!(
-                    "    waiting for resumed base='{resumed_name}' ({}s), current names: {names:?}",
-                    list_start.elapsed().as_secs()
-                );
-            }
-            thread::sleep(Duration::from_secs(1));
-        }
-    };
-    eprintln!(
+    let resumed_full_name: String = poll_until(
+        || {
+            find_instance_by_base(&path_b, &resumed_name)
+                .and_then(|inst| inst["name"].as_str().map(|s| s.to_string()))
+                .or_else(|| {
+                    let list = hcom_with_dir("list --names", &path_b);
+                    let names = String::from_utf8_lossy(&list.stdout).trim().to_string();
+                    eprintln!(
+                        "    waiting for resumed base='{resumed_name}', current names: {names:?}"
+                    );
+                    None
+                })
+        },
+        &format!("Device B has resumed instance base='{resumed_name}'"),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
+    logln!(
+        log,
         "  OK: resumed instance present on Device B as '{resumed_full_name}' (base='{resumed_name}')"
     );
     guard.register_local_b(resumed_full_name.clone());
@@ -1331,7 +1379,7 @@ fn test_relay_roundtrip() {
     );
     let resumed_screen =
         wait_for_screen_drawn(&path_b, &resumed_full_name, Duration::from_secs(30));
-    eprintln!("  OK: resumed instance PTY ready (life event + TUI drawn)");
+    logln!(log, "  OK: resumed instance PTY ready (life event + TUI drawn)");
 
     // After a bootstrapped resume, claude either sees the [hcom:name]
     // marker injected into its first response/screen, OR the life event
@@ -1380,12 +1428,13 @@ fn test_relay_roundtrip() {
          (screen_marker={screen_has_marker}, events={events_have_bootstrap}, \
           transcript_marker={transcript_has_marker}, hooks_bound={hooks_bound})"
     );
-    eprintln!(
+    logln!(
+        log,
         "  OK: resumed instance is rebound to hcom (screen={screen_has_marker}, events={events_have_bootstrap}, transcript={transcript_has_marker}, hooks_bound={hooks_bound})"
     );
 
     // Cleanup handled by guard Drop
-    eprintln!("\n{}", "=".repeat(60));
-    eprintln!("ALL PHASES PASSED (including {launched_tool} remote launch/kill)");
-    eprintln!("{}", "=".repeat(60));
+    logln!(log, "\n{}", "=".repeat(60));
+    logln!(log, "ALL PHASES PASSED (including {launched_tool} remote launch/kill)");
+    logln!(log, "{}", "=".repeat(60));
 }
