@@ -75,6 +75,24 @@ fn current_join_token(config: &crate::config::HcomConfig) -> Option<String> {
     encode_join_token(&config.relay_id, &config.relay, &psk)
 }
 
+/// Show the join token (separate command to avoid leaking in status output).
+fn relay_show_token() -> i32 {
+    let config = config::load_config_snapshot().core;
+    match current_join_token(&config) {
+        Some(token) => {
+            println!("hcom relay connect {token}");
+            if !config.relay_token.is_empty() {
+                println!("  (also needs: --password <secret>)");
+            }
+            0
+        }
+        None => {
+            eprintln!("No relay configured. Run: hcom relay new");
+            1
+        }
+    }
+}
+
 fn validate_existing_relay_config(config: &crate::config::HcomConfig) -> Result<(), String> {
     if config.relay_id.is_empty() {
         return Err("no relay configured".to_string());
@@ -211,13 +229,9 @@ fn relay_status(db: &HcomDb) -> i32 {
         println!("Last push: never");
     }
 
-    // Remote devices from KV
-    // Uses relay_short_{short_id} → device_id + relay_sync_time_{device_id} freshness.
     let own_device = crate::relay::read_device_uuid();
     let now = crate::shared::time::now_epoch_f64();
-    let max_age = 90.0;
 
-    // relay_short_{short_id} → device_id (invert to device_id → short_id)
     let mut device_to_short = std::collections::HashMap::new();
     if let Ok(entries) = db.kv_prefix("relay_short_") {
         for (key, device_id) in entries {
@@ -229,14 +243,12 @@ fn relay_status(db: &HcomDb) -> i32 {
         }
     }
 
-    // Filter by sync_time freshness
     let sync_map: std::collections::HashMap<String, String> = db
         .kv_prefix("relay_sync_time_")
         .unwrap_or_default()
         .into_iter()
         .collect();
 
-    // Agent counts per remote device
     let mut agent_counts = std::collections::HashMap::new();
     if let Ok(mut stmt) = db.conn().prepare(
         "SELECT origin_device_id, COUNT(*) as cnt FROM instances \
@@ -252,7 +264,8 @@ fn relay_status(db: &HcomDb) -> i32 {
         }
     }
 
-    let mut remote_parts = Vec::new();
+    let mut online_parts = Vec::new();
+    let mut offline_parts = Vec::new();
     let mut sorted_devices: Vec<_> = device_to_short.iter().collect();
     sorted_devices.sort_by(|a, b| a.1.cmp(b.1));
 
@@ -261,25 +274,37 @@ fn relay_status(db: &HcomDb) -> i32 {
             .get(&format!("relay_sync_time_{device_id}"))
             .and_then(|s| s.parse().ok())
             .unwrap_or(0.0);
-        if sync_time == 0.0 || (now - sync_time) > max_age {
-            continue;
-        }
+        let is_online = sync_time > 0.0 && (now - sync_time) <= relay::DEVICE_STALE_SECS;
 
         let agents = agent_counts.get(device_id).copied().unwrap_or(0);
-        let mut parts = vec![short.clone()];
-        parts.push(format_time(sync_time));
-        if agents == 0 {
-            parts.push("no agents".to_string());
+        let mut details = Vec::new();
+        if sync_time > 0.0 {
+            details.push(format_time(sync_time));
         }
-        if parts.len() > 1 {
-            remote_parts.push(format!("{} ({})", parts[0], parts[1..].join(", ")));
+        if is_online && agents == 0 {
+            details.push("no agents".to_string());
+        }
+        let label = if details.is_empty() {
+            short.clone()
         } else {
-            remote_parts.push(parts[0].clone());
+            format!("{} ({})", short, details.join(", "))
+        };
+        if is_online {
+            online_parts.push(label);
+        } else {
+            offline_parts.push(label);
         }
     }
 
-    if !remote_parts.is_empty() {
-        println!("\nRemote devices: {}", remote_parts.join(", "));
+    let total = online_parts.len() + offline_parts.len();
+    if total > 0 {
+        println!("\nDevices:   {} known", total + 1); // +1 for self
+        if !online_parts.is_empty() {
+            println!("  online:  {}", online_parts.join(", "));
+        }
+        if !offline_parts.is_empty() {
+            println!("  seen:    {}", offline_parts.join(", "));
+        }
     } else {
         println!("\nNo other devices");
     }
@@ -292,10 +317,7 @@ fn relay_status(db: &HcomDb) -> i32 {
         println!("Key:       {FG_RED}missing{RESET} (run `hcom relay new`)");
     }
 
-    // Show join token
-    if let Some(token) = current_join_token(&config) {
-        println!("\nAdd devices: hcom relay connect {token}");
-    }
+    println!("\nShow token: hcom relay token");
 
     0
 }
@@ -505,7 +527,7 @@ fn persist_relay_config(
 }
 
 /// Create a new relay group.
-fn relay_new(_db: &HcomDb, argv: &[String]) -> i32 {
+fn relay_new(db: &HcomDb, argv: &[String]) -> i32 {
     let (broker_url, auth_token, _) = parse_broker_flags(argv);
 
     let config = config::load_config_snapshot().core;
@@ -514,6 +536,10 @@ fn relay_new(_db: &HcomDb, argv: &[String]) -> i32 {
     if let Some(old_token) = current_join_token(&config) {
         println!("Current group: hcom relay connect {old_token}\n");
     }
+
+    // Clear stale device state from the previous relay group so that
+    // relay_short_* / relay_caps_* only reflect the new token's peers.
+    relay::clear_relay_device_state(db);
 
     let relay_id = uuid::Uuid::new_v4().to_string();
     let psk = match relay::crypto::generate_psk() {
@@ -665,11 +691,9 @@ fn relay_connect(db: &HcomDb, argv: &[String]) -> i32 {
 
     let config = config::load_config_snapshot().core;
 
-    // Show previous group if switching
+    // Clear stale device state when switching groups
     if config.relay_id != relay_id {
-        if let Some(old_token) = current_join_token(&config) {
-            println!("Current group: hcom relay connect {old_token}\n");
-        }
+        relay::clear_relay_device_state(db);
     }
 
     // Save config
@@ -764,6 +788,7 @@ pub fn cmd_relay(db: &HcomDb, args: &RelayArgs, _ctx: Option<&CommandContext>) -
              hcom relay                  Show relay status\n  \
              hcom relay status           Same as above\n  \
              hcom relay new              Create new relay group (generates fresh key)\n  \
+             hcom relay token            Show join token\n  \
              hcom relay connect          Re-enable existing relay\n  \
              hcom relay connect <token>  Join relay from another device\n  \
              hcom relay off              Disable relay sync\n  \
@@ -789,6 +814,7 @@ pub fn cmd_relay(db: &HcomDb, args: &RelayArgs, _ctx: Option<&CommandContext>) -
         "off" | "disconnect" => relay_off(db, &argv[1..]),
         "on" => relay_connect(db, &Vec::new()),
         "status" => relay_status(db),
+        "token" => relay_show_token(),
         "push" => relay_push(),
         "daemon" => crate::commands::daemon::cmd_daemon(&argv[1..]),
         _ => {

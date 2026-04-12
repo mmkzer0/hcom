@@ -485,6 +485,27 @@ fn ensure_relay_worker(hcom_dir: &str) {
     thread::sleep(Duration::from_millis(500));
 }
 
+/// Kill orphan debug relay-worker processes from previous failed test runs.
+/// Without this, a stale daemon can hold MQTT connections and interfere with
+/// new test runs (the test creates isolated HCOM_DIRs but can't find orphan
+/// PIDs once the old temp dir is deleted).
+fn kill_orphan_debug_daemons() {
+    let Ok(output) = std::process::Command::new("pgrep")
+        .args(["-f", "target/debug/hcom relay-worker"])
+        .output()
+    else {
+        return;
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if let Ok(pid) = line.trim().parse::<i32>() {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+    }
+}
+
 fn kill_daemon(hcom_dir: &str) {
     let pid_path = Path::new(hcom_dir).join(".tmp").join("relay.pid");
     if let Ok(content) = fs::read_to_string(&pid_path) {
@@ -544,6 +565,8 @@ impl Drop for RelayGuard {
 #[test]
 #[ignore]
 fn test_relay_roundtrip() {
+    kill_orphan_debug_daemons();
+
     let dir_a = tempfile::tempdir().expect("failed to create temp dir A");
     let dir_b = tempfile::tempdir().expect("failed to create temp dir B");
 
@@ -755,14 +778,15 @@ fn test_relay_roundtrip() {
             }
             let stdout = String::from_utf8_lossy(&out.stdout);
             for line in stdout.lines() {
-                if line.contains("Remote devices:") && line.contains(&short_b) {
+                if (line.contains("online:") || line.contains("Remote devices:"))
+                    && line.contains(&short_b)
+                {
                     return Some(line.trim().to_string());
                 }
             }
-            // Debug: show what relay status says about remote devices
             let remote_line = stdout
                 .lines()
-                .find(|l| l.contains("Remote") || l.contains("other devices"));
+                .find(|l| l.contains("online:") || l.contains("Remote") || l.contains("other devices"));
             eprintln!(
                 "    relay status: {}",
                 remote_line.unwrap_or("(no remote line)")

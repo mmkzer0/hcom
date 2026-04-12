@@ -101,17 +101,19 @@ pub fn handle_device_gone(db: &HcomDb, device_id: &str) {
         log::log_error("relay", "relay.device_gone_err", &format!("{}", e));
         return;
     }
+    let short_id = resolve_short_id(db, device_id);
     safe_kv_set(db, &format!("relay_sync_time_{}", device_id), None);
     safe_kv_set(db, &format!("relay_caps_{}", device_id), None);
     safe_kv_set(db, &format!("relay_ctrl_{}", device_id), None);
     safe_kv_set(db, &state_ts_key(device_id), None);
-    // Clear short_id mapping
-    clear_short_id(db, device_id);
-    log::log_info(
-        "relay",
-        "relay.device_gone",
-        &format!("device={}", &device_id[..8.min(device_id.len())]),
-    );
+    if let Some(ref short) = short_id {
+        safe_kv_set(db, &format!("relay_short_{}", short), None);
+    }
+    let prefix = super::device_id_prefix(device_id);
+    let label = short_id.as_deref().unwrap_or(prefix);
+    emit_device_event(db, super::ACTION_DEVICE_LEAVE, label, prefix,
+        &format!("device {} left the relay", label), false);
+    log::log_info("relay", "relay.device_gone", &format!("device={}", prefix));
 }
 
 /// Handle a control message from the control topic.
@@ -250,8 +252,21 @@ pub fn handle_state_message(
             );
             return false; // Skip to prevent data corruption
         }
+        // Known device — check if it's a reconnect (was offline, now back)
+        let last_sync: f64 = safe_kv_get(db, &format!("relay_sync_time_{}", device_id))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
+        let now = crate::shared::time::now_epoch_f64();
+        if last_sync > 0.0 && (now - last_sync) > super::DEVICE_STALE_SECS {
+            let prefix = super::device_id_prefix(device_id);
+            emit_device_event(db, super::ACTION_DEVICE_JOIN, &short_id, prefix,
+                &format!("device {} reconnected", short_id), true);
+        }
     } else {
         safe_kv_set(db, &format!("relay_short_{}", short_id), Some(device_id));
+        let prefix = super::device_id_prefix(device_id);
+        emit_device_event(db, super::ACTION_DEVICE_JOIN, &short_id, prefix,
+            &format!("new device {} joined the relay", short_id), false);
     }
     // Cache the peer's advertised capabilities. Distinguish three states:
     //   - "null"  → peer state arrived without a `capabilities` field at all
@@ -673,6 +688,39 @@ fn import_remote_events(
     }
 }
 
+/// Reverse lookup: find short_id for a device UUID.
+fn resolve_short_id(db: &HcomDb, device_id: &str) -> Option<String> {
+    if let Ok(entries) = db.kv_prefix("relay_short_") {
+        for (key, val) in entries {
+            if val == device_id {
+                return Some(key.trim_start_matches("relay_short_").to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Emit a relay device lifecycle event.
+fn emit_device_event(
+    db: &HcomDb,
+    action: &str,
+    short_id: &str,
+    device_id_prefix: &str,
+    text: &str,
+    reconnect: bool,
+) {
+    let mut data = serde_json::json!({
+        "action": action,
+        "short_id": short_id,
+        "device_id": device_id_prefix,
+        "text": text,
+    });
+    if reconnect {
+        data["reconnect"] = serde_json::json!(true);
+    }
+    let _ = db.log_event("life", "", &data);
+}
+
 /// Strip own device suffix from a name (case-insensitive).
 /// e.g. "nuvi:RIVA" with own_short_id="RIVA" → "nuvi"
 fn strip_device_suffix(name: &str, own_short_id: &str) -> String {
@@ -698,17 +746,6 @@ fn parse_ts(value: Option<&Value>) -> f64 {
     }
 }
 
-/// Clear short_id mapping for a device (reverse lookup by value).
-fn clear_short_id(db: &HcomDb, device_id: &str) {
-    if let Ok(entries) = db.kv_prefix("relay_short_") {
-        for (key, val) in entries {
-            if val == device_id {
-                safe_kv_set(db, &key, None);
-                break;
-            }
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {

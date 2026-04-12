@@ -391,7 +391,7 @@ const PEER_STALE_THRESHOLD_SECS: f64 = 90.0;
 /// Keeping these separate is load-bearing for mixed-version relays:
 /// a peer that predates the capability field (`Legacy`) must NOT be
 /// hard-blocked like one that explicitly advertises `[]`.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 enum CachedCapabilities {
     /// No state message from this peer yet — caller should retry briefly.
     NotSynced,

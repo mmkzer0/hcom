@@ -29,6 +29,19 @@ pub const DEFAULT_BROKERS: &[(&str, u16)] = &[
     ("test.mosquitto.org", 8886),
 ];
 
+/// Threshold (seconds) after which a device with no state updates is considered offline.
+/// Used for reconnect detection, stale-device cleanup, and status display.
+pub const DEVICE_STALE_SECS: f64 = 90.0;
+
+/// Life event actions for device join/leave notifications.
+pub const ACTION_DEVICE_JOIN: &str = "relay_device_join";
+pub const ACTION_DEVICE_LEAVE: &str = "relay_device_leave";
+
+/// Truncate a device UUID to its first 8 characters for logging.
+pub fn device_id_prefix(device_id: &str) -> &str {
+    &device_id[..8.min(device_id.len())]
+}
+
 /// Check if relay is configured AND enabled (relay_id set + relay_enabled flag).
 pub fn is_relay_enabled(config: &HcomConfig) -> bool {
     !config.relay_id.is_empty() && config.relay_enabled
@@ -154,6 +167,43 @@ pub(crate) fn safe_kv_get(db: &HcomDb, key: &str) -> Option<String> {
 /// Safe KV set that won't crash on DB errors.
 pub(crate) fn safe_kv_set(db: &HcomDb, key: &str, value: Option<&str>) {
     let _ = db.kv_set(key, value);
+}
+
+/// Clear all per-device relay KV entries and reset global relay counters.
+/// Called on `relay new` so stale device mappings from the previous relay group
+/// don't contaminate the new one.
+pub fn clear_relay_device_state(db: &HcomDb) {
+    let prefixes = [
+        "relay_short_",
+        "relay_caps_",
+        "relay_events_",
+        "relay_reset_",
+        "relay_sync_time_",
+        "relay_state_ts_",
+        "relay_ctrl_",
+    ];
+    for prefix in &prefixes {
+        if let Ok(entries) = db.kv_prefix(prefix) {
+            for (key, _) in entries {
+                safe_kv_set(db, &key, None);
+            }
+        }
+    }
+    // Reset global counters
+    for key in &[
+        "relay_device_count",
+        "relay_last_push",
+        "relay_last_push_id",
+        "relay_last_sync",
+        "relay_local_reset_ts",
+    ] {
+        safe_kv_set(db, key, None);
+    }
+    // Remove remote instances from the old relay
+    let _ = db.conn().execute(
+        "DELETE FROM instances WHERE origin_device_id IS NOT NULL AND origin_device_id != ''",
+        [],
+    );
 }
 
 /// Relay status for TUI/CLI display.
