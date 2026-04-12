@@ -392,6 +392,16 @@ pub fn maybe_reexec_dev_root() {
     );
 }
 
+/// True if argv is `hcom config dev_root [...]` (after stripping global flags).
+fn is_config_dev_root_invocation(argv: &[String]) -> bool {
+    let (positional, _, _) = extract_global_flags_full(argv);
+    let mut iter = positional.iter().take_while(|a| a.as_str() != "--");
+    matches!(
+        (iter.next().map(String::as_str), iter.next().map(String::as_str)),
+        (Some("config"), Some("dev_root"))
+    )
+}
+
 pub(crate) fn resolve_effective_dev_root(db_path: &Path) -> Option<(PathBuf, &'static str)> {
     if let Ok(r) = env::var("HCOM_DEV_ROOT") {
         if !r.is_empty() {
@@ -456,11 +466,14 @@ fn is_same_file(a: &Path, b: &Path) -> bool {
 
 /// Main entry point: resolve action and dispatch.
 pub fn dispatch() -> anyhow::Result<()> {
-    // HCOM_DEV_ROOT re-exec (must happen before anything else)
-    maybe_reexec_dev_root();
-
     let args: Vec<String> = env::args().collect();
     let argv = &args[1..]; // strip binary name
+
+    // Skip dev_root re-exec for `config dev_root` so a stale pointer can't
+    // trap the user — the invoked binary owns its own dev_root setting.
+    if !is_config_dev_root_invocation(argv) {
+        maybe_reexec_dev_root();
+    }
 
     let action = resolve_action(argv);
 
@@ -915,6 +928,21 @@ mod tests {
             .unwrap();
 
         assert_eq!(read_dev_root_from_kv(&db_path), None);
+    }
+
+    #[test]
+    fn is_config_dev_root_invocation_matches_expected_shapes() {
+        assert!(is_config_dev_root_invocation(&sv(&["config", "dev_root"])));
+        assert!(is_config_dev_root_invocation(&sv(&["config", "dev_root", "/tmp/x"])));
+        assert!(is_config_dev_root_invocation(&sv(&["config", "dev_root", "--unset"])));
+        assert!(is_config_dev_root_invocation(&sv(&[
+            "--name", "vami", "config", "dev_root", "/tmp/x"
+        ])));
+
+        assert!(!is_config_dev_root_invocation(&sv(&["config"])));
+        assert!(!is_config_dev_root_invocation(&sv(&["config", "terminal", "tmux"])));
+        assert!(!is_config_dev_root_invocation(&sv(&["list"])));
+        assert!(!is_config_dev_root_invocation(&[]));
     }
 
     // ── resolve_action tests ────────────────────────────────────────────
