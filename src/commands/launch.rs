@@ -34,6 +34,7 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
     let terminal = hcom_flags.terminal;
     let headless = hcom_flags.headless;
     let remote_device = hcom_flags.device.clone();
+    let dir_override = hcom_flags.dir.clone();
     let tag_for_output = tag.clone();
     let terminal_for_output = terminal.clone();
 
@@ -57,7 +58,7 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
             background: preview_background,
             args: &tool_args,
             tag: tag.as_deref(),
-            cwd: None,
+            cwd: dir_override.as_deref(),
             terminal: terminal.as_deref(),
             config: &hcom_config,
             show_config_args: remote_device.is_none(),
@@ -70,6 +71,11 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
         if hcom_flags.run_here == Some(true) {
             bail!("Remote launch does not support --run-here");
         }
+        let remote_cwd = dir_override.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Remote launch requires --dir to specify the working directory on the target device"
+            )
+        })?;
         let db = HcomDb::open()?;
         let launcher_name =
             resolve_launcher_name(&db, flags, std::env::var("HCOM_PROCESS_ID").ok().as_deref());
@@ -81,9 +87,7 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
             "launcher": launcher_name,
             "background": headless,
             "terminal": terminal,
-            "cwd": std::env::current_dir()
-                .ok()
-                .map(|p| p.to_string_lossy().to_string()),
+            "cwd": remote_cwd,
             "initial_prompt": hcom_flags.initial_prompt,
             "system_prompt": hcom_flags.system_prompt,
         });
@@ -162,11 +166,19 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
             initial_prompt,
             pty: use_pty,
             background,
-            cwd: Some(
+            cwd: Some(if let Some(ref dir) = dir_override {
+                let path = std::path::Path::new(dir);
+                if !path.is_dir() {
+                    bail!("--dir path does not exist or is not a directory: {}", dir);
+                }
+                path.canonicalize()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| dir.clone())
+            } else {
                 std::env::current_dir()
                     .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_else(|_| ".".to_string()),
-            ),
+                    .unwrap_or_else(|_| ".".to_string())
+            }),
             env: None,
             launcher: Some(launcher_name.clone()),
             run_here: hcom_flags.run_here,
@@ -364,6 +376,7 @@ pub(crate) struct HcomLaunchFlags {
     pub initial_prompt: Option<String>,
     pub run_here: Option<bool>,
     pub batch_id: Option<String>,
+    pub dir: Option<String>,
 }
 
 /// Parse launch argv: extract count, tool name, hcom flags, and tool-specific args.
@@ -508,6 +521,11 @@ pub(crate) fn extract_launch_flags(args: &[String]) -> (HcomLaunchFlags, Vec<Str
             i += 1;
             continue;
         }
+        if args[i].starts_with("--dir=") {
+            flags.dir = Some(args[i][6..].to_string());
+            i += 1;
+            continue;
+        }
         match args[i].as_str() {
             "--tag" if i + 1 < args.len() => {
                 flags.tag = Some(args[i + 1].clone());
@@ -519,6 +537,10 @@ pub(crate) fn extract_launch_flags(args: &[String]) -> (HcomLaunchFlags, Vec<Str
             }
             "--device" if i + 1 < args.len() => {
                 flags.device = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--dir" if i + 1 < args.len() => {
+                flags.dir = Some(args[i + 1].clone());
                 i += 2;
             }
             "--headless" => {
@@ -955,5 +977,30 @@ mod tests {
 
         let name = resolve_launcher_name(&db, &GlobalFlags::default(), Some("pid-123"));
         assert_eq!(name, "bound");
+    }
+
+    #[test]
+    fn test_parse_launch_argv_dir_flag() {
+        let (_, _, flags, args) =
+            parse_launch_argv(&s(&["claude", "--dir", "/tmp/project", "--model", "haiku"]))
+                .unwrap();
+        assert_eq!(flags.dir, Some("/tmp/project".to_string()));
+        assert_eq!(args, s(&["--model", "haiku"]));
+    }
+
+    #[test]
+    fn test_parse_launch_argv_dir_equals() {
+        let (_, _, flags, args) =
+            parse_launch_argv(&s(&["claude", "--dir=/tmp/project", "--model", "haiku"])).unwrap();
+        assert_eq!(flags.dir, Some("/tmp/project".to_string()));
+        assert_eq!(args, s(&["--model", "haiku"]));
+    }
+
+    #[test]
+    fn test_parse_launch_argv_dir_not_passed_to_tool() {
+        let (_, _, flags, args) =
+            parse_launch_argv(&s(&["gemini", "--dir", "/tmp/proj", "-m", "flash"])).unwrap();
+        assert_eq!(flags.dir, Some("/tmp/proj".to_string()));
+        assert_eq!(args, s(&["-m", "flash"]));
     }
 }

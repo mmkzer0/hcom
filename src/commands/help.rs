@@ -746,6 +746,7 @@ fn generate_tool_help(spec: &ToolHelpSpec) -> String {
     lines.push("hcom Flags:".to_string());
     lines.push("    --tag <name>                 Group tag (names become tag-*)".to_string());
     lines.push("    --terminal <preset>          Where new windows open".to_string());
+    lines.push("    --dir <path>                  Working directory for launch".to_string());
     lines.push("    --hcom-prompt <text>          Initial prompt".to_string());
     lines.push("    --hcom-system-prompt <text>   System prompt".to_string());
 

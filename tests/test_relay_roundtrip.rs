@@ -18,6 +18,9 @@
 //! Requires:
 //! - hcom installed
 //! - Network access to public MQTT brokers
+//! - tmux installed
+//! - claude installed and previously launched in /tmp (so the permission
+//!   prompt is already approved — a fresh cwd blocks the TUI from drawing)
 //!
 //! Run:
 //!     cargo test -p hcom --test test_relay_roundtrip -- --ignored --nocapture
@@ -443,7 +446,11 @@ fn try_remote_launch_claude_tmux(
     target_device: &str,
 ) -> Result<(String, String), String> {
     // Model pinning comes via HCOM_CLAUDE_ARGS set in hcom_with_dir.
-    let cmd = format!("1 claude --device {target_device} --terminal tmux --go");
+    // --dir is required for remote launches; use /tmp as cwd — it always
+    // exists on both sides of the local-machine test and claude has already
+    // been trusted there (a never-seen-before cwd triggers a permission
+    // prompt that blocks the TUI from drawing).
+    let cmd = format!("1 claude --device {target_device} --terminal tmux --dir /tmp --go");
     let out = hcom_with_dir(&cmd, hcom_dir);
     if !out.status.success() {
         return Err(format!(

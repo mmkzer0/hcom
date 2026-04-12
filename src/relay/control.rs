@@ -504,22 +504,18 @@ fn emit_rpc_result(
 
 fn resolve_remote_cwd(requested: Option<&str>) -> Result<String, String> {
     let requested = requested.unwrap_or("");
-    if !requested.is_empty() {
-        if std::path::Path::new(requested).is_dir() {
-            return Ok(requested.to_string());
-        }
-        return Err(format!(
-            "requested cwd does not exist or is not a directory: {}",
-            requested
-        ));
+    if requested.is_empty() {
+        return Err(
+            "remote launch requires a working directory (--dir) but none was provided".to_string(),
+        );
     }
-    let home = std::env::var("HOME")
-        .ok()
-        .filter(|p| std::path::Path::new(p).is_dir())
-        .ok_or_else(|| {
-            "remote launch needs a working directory but $HOME is not usable".to_string()
-        })?;
-    Ok(home)
+    if std::path::Path::new(requested).is_dir() {
+        return Ok(requested.to_string());
+    }
+    Err(format!(
+        "requested cwd does not exist or is not a directory: {}",
+        requested
+    ))
 }
 
 fn required_param<'a>(params: &'a Value, key: &str) -> Result<&'a str, String> {
@@ -1050,6 +1046,14 @@ mod tests {
     fn test_resolve_remote_cwd_rejects_missing_requested_directory() {
         let err = resolve_remote_cwd(Some("/definitely/missing")).unwrap_err();
         assert!(err.contains("requested cwd does not exist or is not a directory"));
+    }
+
+    #[test]
+    fn test_resolve_remote_cwd_rejects_empty() {
+        let err = resolve_remote_cwd(None).unwrap_err();
+        assert!(err.contains("--dir"));
+        let err = resolve_remote_cwd(Some("")).unwrap_err();
+        assert!(err.contains("--dir"));
     }
 
     #[test]

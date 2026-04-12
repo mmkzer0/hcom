@@ -102,6 +102,16 @@ pub fn do_resume(
     let ctx = crate::shared::HcomContext::from_os();
 
     if let Some((base_name, device)) = crate::relay::control::split_device_suffix(&name) {
+        if fork {
+            let has_dir = extra_args
+                .iter()
+                .any(|a| a == "--dir" || a.starts_with("--dir="));
+            if !has_dir {
+                bail!(
+                    "Remote fork requires --dir to specify the working directory on the target device"
+                );
+            }
+        }
         if ctx.is_inside_ai_tool() && !flags.go && should_preview_resume_rpc(extra_args) {
             if let Ok(plan) = prepare_resume_plan(&db, &name, fork, extra_args, flags) {
                 print_resume_preview(&plan, &hcom_config, &name, fork);
