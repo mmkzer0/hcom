@@ -344,7 +344,15 @@ pub fn ensure_worker(require_instances: bool) -> bool {
     // Explicit command path: ensure running AND port-ready.
     if is_relay_worker_running() {
         // Process exists but may be in startup window before port bind.
-        return poll_until_ready(300);
+        if poll_until_ready(300) {
+            return true;
+        }
+        // The existing worker may have exited while we were polling (for
+        // example, a user just stopped it or it hit watchdog exit). In that
+        // case, fall through and try to spawn a fresh worker.
+        if is_relay_worker_running() {
+            return false;
+        }
     }
     if !do_spawn() {
         // TOCTOU: another process may have spawned between our check and do_spawn().

@@ -12,7 +12,84 @@ use crate::db::HcomDb;
 use crate::instance_lifecycle;
 use crate::log;
 
+use super::crypto;
+use super::replay::ReplayGuard;
 use super::{device_short_id, safe_kv_get, safe_kv_set};
+
+struct OpenedEnvelope {
+    plaintext: Vec<u8>,
+    ts_secs: u64,
+}
+
+fn state_ts_key(device_id: &str) -> String {
+    format!("relay_state_ts_{}", device_id)
+}
+
+fn state_ts_watermark(db: &HcomDb, device_id: &str) -> Option<u64> {
+    safe_kv_get(db, &state_ts_key(device_id)).and_then(|s| s.parse().ok())
+}
+
+fn record_state_ts_watermark(db: &HcomDb, device_id: &str, ts_secs: u64) {
+    let current = state_ts_watermark(db, device_id).unwrap_or(0);
+    if ts_secs > current {
+        safe_kv_set(db, &state_ts_key(device_id), Some(&ts_secs.to_string()));
+    }
+}
+
+/// Decrypt + replay-check an envelope coming off the wire. Returns the inner
+/// JSON bytes ready for `serde_json::from_slice`. Errors are logged inline so
+/// caller sites stay short.
+fn open_envelope_for_handler(
+    psk: &[u8; 32],
+    relay_id: &str,
+    topic: &str,
+    sender_short: &str,
+    payload: &[u8],
+    allow_stale: bool,
+    retained_watermark: Option<u64>,
+    replay_guard: &mut ReplayGuard,
+) -> Option<OpenedEnvelope> {
+    let parsed = match crypto::parse_envelope(payload) {
+        Ok(p) => p,
+        Err(e) => {
+            log::log_warn("relay", "relay.bad_envelope", &format!("{}", e));
+            return None;
+        }
+    };
+    let now_secs = crate::shared::time::now_epoch_f64() as u64;
+    let replay_result = if allow_stale {
+        replay_guard.check_retained(
+            sender_short,
+            parsed.nonce,
+            parsed.ts_secs,
+            now_secs,
+            retained_watermark,
+        )
+    } else {
+        replay_guard.check(sender_short, parsed.nonce, parsed.ts_secs, now_secs)
+    };
+    if let Err(e) = replay_result {
+        log::log_warn("relay", "relay.replay", &format!("{}", e));
+        return None;
+    }
+
+    match crypto::open(psk, relay_id, topic, payload) {
+        Ok(pt) => {
+            if let Err(e) = replay_guard.record_nonce(sender_short, parsed.nonce, now_secs) {
+                log::log_warn("relay", "relay.replay", &format!("{}", e));
+                return None;
+            }
+            Some(OpenedEnvelope {
+                plaintext: pt,
+                ts_secs: parsed.ts_secs,
+            })
+        }
+        Err(e) => {
+            log::log_warn("relay", "relay.decrypt_fail", &format!("{}", e));
+            None
+        }
+    }
+}
 
 /// Handle device gone (empty retained payload = LWT or graceful disconnect).
 /// Removes all instances belonging to the disconnected device.
@@ -26,6 +103,8 @@ pub fn handle_device_gone(db: &HcomDb, device_id: &str) {
     }
     safe_kv_set(db, &format!("relay_sync_time_{}", device_id), None);
     safe_kv_set(db, &format!("relay_caps_{}", device_id), None);
+    safe_kv_set(db, &format!("relay_ctrl_{}", device_id), None);
+    safe_kv_set(db, &state_ts_key(device_id), None);
     // Clear short_id mapping
     clear_short_id(db, device_id);
     log::log_info(
@@ -36,8 +115,30 @@ pub fn handle_device_gone(db: &HcomDb, device_id: &str) {
 }
 
 /// Handle a control message from the control topic.
-pub fn handle_control_message(db: &HcomDb, payload: &[u8], own_device: &str) -> bool {
-    let data: Value = match serde_json::from_slice(payload) {
+pub fn handle_control_message(
+    db: &HcomDb,
+    payload: &[u8],
+    own_device: &str,
+    psk: &[u8; 32],
+    relay_id: &str,
+    topic: &str,
+    replay_guard: &mut ReplayGuard,
+) -> bool {
+    let opened = match open_envelope_for_handler(
+        psk,
+        relay_id,
+        topic,
+        "control",
+        payload,
+        false,
+        None,
+        replay_guard,
+    ) {
+        Some(p) => p,
+        None => return false,
+    };
+
+    let data: Value = match serde_json::from_slice(&opened.plaintext) {
         Ok(v) => v,
         Err(e) => {
             log::log_warn("relay", "relay.bad_payload", &format!("{}", e));
@@ -73,16 +174,45 @@ pub fn handle_state_message(
     device_id: &str,
     payload: &[u8],
     own_device: &str,
+    psk: &[u8; 32],
+    relay_id: &str,
+    topic: &str,
+    allow_stale: bool,
+    replay_guard: &mut ReplayGuard,
 ) -> bool {
     let t0 = std::time::Instant::now();
 
-    let data: Value = match serde_json::from_slice(payload) {
+    let retained_watermark = if allow_stale {
+        state_ts_watermark(db, device_id)
+    } else {
+        None
+    };
+    let opened = match open_envelope_for_handler(
+        psk,
+        relay_id,
+        topic,
+        device_id,
+        payload,
+        allow_stale,
+        retained_watermark,
+        replay_guard,
+    ) {
+        Some(p) => p,
+        None => return false,
+    };
+
+    let data: Value = match serde_json::from_slice(&opened.plaintext) {
         Ok(v) => v,
         Err(e) => {
             log::log_warn("relay", "relay.bad_payload", &format!("{}", e));
             return false;
         }
     };
+
+    if data.get("state").is_some() && data["state"].is_null() {
+        handle_device_gone(db, device_id);
+        return false;
+    }
 
     let state = data
         .get("state")
@@ -345,6 +475,7 @@ pub fn handle_state_message(
         .unwrap_or(0);
     safe_kv_set(db, "relay_device_count", Some(&device_count.to_string()));
     safe_kv_set(db, "relay_last_sync", Some(&now.to_string()));
+    record_state_ts_watermark(db, device_id, opened.ts_secs);
 
     let apply_ms = t0.elapsed().as_millis();
     log::log_with_fields(
@@ -586,6 +717,17 @@ mod tests {
     use serde_json::json;
     use serial_test::serial;
 
+    fn fixture_psk() -> [u8; 32] {
+        [0x33; 32]
+    }
+
+    fn seal_for_test(payload: &serde_json::Value, topic: &str, relay_id: &str) -> Vec<u8> {
+        let psk = fixture_psk();
+        let bytes = serde_json::to_vec(payload).unwrap();
+        let now = crate::shared::time::now_epoch_f64() as u64;
+        crate::relay::crypto::seal(&psk, relay_id, topic, &bytes, now).unwrap()
+    }
+
     #[test]
     #[serial]
     fn test_handle_state_message_drops_remote_unique_identity_fields() {
@@ -632,11 +774,20 @@ mod tests {
             "events": []
         });
 
+        let topic = "relay-test/device-1234";
+        let envelope = seal_for_test(&payload, topic, "relay-test");
+        let mut guard = ReplayGuard::default();
+        let psk = fixture_psk();
         handle_state_message(
             &db,
             "device-1234",
-            &serde_json::to_vec(&payload).unwrap(),
+            &envelope,
             "own-device-5678",
+            &psk,
+            "relay-test",
+            topic,
+            false,
+            &mut guard,
         );
 
         let row = db
@@ -666,11 +817,20 @@ mod tests {
             "events": []
         });
 
+        let topic = "relay-test/device-1234";
+        let envelope = seal_for_test(&payload, topic, "relay-test");
+        let mut guard = ReplayGuard::default();
+        let psk = fixture_psk();
         assert!(!handle_state_message(
             &db,
             "device-1234",
-            &serde_json::to_vec(&payload).unwrap(),
+            &envelope,
             "own-device-5678",
+            &psk,
+            "relay-test",
+            topic,
+            false,
+            &mut guard,
         ));
 
         assert_eq!(
@@ -699,11 +859,20 @@ mod tests {
             "events": []
         });
 
+        let topic = "relay-test/device-1234";
+        let envelope = seal_for_test(&payload, topic, "relay-test");
+        let mut guard = ReplayGuard::default();
+        let psk = fixture_psk();
         assert!(!handle_state_message(
             &db,
             "device-1234",
-            &serde_json::to_vec(&payload).unwrap(),
+            &envelope,
             "own-device-5678",
+            &psk,
+            "relay-test",
+            topic,
+            false,
+            &mut guard,
         ));
 
         assert_eq!(
@@ -711,5 +880,210 @@ mod tests {
             Some("null"),
             "legacy peer (no capabilities field) must be cached as the \"null\" sentinel"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn test_handle_retained_state_message_allows_stale_snapshot() {
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+
+        let payload = json!({
+            "state": {
+                "short_id": "ABCD",
+                "reset_ts": 0.0,
+                "instances": {
+                    "luna": {
+                        "status": "active",
+                        "context": "",
+                        "detail": "",
+                        "status_time": crate::shared::time::now_epoch_f64(),
+                        "parent": serde_json::Value::Null,
+                        "directory": "/tmp/demo",
+                        "transcript": "/tmp/demo/transcript.jsonl",
+                        "wait_timeout": 42,
+                        "last_stop": 0.0,
+                        "tcp_mode": false,
+                        "tag": serde_json::Value::Null,
+                        "tool": "codex",
+                        "background": false
+                    }
+                }
+            },
+            "events": []
+        });
+
+        let topic = "relay-test/device-1234";
+        let stale_secs = (crate::shared::time::now_epoch_f64() as u64).saturating_sub(600);
+        let bytes = serde_json::to_vec(&payload).unwrap();
+        let envelope =
+            crate::relay::crypto::seal(&fixture_psk(), "relay-test", topic, &bytes, stale_secs)
+                .unwrap();
+        let mut guard = ReplayGuard::default();
+        let psk = fixture_psk();
+
+        assert!(!handle_state_message(
+            &db,
+            "device-1234",
+            &envelope,
+            "own-device-5678",
+            &psk,
+            "relay-test",
+            topic,
+            true,
+            &mut guard,
+        ));
+
+        assert!(db.get_instance_full("luna:ABCD").unwrap().is_some());
+    }
+
+    #[test]
+    #[serial]
+    fn test_handle_retained_state_message_rejects_rollback_behind_watermark() {
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        safe_kv_set(&db, "relay_state_ts_device-1234", Some("1500"));
+
+        let payload = json!({
+            "state": {
+                "short_id": "ABCD",
+                "reset_ts": 0.0,
+                "instances": {
+                    "luna": {
+                        "status": "active",
+                        "context": "",
+                        "detail": "",
+                        "status_time": crate::shared::time::now_epoch_f64(),
+                        "parent": serde_json::Value::Null,
+                        "directory": "/tmp/demo",
+                        "transcript": "/tmp/demo/transcript.jsonl",
+                        "wait_timeout": 42,
+                        "last_stop": 0.0,
+                        "tcp_mode": false,
+                        "tag": serde_json::Value::Null,
+                        "tool": "codex",
+                        "background": false
+                    }
+                }
+            },
+            "events": []
+        });
+
+        let topic = "relay-test/device-1234";
+        let bytes = serde_json::to_vec(&payload).unwrap();
+        let envelope =
+            crate::relay::crypto::seal(&fixture_psk(), "relay-test", topic, &bytes, 1000).unwrap();
+        let mut guard = ReplayGuard::default();
+        let psk = fixture_psk();
+
+        assert!(!handle_state_message(
+            &db,
+            "device-1234",
+            &envelope,
+            "own-device-5678",
+            &psk,
+            "relay-test",
+            topic,
+            true,
+            &mut guard,
+        ));
+
+        assert!(db.get_instance_full("luna:ABCD").unwrap().is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn test_decrypt_failure_does_not_consume_replay_slot() {
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let topic = "relay-test/device-1234";
+        let payload = json!({
+            "state": {
+                "short_id": "ABCD",
+                "reset_ts": 0.0,
+                "instances": {}
+            },
+            "events": []
+        });
+
+        let good_envelope = seal_for_test(&payload, topic, "relay-test");
+        let mut bad_psk = fixture_psk();
+        bad_psk[0] ^= 0x55;
+        let bad_bytes = serde_json::to_vec(&payload).unwrap();
+        let bad_envelope =
+            crate::relay::crypto::seal(&bad_psk, "relay-test", topic, &bad_bytes, 1234).unwrap();
+
+        let mut guard = ReplayGuard::new(1, 600, crate::relay::replay::MAX_SKEW_SECS);
+        let psk = fixture_psk();
+
+        assert!(!handle_state_message(
+            &db,
+            "device-1234",
+            &bad_envelope,
+            "own-device-5678",
+            &psk,
+            "relay-test",
+            topic,
+            false,
+            &mut guard,
+        ));
+        assert_eq!(
+            guard.len(),
+            0,
+            "failed decrypt must not record replay nonce"
+        );
+
+        assert!(!handle_state_message(
+            &db,
+            "device-1234",
+            &good_envelope,
+            "own-device-5678",
+            &psk,
+            "relay-test",
+            topic,
+            false,
+            &mut guard,
+        ));
+        assert_eq!(guard.len(), 1);
+    }
+
+    #[test]
+    #[serial]
+    fn test_handle_state_message_authenticated_null_state_cleans_up_device_and_watermark() {
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, origin_device_id, created_at) VALUES (?1, ?2, ?3)",
+                rusqlite::params!["luna:ABCD", "device-1234", 1.0],
+            )
+            .unwrap();
+        safe_kv_set(&db, "relay_state_ts_device-1234", Some("1500"));
+
+        let payload = json!({
+            "state": serde_json::Value::Null,
+            "events": [],
+        });
+        let topic = "relay-test/device-1234";
+        let bytes = serde_json::to_vec(&payload).unwrap();
+        let envelope =
+            crate::relay::crypto::seal(&fixture_psk(), "relay-test", topic, &bytes, 2000).unwrap();
+        let mut guard = ReplayGuard::default();
+        let psk = fixture_psk();
+
+        assert!(!handle_state_message(
+            &db,
+            "device-1234",
+            &envelope,
+            "own-device-5678",
+            &psk,
+            "relay-test",
+            topic,
+            true,
+            &mut guard,
+        ));
+
+        assert!(db.get_instance_full("luna:ABCD").unwrap().is_none());
+        assert_eq!(safe_kv_get(&db, "relay_state_ts_device-1234"), None);
     }
 }

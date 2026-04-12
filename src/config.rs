@@ -96,6 +96,7 @@ const TOML_KEY_MAP: &[(&str, &str)] = &[
     ("relay", "relay.url"),
     ("relay_id", "relay.id"),
     ("relay_token", "relay.token"),
+    ("relay_psk", "relay.psk"),
     ("relay_enabled", "relay.enabled"),
     ("timeout", "preferences.timeout"),
     ("auto_approve", "preferences.auto_approve"),
@@ -120,6 +121,12 @@ const FIELD_TO_ENV: &[(&str, &str)] = &[
     ("relay", "HCOM_RELAY"),
     ("relay_id", "HCOM_RELAY_ID"),
     ("relay_token", "HCOM_RELAY_TOKEN"),
+    // NOTE: `relay_psk` is deliberately NOT in FIELD_TO_ENV. `to_env_dict` feeds
+    // `build_launch_env`, which injects these vars into every spawned agent
+    // child. The PSK is forge/decrypt authority for the entire relay group —
+    // it must never cross a process boundary via environment. Relay fields are
+    // file-only on load already (see `is_relay_field` in `load_from_sources`),
+    // so env-var override was never the mechanism for configuring the PSK.
     ("relay_enabled", "HCOM_RELAY_ENABLED"),
     ("auto_approve", "HCOM_AUTO_APPROVE"),
     ("auto_subscribe", "HCOM_AUTO_SUBSCRIBE"),
@@ -127,7 +134,13 @@ const FIELD_TO_ENV: &[(&str, &str)] = &[
 ];
 
 /// Relay fields — file-only, no env var override.
-const RELAY_FIELDS: &[&str] = &["relay", "relay_id", "relay_token", "relay_enabled"];
+const RELAY_FIELDS: &[&str] = &[
+    "relay",
+    "relay_id",
+    "relay_token",
+    "relay_psk",
+    "relay_enabled",
+];
 
 /// Characters that are dangerous in terminal preset values (injection risk).
 const TERMINAL_DANGEROUS_CHARS: &[char] = &['`', '$', ';', '|', '&', '\n', '\r'];
@@ -216,6 +229,7 @@ pub struct HcomConfig {
     pub relay: String,
     pub relay_id: String,
     pub relay_token: String,
+    pub relay_psk: String,
     pub relay_enabled: bool,
     pub auto_approve: bool,
     pub auto_subscribe: String,
@@ -241,6 +255,7 @@ impl Default for HcomConfig {
             relay: String::new(),
             relay_id: String::new(),
             relay_token: String::new(),
+            relay_psk: String::new(),
             relay_enabled: true,
             auto_approve: true,
             auto_subscribe: "collision".to_string(),
@@ -386,6 +401,7 @@ impl HcomConfig {
             "relay" => Some(self.relay.clone()),
             "relay_id" => Some(self.relay_id.clone()),
             "relay_token" => Some(self.relay_token.clone()),
+            "relay_psk" => Some(self.relay_psk.clone()),
             "relay_enabled" => Some(if self.relay_enabled { "1" } else { "0" }.into()),
             "auto_approve" => Some(if self.auto_approve { "1" } else { "0" }.into()),
             "auto_subscribe" => Some(self.auto_subscribe.clone()),
@@ -428,6 +444,7 @@ impl HcomConfig {
             "relay" => self.relay = value.to_string(),
             "relay_id" => self.relay_id = value.to_string(),
             "relay_token" => self.relay_token = value.to_string(),
+            "relay_psk" => self.relay_psk = value.to_string(),
             "relay_enabled" => self.relay_enabled = !is_falsy(value),
             "auto_approve" => self.auto_approve = !is_falsy(value),
             "auto_subscribe" => self.auto_subscribe = value.to_string(),
@@ -562,7 +579,7 @@ impl HcomConfig {
         }
 
         // Load relay string fields (file-only, already handled by get_var)
-        for relay_field in &["relay", "relay_id", "relay_token"] {
+        for relay_field in &["relay", "relay_id", "relay_token", "relay_psk"] {
             if let Some(val) = get_var(relay_field) {
                 let _ = config.set_field(relay_field, &val.as_string());
             }
@@ -577,10 +594,14 @@ impl HcomConfig {
         Ok(config)
     }
 
-    /// Convert to HCOM_* env var dict (for persistence/display).
+    /// Convert to HCOM_* env var dict (for persistence/display). Relay secret
+    /// material (the PSK) is never emitted here — see `FIELD_TO_ENV` for why.
     pub fn to_env_dict(&self) -> HashMap<String, String> {
         let mut map = HashMap::new();
         for &(field, env_key) in FIELD_TO_ENV {
+            if field == "relay_psk" {
+                continue;
+            }
             if let Some(val) = self.get_field(field) {
                 map.insert(env_key.to_string(), val);
             }
@@ -774,7 +795,7 @@ pub fn save_toml_config(config: &HcomConfig, presets: Option<&toml::Value>) -> s
         }
     }
 
-    atomic_write(&toml_path, &doc.to_string())
+    write_config_toml_path(&toml_path, &doc.to_string())
 }
 
 /// Set a value in a toml_edit document using a dotted path, creating intermediate tables.
@@ -846,6 +867,7 @@ active = "default"
 url = ""
 id = ""
 token = ""
+psk = ""
 enabled = true
 
 [launch]
@@ -1176,9 +1198,30 @@ fn atomic_write(path: &std::path::Path, content: &str) -> std::io::Result<()> {
     crate::paths::atomic_write_io(path, content)
 }
 
+pub fn write_config_toml_path(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    atomic_write(path, content)?;
+    lock_down_config_permissions(path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn lock_down_config_permissions(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut perms = std::fs::metadata(path)?.permissions();
+    perms.set_mode(0o600);
+    std::fs::set_permissions(path, perms)
+}
+
+#[cfg(not(unix))]
+fn lock_down_config_permissions(_path: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hooks::test_helpers::isolated_test_env;
     use serial_test::serial;
     use std::env;
 
@@ -1538,6 +1581,25 @@ mod tests {
     }
 
     #[test]
+    fn test_to_env_dict_never_exposes_relay_psk() {
+        // The PSK is the decrypt/forge authority for the whole relay group.
+        // `build_launch_env` feeds `to_env_dict` into every spawned child
+        // process's environment, so anything emitted here crosses a
+        // process boundary. The PSK must stay file-only — verified by
+        // checking that even a populated field is suppressed.
+        let mut config = HcomConfig::default();
+        config.relay_psk = "an-example-secret-value-xxxxxxxxxxxxxxxxxxxxxxxx".to_string();
+        let dict = config.to_env_dict();
+        assert!(!dict.contains_key("HCOM_RELAY_PSK"));
+        for v in dict.values() {
+            assert!(
+                !v.contains("an-example-secret-value"),
+                "PSK leaked into launch env dict: {v}"
+            );
+        }
+    }
+
+    #[test]
     fn test_load_from_sources_empty() {
         let file_config = HashMap::new();
         let env = HashMap::new();
@@ -1879,5 +1941,25 @@ active = "default"
 
         let presets = load_toml_presets(&path);
         assert!(presets.is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn test_save_toml_config_sets_mode_600_for_secret_bearing_config() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let mut config = HcomConfig::default();
+        config.relay_psk = "super-secret-psk".to_string();
+
+        save_toml_config(&config, None).unwrap();
+
+        let mode = std::fs::metadata(paths::config_toml_path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
     }
 }

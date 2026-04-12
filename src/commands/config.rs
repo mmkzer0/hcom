@@ -290,7 +290,7 @@ pub fn config_set(key: &str, value: &str) -> Result<(), String> {
         }
     }
 
-    std::fs::write(&path, doc.to_string())
+    crate::config::write_config_toml_path(&path, &doc.to_string())
         .map_err(|e| format!("Failed to write config.toml: {e}"))?;
 
     Ok(())

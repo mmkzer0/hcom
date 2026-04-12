@@ -17,10 +17,12 @@ use std::time::{Duration, Instant};
 use crate::config::HcomConfig;
 use crate::db::HcomDb;
 use crate::log;
+use serde_json::json;
 
+use super::replay::ReplayGuard;
 use super::{
-    get_broker_from_config, is_relay_enabled, read_device_uuid, set_relay_status, state_topic,
-    wildcard_topic,
+    get_broker_from_config, is_relay_enabled, load_psk, read_device_uuid, set_relay_status,
+    state_topic, wildcard_topic,
 };
 
 /// Build a TLS config that combines webpki-roots (bundled Mozilla CAs for Android/Termux
@@ -95,6 +97,11 @@ pub struct MqttRelay {
     client: Client,
     relay_id: String,
     device_uuid: String,
+    /// Active sealing key. Guarded by a mutex so future refactors cannot
+    /// accidentally make concurrent access compile.
+    psk: Mutex<[u8; 32]>,
+    /// Replay guard (clock-skew + nonce LRU).
+    replay_guard: Mutex<ReplayGuard>,
     /// Channel to receive commands (push, shutdown) from external callers.
     cmd_rx: mpsc::Receiver<RelayCommand>,
     /// Push interval (seconds between automatic push cycles).
@@ -117,6 +124,8 @@ impl MqttRelay {
         }
 
         let (host, port, use_tls) = get_broker_from_config(config).ok_or("no broker configured")?;
+
+        let psk = load_psk(config)?;
 
         let relay_id = config.relay_id.clone();
         let device_uuid = read_device_uuid();
@@ -158,6 +167,8 @@ impl MqttRelay {
             client,
             relay_id,
             device_uuid,
+            psk: Mutex::new(psk),
+            replay_guard: Mutex::new(ReplayGuard::default()),
             cmd_rx,
             push_interval: Duration::from_secs(5),
         };
@@ -312,7 +323,7 @@ impl MqttRelay {
                 Packet::Publish(publish) => {
                     let topic = String::from_utf8_lossy(&publish.topic).to_string();
                     let payload = publish.payload.to_vec();
-                    self.handle_incoming_message(&topic, &payload)
+                    self.handle_incoming_message(&topic, &payload, publish.retain)
                 }
                 Packet::Disconnect(_) => {
                     *connected = false;
@@ -329,8 +340,9 @@ impl MqttRelay {
     ///
     /// Topic layout: `{relay_id}/{device_uuid}` for state snapshots,
     /// `{relay_id}/control` for control events. Empty payload on a state topic
-    /// means "device gone" (LWT or graceful cleanup).
-    fn handle_incoming_message(&self, topic: &str, payload: &[u8]) -> bool {
+    /// means "device gone" (LWT or graceful cleanup) — special-cased before
+    /// any decrypt attempt because it carries no plaintext.
+    fn handle_incoming_message(&self, topic: &str, payload: &[u8], is_retained: bool) -> bool {
         let prefix = format!("{}/", self.relay_id);
         if !topic.starts_with(&prefix) {
             return false; // Not our relay group
@@ -346,22 +358,87 @@ impl MqttRelay {
         };
 
         if payload.is_empty() {
-            // Empty payload = device disconnected (LWT or graceful cleanup)
             if !suffix.is_empty() && suffix != "control" {
-                super::pull::handle_device_gone(&db, suffix);
+                ignore_unauthenticated_empty_state(&db, suffix);
             }
             return false;
         }
 
+        let psk = match self.psk.lock() {
+            Ok(guard) => {
+                let psk = *guard;
+                drop(guard);
+                psk
+            }
+            Err(e) => {
+                log::log_error("relay", "relay.psk_lock_err", &format!("{}", e));
+                return false;
+            }
+        };
+        let mut guard = match self.replay_guard.lock() {
+            Ok(guard) => guard,
+            Err(e) => {
+                log::log_error("relay", "relay.replay_lock_err", &format!("{}", e));
+                return false;
+            }
+        };
+
         if suffix == "control" {
-            super::pull::handle_control_message(&db, payload, &self.device_uuid)
+            super::pull::handle_control_message(
+                &db,
+                payload,
+                &self.device_uuid,
+                &psk,
+                &self.relay_id,
+                topic,
+                &mut guard,
+            )
         } else {
             // State message from a remote device
             let device_id = suffix;
             if device_id == self.device_uuid {
                 return false; // Ignore own messages
             }
-            super::pull::handle_state_message(&db, device_id, payload, &self.device_uuid)
+            super::pull::handle_state_message(
+                &db,
+                device_id,
+                payload,
+                &self.device_uuid,
+                &psk,
+                &self.relay_id,
+                topic,
+                is_retained,
+                &mut guard,
+            )
+        }
+    }
+
+    /// Re-read the active PSK from disk. This is a best-effort escape hatch for
+    /// same-namespace config changes; full relay resets still restart the worker.
+    fn reload_psk_if_changed(&self) {
+        let cfg = match HcomConfig::load(None) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        if let Ok(new) = load_psk(&cfg) {
+            let mut psk = match self.psk.lock() {
+                Ok(psk) => psk,
+                Err(e) => {
+                    log::log_error("relay", "relay.psk_lock_err", &format!("{}", e));
+                    return;
+                }
+            };
+            if new != *psk {
+                log::log_info(
+                    "relay",
+                    "relay.psk_reload",
+                    &format!(
+                        "active key reloaded to fingerprint={}",
+                        super::crypto::fingerprint(&new)
+                    ),
+                );
+                *psk = new;
+            }
         }
     }
 
@@ -375,10 +452,26 @@ impl MqttRelay {
             }
         };
 
+        self.reload_psk_if_changed();
+        let psk = match self.psk.lock() {
+            Ok(psk) => *psk,
+            Err(e) => {
+                log::log_error("relay", "relay.psk_lock_err", &format!("{}", e));
+                return;
+            }
+        };
+
         // Drain loop with 10s budget
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            match super::push::push(&db, &self.client, &self.relay_id, &self.device_uuid, true) {
+            match super::push::push(
+                &db,
+                &self.client,
+                &self.relay_id,
+                &self.device_uuid,
+                &psk,
+                true,
+            ) {
                 Ok((true, has_more)) => {
                     if has_more && Instant::now() < deadline {
                         continue; // More events to drain
@@ -450,6 +543,17 @@ impl MqttRelay {
     pub fn device_uuid(&self) -> &str {
         &self.device_uuid
     }
+}
+
+fn ignore_unauthenticated_empty_state(_db: &HcomDb, device_id: &str) {
+    log::log_warn(
+        "relay",
+        "relay.empty_state_ignored",
+        &format!(
+            "ignored unauthenticated empty retained payload for device={}",
+            &device_id[..8.min(device_id.len())]
+        ),
+    );
 }
 
 /// Tracks PUBACK or connection error for an ephemeral publish.
@@ -591,7 +695,8 @@ pub fn create_ephemeral_client(config: &HcomConfig) -> Option<EphemeralClient> {
     Some(EphemeralClient { client, pub_result })
 }
 
-/// Publish empty retained to clear device state and disconnect an ephemeral client.
+/// Publish an authenticated retained tombstone to clear device state and
+/// disconnect an ephemeral client. Literal empty MQTT payloads are ignored.
 pub fn clear_retained_state(config: &HcomConfig) -> bool {
     if config.relay_id.is_empty() {
         return false;
@@ -600,6 +705,22 @@ pub fn clear_retained_state(config: &HcomConfig) -> bool {
 
     let device_uuid = read_device_uuid();
     let topic = state_topic(relay_id, &device_uuid);
+    let psk = match load_psk(config) {
+        Ok(psk) => psk,
+        Err(_) => return false,
+    };
+    let payload = match serde_json::to_vec(&json!({
+        "state": serde_json::Value::Null,
+        "events": [],
+    })) {
+        Ok(payload) => payload,
+        Err(_) => return false,
+    };
+    let ts_secs = crate::shared::time::now_epoch_f64() as u64;
+    let sealed = match super::crypto::seal(&psk, relay_id, &topic, &payload, ts_secs) {
+        Ok(sealed) => sealed,
+        Err(_) => return false,
+    };
 
     let client = match create_ephemeral_client(config) {
         Some(c) => c,
@@ -610,10 +731,34 @@ pub fn clear_retained_state(config: &HcomConfig) -> bool {
         &topic,
         QoS::AtLeastOnce,
         true,
-        vec![],
+        sealed,
         Duration::from_secs(5),
     );
 
     client.disconnect();
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hooks::test_helpers::isolated_test_env;
+    use serial_test::serial;
+
+    #[test]
+    #[serial]
+    fn test_ignore_unauthenticated_empty_state_does_not_delete_peer_instances() {
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, origin_device_id, created_at) VALUES (?1, ?2, ?3)",
+                rusqlite::params!["luna:ABCD", "device-1234", 1.0],
+            )
+            .unwrap();
+
+        ignore_unauthenticated_empty_state(&db, "device-1234");
+
+        assert!(db.get_instance_full("luna:ABCD").unwrap().is_some());
+    }
 }

@@ -13,15 +13,18 @@ use crate::launcher::{self, LaunchParams};
 use crate::log;
 
 use super::{
-    control_topic, device_short_id, is_relay_enabled, read_device_uuid, safe_kv_get, safe_kv_set,
+    control_topic, crypto, device_short_id, is_relay_enabled, load_psk, read_device_uuid,
+    safe_kv_get, safe_kv_set,
 };
 
-/// Build RPC control payload JSON bytes. Returns (topic, payload_bytes) or None.
-pub fn build_rpc_control_payload(
+/// Build a sealed RPC control envelope ready to publish. Returns the topic and
+/// the AEAD-sealed bytes; the underlying JSON layout is unchanged from the
+/// pre-encryption format so callers don't have to know about the cipher.
+fn build_control_payload(
     config: &HcomConfig,
     action: &str,
     target_device_short_id: &str,
-    request_id: &str,
+    request_id: Option<&str>,
     params: &serde_json::Value,
 ) -> Option<(String, Vec<u8>)> {
     if !is_relay_enabled(config) {
@@ -33,9 +36,27 @@ pub fn build_rpc_control_payload(
         return None;
     }
 
+    let psk = match load_psk(config) {
+        Ok(p) => p,
+        Err(e) => {
+            crate::log::log_warn("relay", "relay.psk_missing", &e);
+            return None;
+        }
+    };
+
     let device_id = read_device_uuid();
     let short_id = device_short_id(&device_id);
     let now = crate::shared::time::now_epoch_f64();
+    let mut control_data = json!({
+        "action": action,
+        "target_device": target_device_short_id,
+        "from": format!("_:{}", short_id),
+        "from_device": device_id,
+        "params": params,
+    });
+    if let Some(request_id) = request_id {
+        control_data["request_id"] = Value::String(request_id.to_string());
+    }
 
     let control_payload = json!({
         "from_device": device_id,
@@ -43,33 +64,42 @@ pub fn build_rpc_control_payload(
             "ts": now,
             "type": "control",
             "instance": "_control",
-            "data": {
-                "action": action,
-                "target_device": target_device_short_id,
-                "from": format!("_:{}", short_id),
-                "from_device": device_id,
-                "request_id": request_id,
-                "params": params,
-            },
+            "data": control_data,
         }],
     });
 
     let topic = control_topic(relay_id);
-    let payload_bytes = serde_json::to_vec(&control_payload).ok()?;
-    Some((topic, payload_bytes))
+    let plaintext = serde_json::to_vec(&control_payload).ok()?;
+    let sealed = crypto::seal(&psk, relay_id, &topic, &plaintext, now as u64).ok()?;
+    Some((topic, sealed))
 }
 
-fn send_rpc_control_via_ephemeral(
+pub fn build_rpc_control_payload(
     config: &HcomConfig,
-    client: &super::client::EphemeralClient,
     action: &str,
     target_device_short_id: &str,
     request_id: &str,
     params: &serde_json::Value,
+) -> Option<(String, Vec<u8>)> {
+    build_control_payload(
+        config,
+        action,
+        target_device_short_id,
+        Some(request_id),
+        params,
+    )
+}
+
+fn send_control_via_ephemeral(
+    config: &HcomConfig,
+    client: &super::client::EphemeralClient,
+    action: &str,
+    target_device_short_id: &str,
+    request_id: Option<&str>,
+    params: &serde_json::Value,
 ) -> bool {
     let (topic, payload_bytes) =
-        match build_rpc_control_payload(config, action, target_device_short_id, request_id, params)
-        {
+        match build_control_payload(config, action, target_device_short_id, request_id, params) {
             Some(v) => v,
             None => return false,
         };
@@ -83,17 +113,27 @@ fn send_rpc_control_via_ephemeral(
     );
 
     if result {
-        log::log_with_fields(
-            "INFO",
-            "relay",
-            "relay.control",
-            "",
-            &[
-                ("action", action),
-                ("target", target_device_short_id),
-                ("request_id", request_id),
-            ],
-        );
+        if let Some(request_id) = request_id {
+            log::log_with_fields(
+                "INFO",
+                "relay",
+                "relay.control",
+                "",
+                &[
+                    ("action", action),
+                    ("target", target_device_short_id),
+                    ("request_id", request_id),
+                ],
+            );
+        } else {
+            log::log_with_fields(
+                "INFO",
+                "relay",
+                "relay.control",
+                "",
+                &[("action", action), ("target", target_device_short_id)],
+            );
+        }
     } else {
         log::log_warn("relay", "relay.network", "control: PUBACK timeout");
     }
@@ -114,12 +154,36 @@ pub fn send_rpc_control_ephemeral(
         None => return false,
     };
 
-    let result = send_rpc_control_via_ephemeral(
+    let result = send_control_via_ephemeral(
         config,
         &ephemeral,
         action,
         target_device_short_id,
-        request_id,
+        Some(request_id),
+        params,
+    );
+
+    ephemeral.disconnect();
+    result
+}
+
+pub fn send_one_way_control_ephemeral(
+    config: &HcomConfig,
+    action: &str,
+    target_device_short_id: &str,
+    params: &serde_json::Value,
+) -> bool {
+    let ephemeral = match super::client::create_ephemeral_client(config) {
+        Some(c) => c,
+        None => return false,
+    };
+
+    let result = send_control_via_ephemeral(
+        config,
+        &ephemeral,
+        action,
+        target_device_short_id,
+        None,
         params,
     );
 
@@ -178,7 +242,7 @@ pub fn send_rpc_request_and_wait_with_db(
     params: &serde_json::Value,
     timeout: Duration,
 ) -> Result<Value, String> {
-    if !super::worker::is_relay_worker_running() {
+    if !super::worker::ensure_worker(false) {
         return Err("relay worker not running - start with: hcom relay on".to_string());
     }
     ensure_remote_action_supported(target_device_short_id, action, target_name)?;
@@ -190,7 +254,7 @@ pub fn send_rpc_request_and_wait_with_db(
 }
 
 pub fn require_successful_rpc_result(response: Value) -> Result<Value, String> {
-    if response.get("ok").and_then(|v| v.as_bool()).unwrap_or(true) {
+    if response.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
         return Ok(response);
     }
 
@@ -262,6 +326,10 @@ pub const RPC_DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Longer timeout for remote launch, which may need to pull a model and start a process.
 pub const RPC_LAUNCH_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Remote resume waits on a real relaunch on the target device, so it can
+/// legitimately take longer than the generic term/config/kill RPC budget.
+pub const RPC_RESUME_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Split a target name like "luna:ABCD" into ("luna", "ABCD").
 /// Only returns Some when the suffix is exactly 4 uppercase alphanumeric characters —
 /// the format used for device short IDs. This prevents plain colons in agent names
@@ -287,6 +355,7 @@ const REMOTE_RPC_HANDLERS: &[(&str, RemoteRpcHandler)] = &[
     ("resume", handle_remote_resume),
     ("config_get", handle_remote_config_get),
     ("config_set", handle_remote_config_set),
+    ("relay_off", handle_remote_relay_off),
     ("term_screen", handle_remote_term_screen),
     ("term_inject", handle_remote_term_inject),
     ("transcript", handle_remote_transcript),
@@ -304,6 +373,10 @@ fn find_remote_rpc_handler(action: &str) -> Option<RemoteRpcHandler> {
         .iter()
         .find(|(name, _)| *name == action)
         .map(|(_, handler)| *handler)
+}
+
+fn allows_one_way_remote_action(action: &str) -> bool {
+    action == "relay_off"
 }
 
 /// Three distinct states a remote peer's capability advertisement can be in.
@@ -652,6 +725,9 @@ fn handle_remote_config_get(
 ) -> Result<Value, String> {
     if let Some(instance) = optional_param(params, "instance") {
         let key = optional_param(params, "field");
+        if let Some(field) = key {
+            reject_remote_secret_field(field)?;
+        }
         return crate::commands::config::config_instance_get(db, instance, key);
     }
     let fields = params
@@ -662,6 +738,7 @@ fn handle_remote_config_get(
     let mut values = serde_json::Map::new();
     for field in fields {
         if let Some(field_str) = field.as_str() {
+            reject_remote_secret_field(field_str)?;
             let normalized = normalize_config_field(field_str);
             let (value, source) = crate::commands::config::config_get(&normalized);
             values.insert(
@@ -681,14 +758,57 @@ fn handle_remote_config_set(
 ) -> Result<Value, String> {
     if let Some(instance) = optional_param(params, "instance") {
         let field = required_param(params, "field")?;
+        reject_remote_secret_field(field)?;
         let value = required_param(params, "value")?;
         return crate::commands::config::config_instance_set(db, instance, field, value);
     }
     let field = required_param(params, "field")?;
+    reject_remote_secret_field(field)?;
     let value = required_param(params, "value")?;
     let normalized = normalize_config_field(field);
     crate::commands::config::config_set(&normalized, value)?;
     Ok(json!({"field": field, "value": value}))
+}
+
+fn reject_remote_secret_field(field: &str) -> Result<(), String> {
+    let normalized = normalize_config_field(field);
+    let secret = match normalized.as_str() {
+        "HCOM_RELAY_PSK" => "relay_psk",
+        "HCOM_RELAY_TOKEN" => "relay_token",
+        "HCOM_RELAY_ID" => "relay_id",
+        "HCOM_RELAY" => "relay",
+        _ => return Ok(()),
+    };
+    Err(format!("{secret} is not remotely queryable"))
+}
+
+pub fn disable_local_relay(config: &HcomConfig) -> Result<bool, String> {
+    let cleared_remote_state = if config.relay_enabled {
+        super::client::clear_retained_state(config)
+    } else {
+        false
+    };
+    crate::commands::config::config_set("relay_enabled", "false")?;
+    Ok(cleared_remote_state)
+}
+
+fn handle_remote_relay_off(
+    _db: &HcomDb,
+    _params: &Value,
+    _initiated_by: &str,
+    config: &HcomConfig,
+) -> Result<Value, String> {
+    let cleared_remote_state = disable_local_relay(config)?;
+    if super::worker::is_relay_worker_running() {
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(100));
+            let _ = super::worker::stop_relay_worker();
+        });
+    }
+    Ok(json!({
+        "disabled": true,
+        "cleared_remote_state": cleared_remote_state,
+    }))
 }
 
 fn handle_remote_term_screen(
@@ -794,16 +914,27 @@ pub fn handle_control_events(
                 let Some(handler) = find_remote_rpc_handler(action) else {
                     continue;
                 };
-                if request_id.is_empty() {
+                if request_id.is_empty() && !allows_one_way_remote_action(action) {
                     continue;
                 }
-                produced_rpc_results = true;
                 let initiated_by = data
                     .get("from")
                     .and_then(|v| v.as_str())
                     .unwrap_or("remote");
                 let rpc_result = handler(db, &params, initiated_by, &config);
 
+                if request_id.is_empty() {
+                    if let Err(error) = rpc_result {
+                        log::log_warn(
+                            "relay",
+                            "relay.control_one_way_err",
+                            &format!("action={} error={}", action, error),
+                        );
+                    }
+                    continue;
+                }
+
+                produced_rpc_results = true;
                 match rpc_result {
                     Ok(result) => {
                         let ok = result.get("ok").and_then(|v| v.as_bool()).unwrap_or(true);
@@ -921,7 +1052,9 @@ mod tests {
     fn test_build_rpc_control_payload_includes_request_id_and_params() {
         let mut config = HcomConfig::default();
         config.relay_id = "relay-1".to_string();
-        let (_, payload) = build_rpc_control_payload(
+        let psk = [0x55u8; 32];
+        config.relay_psk = super::super::encode_psk(&psk);
+        let (topic, sealed) = build_rpc_control_payload(
             &config,
             "launch",
             "WXYZ",
@@ -929,7 +1062,11 @@ mod tests {
             &json!({"tool": "claude", "count": 1}),
         )
         .expect("payload");
-        let parsed: Value = serde_json::from_slice(&payload).unwrap();
+        // Build path now produces a sealed envelope; opening with the same PSK
+        // returns the original JSON.
+        let plaintext =
+            super::super::crypto::open(&psk, &config.relay_id, &topic, &sealed).expect("open");
+        let parsed: Value = serde_json::from_slice(&plaintext).unwrap();
         let data = &parsed["events"][0]["data"];
         assert_eq!(data["action"], "launch");
         assert_eq!(data["target_device"], "WXYZ");
@@ -1065,6 +1202,24 @@ mod tests {
     }
 
     #[test]
+    fn test_handle_control_events_relay_off_disables_local_relay() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let mut config = HcomConfig::default();
+        config.relay = "mqtts://broker.emqx.io:8883".to_string();
+        config.relay_id = "relay-1".to_string();
+        config.relay_psk = super::super::encode_psk(&[0x22; 32]);
+        config.relay_enabled = true;
+        crate::config::save_toml_config(&config, None).unwrap();
+
+        let db = test_db();
+        let loaded = HcomConfig::load(None).unwrap();
+        let result = handle_remote_relay_off(&db, &json!({}), "_:EFGH", &loaded).unwrap();
+        assert_eq!(result["disabled"], true);
+        let updated = HcomConfig::load(None).unwrap();
+        assert!(!updated.relay_enabled);
+    }
+
+    #[test]
     fn test_require_successful_rpc_result_returns_error_for_failed_response() {
         let err = require_successful_rpc_result(json!({
             "action": "resume",
@@ -1173,10 +1328,63 @@ mod tests {
                 "resume",
                 "config_get",
                 "config_set",
+                "relay_off",
                 "term_screen",
                 "term_inject",
                 "transcript",
             ]
         );
+    }
+
+    #[test]
+    fn test_handle_remote_config_get_blocks_relay_psk() {
+        let db = test_db();
+        let err = handle_remote_config_get(
+            &db,
+            &json!({"fields": ["relay_psk"]}),
+            "initiator",
+            &HcomConfig::default(),
+        )
+        .unwrap_err();
+        assert_eq!(err, "relay_psk is not remotely queryable");
+    }
+
+    #[test]
+    fn test_handle_remote_config_get_blocks_relay_psk_for_instance_mode() {
+        let db = test_db();
+        let err = handle_remote_config_get(
+            &db,
+            &json!({"instance": "luna", "field": "relay_psk"}),
+            "initiator",
+            &HcomConfig::default(),
+        )
+        .unwrap_err();
+        assert_eq!(err, "relay_psk is not remotely queryable");
+    }
+
+    #[test]
+    fn test_handle_remote_config_set_blocks_relay_psk() {
+        let db = test_db();
+        let err = handle_remote_config_set(
+            &db,
+            &json!({"field": "relay_psk", "value": "secret"}),
+            "initiator",
+            &HcomConfig::default(),
+        )
+        .unwrap_err();
+        assert_eq!(err, "relay_psk is not remotely queryable");
+    }
+
+    #[test]
+    fn test_handle_remote_config_set_blocks_relay_psk_for_instance_mode() {
+        let db = test_db();
+        let err = handle_remote_config_set(
+            &db,
+            &json!({"instance": "luna", "field": "relay_psk", "value": "secret"}),
+            "initiator",
+            &HcomConfig::default(),
+        )
+        .unwrap_err();
+        assert_eq!(err, "relay_psk is not remotely queryable");
     }
 }

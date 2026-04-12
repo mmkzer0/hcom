@@ -9,8 +9,10 @@
 pub mod broker;
 pub mod client;
 pub mod control;
+pub mod crypto;
 pub mod pull;
 pub mod push;
+pub mod replay;
 pub mod token;
 pub mod worker;
 
@@ -30,6 +32,43 @@ pub const DEFAULT_BROKERS: &[(&str, u16)] = &[
 /// Check if relay is configured AND enabled (relay_id set + relay_enabled flag).
 pub fn is_relay_enabled(config: &HcomConfig) -> bool {
     !config.relay_id.is_empty() && config.relay_enabled
+}
+
+/// Decode the configured 32-byte PSK from the base64 stored in `relay.psk`.
+///
+/// Returns `Err` if the field is empty or malformed. Callers that need to
+/// publish or open envelopes (worker, control sender) treat this as fatal —
+/// the user must rerun `hcom relay new` to regenerate a key.
+pub fn load_psk(config: &HcomConfig) -> Result<[u8; 32], String> {
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+    if config.relay_psk.is_empty() {
+        return Err(
+            "relay key not set — run `hcom relay new` to generate one and re-share the token"
+                .to_string(),
+        );
+    }
+    let trimmed = config.relay_psk.trim_end_matches('=');
+    let bytes = URL_SAFE_NO_PAD
+        .decode(trimmed.as_bytes())
+        .map_err(|e| format!("relay key is not valid base64: {e}"))?;
+    if bytes.len() != 32 {
+        return Err(format!(
+            "relay key must be 32 bytes after decoding, got {}",
+            bytes.len()
+        ));
+    }
+    let mut psk = [0u8; 32];
+    psk.copy_from_slice(&bytes);
+    Ok(psk)
+}
+
+/// Encode a 32-byte PSK as base64url (no padding) for storage in config.toml.
+pub fn encode_psk(psk: &[u8; 32]) -> String {
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    URL_SAFE_NO_PAD.encode(psk)
 }
 
 /// State topic: {relay_id}/{device_uuid} — retained, one per device.

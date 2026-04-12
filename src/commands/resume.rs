@@ -122,7 +122,7 @@ pub fn do_resume(
                 "extra_args": extra_args,
                 "launcher": launcher_name,
             }),
-            crate::relay::control::RPC_DEFAULT_TIMEOUT,
+            crate::relay::control::RPC_RESUME_TIMEOUT,
         )
         .map_err(anyhow::Error::msg)?;
         let launch_result =
@@ -311,8 +311,7 @@ fn prepare_resume_plan(
     };
     let output_tag = effective_tag.clone();
     let launch_tag = effective_tag.clone();
-    let base_system_prompt =
-        resume_system_prompt(&tool, &name, fork, fork_child_name.as_deref());
+    let base_system_prompt = resume_system_prompt(&tool, &name, fork, fork_child_name.as_deref());
     let effective_system_prompt = match launch_flags.system_prompt.as_deref() {
         Some(custom) if !custom.trim().is_empty() => format!("{base_system_prompt}\n\n{custom}"),
         _ => base_system_prompt,
@@ -433,10 +432,7 @@ fn execute_prepared_resume_result(
             crate::instances::update_instance_position(
                 db,
                 child_name,
-                &serde_json::Map::from_iter([(
-                    "last_event_id".to_string(),
-                    json!(current_max),
-                )]),
+                &serde_json::Map::from_iter([("last_event_id".to_string(), json!(current_max))]),
             );
         }
     }
@@ -1023,9 +1019,18 @@ mod tests {
     fn test_resume_system_prompt_non_codex_fork_states_new_identity() {
         let prompt = resume_system_prompt("claude", "luna", true, Some("feri"));
         assert!(prompt.contains("feri"), "should name the new identity");
-        assert!(prompt.contains("--name feri"), "should state the --name flag");
-        assert!(!prompt.contains("Run hcom start"), "should not tell agent to rebind");
-        assert!(!prompt.contains("You are still 'luna'"), "should not resume as parent");
+        assert!(
+            prompt.contains("--name feri"),
+            "should state the --name flag"
+        );
+        assert!(
+            !prompt.contains("Run hcom start"),
+            "should not tell agent to rebind"
+        );
+        assert!(
+            !prompt.contains("You are still 'luna'"),
+            "should not resume as parent"
+        );
 
         // None path falls back to already-assigned wording (no child name available)
         let prompt_none = resume_system_prompt("claude", "luna", true, None);

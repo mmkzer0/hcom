@@ -44,10 +44,12 @@ uuid = { version = "1.23.0", features = ["v4"] }
 rumqttc = { version = "0.25.1", default-features = false, features = ["use-rustls"] }
 base64 = "0.22"
 sha2 = "0.11.0"
+chacha20poly1305 = "0.10"
 bytes = "1"
 rustls = "0.23.37"
 webpki-roots = "1.0.6"
 rustls-native-certs = "0.8.3"
+lru = "0.16"
 
 [dev-dependencies]
 serial_test = "3"

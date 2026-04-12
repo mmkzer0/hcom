@@ -12,12 +12,12 @@ use crate::config::HcomConfig;
 use crate::db::HcomDb;
 use crate::log;
 
+use super::crypto;
 use super::{device_short_id, safe_kv_get, safe_kv_set, set_relay_status, state_topic};
 
 /// Build current instance state snapshot for publishing.
 /// Only includes local instances (no origin_device_id).
-pub fn build_state(db: &HcomDb) -> Value {
-    let device_uuid = super::read_device_uuid();
+pub fn build_state(db: &HcomDb, device_uuid: &str) -> Value {
     let short_id = device_short_id(&device_uuid);
 
     let instances = match db.conn().prepare(
@@ -111,8 +111,8 @@ pub fn build_state(db: &HcomDb) -> Value {
 
 /// Build push payload: state + events, returning (state, events, max_event_id, has_more).
 /// Fetches 101 rows, sends first 100 — has_more=true if 101st exists.
-pub fn build_push_payload(db: &HcomDb) -> (Value, Vec<Value>, i64, bool) {
-    let state = build_state(db);
+pub fn build_push_payload(db: &HcomDb, device_uuid: &str) -> (Value, Vec<Value>, i64, bool) {
+    let state = build_state(db, device_uuid);
 
     let last_push_id: i64 = safe_kv_get(db, "relay_last_push_id")
         .and_then(|s| s.parse().ok())
@@ -172,18 +172,23 @@ pub fn push(
     client: &Client,
     relay_id: &str,
     device_uuid: &str,
+    psk: &[u8; 32],
     is_worker: bool,
 ) -> Result<(bool, bool), String> {
-    let (state, events, max_id, has_more) = build_push_payload(db);
+    let (state, events, max_id, has_more) = build_push_payload(db, device_uuid);
 
     let payload = json!({
         "state": state,
         "events": events,
     });
     let payload_bytes = serde_json::to_vec(&payload).map_err(|e| format!("json: {}", e))?;
-    let payload_len = payload_bytes.len();
 
     let topic = state_topic(relay_id, device_uuid);
+    let now_secs = crate::shared::time::now_epoch_f64() as u64;
+    let sealed = crypto::seal(psk, relay_id, &topic, &payload_bytes, now_secs)
+        .map_err(|e| format!("seal: {}", e))?;
+    let payload_len = sealed.len();
+
     let t0 = Instant::now();
 
     // Blocking publish — waits for rumqttc's internal channel to accept the message.
@@ -194,7 +199,7 @@ pub fn push(
     // doesn't expose per-message PUBACK tracking, so we advance the cursor after
     // successful enqueue and rely on rumqttc's QoS retransmission for reliability.
     client
-        .publish(&topic, QoS::AtLeastOnce, true, payload_bytes)
+        .publish(&topic, QoS::AtLeastOnce, true, sealed)
         .map_err(|e| format!("publish: {}", e))?;
 
     let publish_ms = t0.elapsed().as_millis();
