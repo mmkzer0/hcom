@@ -1044,7 +1044,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                         &paths::hcom_dir(),
                         &instance_name,
                         "codex",
-                        false,
+                        params.background,
                         true, // is_launched
                         "",
                         &effective_tag,

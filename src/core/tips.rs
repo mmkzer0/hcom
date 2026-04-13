@@ -188,7 +188,7 @@ pub fn print_launch_tips(db: &HcomDb, ctx: LaunchTipsContext<'_>) {
             );
         }
 
-        if is_tmux {
+        if is_tmux || ctx.background {
             once(
                 db,
                 &mut tips,
