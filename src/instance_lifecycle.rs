@@ -744,7 +744,7 @@ fn cleanup_stale_remote_instances(db: &HcomDb) {
                 crate::log::log_info(
                     "cleanup",
                     "remote_device_stale",
-                    &device_id[..8.min(device_id.len())],
+                    crate::relay::device_id_prefix(&device_id),
                 );
             }
         }

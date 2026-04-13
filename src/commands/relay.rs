@@ -388,7 +388,6 @@ fn known_remote_device_shorts(db: &HcomDb) -> Vec<String> {
         }
     }
     shorts.sort();
-    shorts.dedup();
     shorts
 }
 

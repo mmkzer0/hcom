@@ -281,7 +281,7 @@ fn prepare_resume_plan(
         resolve_launcher_name(db, flags, std::env::var("HCOM_PROCESS_ID").ok().as_deref());
     let launcher_name_for_output = launcher_name.clone();
     let fork_child_name = if fork {
-        let (alive_names, taken_names) = crate::instance_names::collect_taken_names(&db)?;
+        let (alive_names, taken_names) = crate::instance_names::collect_taken_names(db)?;
         let candidate = crate::instance_names::allocate_name(
             &|n| taken_names.contains(n) || db.get_instance_full(n).ok().flatten().is_some(),
             &alive_names,
@@ -321,7 +321,7 @@ fn prepare_resume_plan(
     };
     let output_tag = effective_tag.clone();
     let launch_tag = effective_tag.clone();
-    let base_system_prompt = resume_system_prompt(&tool, &name, fork, fork_child_name.as_deref());
+    let base_system_prompt = resume_system_prompt(&tool, name, fork, fork_child_name.as_deref());
     let effective_system_prompt = match launch_flags.system_prompt.as_deref() {
         Some(custom) if !custom.trim().is_empty() => format!("{base_system_prompt}\n\n{custom}"),
         _ => base_system_prompt,

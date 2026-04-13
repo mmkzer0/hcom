@@ -245,7 +245,7 @@ pub fn send_rpc_request_and_wait_with_db(
     if !super::worker::ensure_worker(false) {
         return Err("relay worker not running - start with: hcom relay on".to_string());
     }
-    ensure_remote_action_supported(target_device_short_id, action, target_name)?;
+    ensure_remote_action_supported(db, target_device_short_id, action, target_name)?;
     let request_id = uuid::Uuid::new_v4().to_string();
     if !send_rpc_control_ephemeral(config, action, target_device_short_id, &request_id, params) {
         return Err(format!("failed to send {} request", action));
@@ -365,7 +365,7 @@ const REMOTE_RPC_HANDLERS: &[(&str, RemoteRpcHandler)] = &[
     ("transcript", handle_remote_transcript),
 ];
 
-pub fn advertised_remote_capabilities(_config: &HcomConfig) -> Vec<&'static str> {
+pub fn advertised_remote_capabilities() -> Vec<&'static str> {
     REMOTE_RPC_HANDLERS
         .iter()
         .map(|(action, _)| *action)
@@ -465,7 +465,7 @@ fn check_remote_action_for_db(
         // clear "timed out waiting for rpc_result" error.
         CachedCapabilities::Legacy => Ok(()),
         CachedCapabilities::Stale(age_secs) => {
-            let age_str = format_age(age_secs);
+            let age_str = crate::shared::time::format_age(age_secs as i64);
             Err(format!(
                 "device {target_device_short_id}{detail} is offline (last seen {age_str} ago) — is the remote relay worker running?"
             ))
@@ -476,51 +476,31 @@ fn check_remote_action_for_db(
     }
 }
 
-fn format_age(secs: u64) -> String {
-    if secs < 120 {
-        format!("{secs}s")
-    } else if secs < 7200 {
-        format!("{}m", secs / 60)
-    } else {
-        format!("{}h", secs / 3600)
-    }
-}
-
 fn ensure_remote_action_supported(
+    db: &HcomDb,
     target_device_short_id: &str,
     action: &str,
     target_name: Option<&str>,
 ) -> Result<(), String> {
     const RETRY_DELAY: Duration = Duration::from_millis(500);
 
-    let db = HcomDb::open().map_err(|e| e.to_string())?;
     for attempt in 0..3u32 {
         if attempt > 0 {
             std::thread::sleep(RETRY_DELAY);
         }
-        match read_remote_capabilities(&db, target_device_short_id)? {
+        match read_remote_capabilities(db, target_device_short_id)? {
             // Cache is warm or peer is stale — resolve immediately, no retry.
             CachedCapabilities::Advertised(_)
             | CachedCapabilities::Legacy
             | CachedCapabilities::Stale(_) => {
-                return check_remote_action_for_db(
-                    &db,
-                    target_device_short_id,
-                    action,
-                    target_name,
-                );
+                return check_remote_action_for_db(db, target_device_short_id, action, target_name);
             }
             CachedCapabilities::NotSynced => {
                 // Capabilities not yet synced; keep retrying
                 if attempt < 2 {
                     continue;
                 }
-                return check_remote_action_for_db(
-                    &db,
-                    target_device_short_id,
-                    action,
-                    target_name,
-                );
+                return check_remote_action_for_db(db, target_device_short_id, action, target_name);
             }
         }
     }
@@ -745,8 +725,10 @@ fn handle_remote_resume(
     _config: &HcomConfig,
 ) -> Result<Value, String> {
     let request = RemoteResumeRequest::from_params(params)?;
-    let mut flags = crate::router::GlobalFlags::default();
-    flags.name = request.launcher;
+    let flags = crate::router::GlobalFlags {
+        name: request.launcher,
+        ..Default::default()
+    };
     let result = crate::commands::resume::run_local_resume_result(
         db,
         &request.target,
@@ -950,40 +932,38 @@ pub fn handle_control_events(
             })
         });
 
-        match action {
-            action => {
-                let Some(handler) = find_remote_rpc_handler(action) else {
-                    continue;
-                };
-                if request_id.is_empty() && !allows_one_way_remote_action(action) {
-                    continue;
-                }
-                let initiated_by = data
-                    .get("from")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("remote");
-                let rpc_result = handler(db, &params, initiated_by, &config);
+        {
+            let Some(handler) = find_remote_rpc_handler(action) else {
+                continue;
+            };
+            if request_id.is_empty() && !allows_one_way_remote_action(action) {
+                continue;
+            }
+            let initiated_by = data
+                .get("from")
+                .and_then(|v| v.as_str())
+                .unwrap_or("remote");
+            let rpc_result = handler(db, &params, initiated_by, &config);
 
-                if request_id.is_empty() {
-                    if let Err(error) = rpc_result {
-                        log::log_warn(
-                            "relay",
-                            "relay.control_one_way_err",
-                            &format!("action={} error={}", action, error),
-                        );
-                    }
-                    continue;
+            if request_id.is_empty() {
+                if let Err(error) = rpc_result {
+                    log::log_warn(
+                        "relay",
+                        "relay.control_one_way_err",
+                        &format!("action={} error={}", action, error),
+                    );
                 }
+                continue;
+            }
 
-                produced_rpc_results = true;
-                match rpc_result {
-                    Ok(result) => {
-                        let ok = result.get("ok").and_then(|v| v.as_bool()).unwrap_or(true);
-                        emit_rpc_result(db, request_id, action, ok, &result);
-                    }
-                    Err(error) => {
-                        emit_rpc_result(db, request_id, action, false, &json!({ "error": error }));
-                    }
+            produced_rpc_results = true;
+            match rpc_result {
+                Ok(result) => {
+                    let ok = result.get("ok").and_then(|v| v.as_bool()).unwrap_or(true);
+                    emit_rpc_result(db, request_id, action, ok, &result);
+                }
+                Err(error) => {
+                    emit_rpc_result(db, request_id, action, false, &json!({ "error": error }));
                 }
             }
         }
@@ -1368,9 +1348,8 @@ mod tests {
 
     #[test]
     fn test_advertised_remote_capabilities_lists_all_handlers() {
-        let config = HcomConfig::default();
         assert_eq!(
-            advertised_remote_capabilities(&config),
+            advertised_remote_capabilities(),
             vec![
                 "launch",
                 "kill",

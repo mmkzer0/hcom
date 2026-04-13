@@ -129,7 +129,7 @@ impl MqttRelay {
 
         let relay_id = config.relay_id.clone();
         let device_uuid = read_device_uuid();
-        let client_id = format!("hcom-{}", &device_uuid[..8.min(device_uuid.len())]);
+        let client_id = format!("hcom-{}", super::device_id_prefix(&device_uuid));
 
         let mut mqttoptions = MqttOptions::new(&client_id, &host, port);
         mqttoptions.set_keep_alive(Duration::from_secs(30));
@@ -551,7 +551,7 @@ fn ignore_unauthenticated_empty_state(_db: &HcomDb, device_id: &str) {
         "relay.empty_state_ignored",
         &format!(
             "ignored unauthenticated empty retained payload for device={}",
-            &device_id[..8.min(device_id.len())]
+            super::device_id_prefix(device_id)
         ),
     );
 }

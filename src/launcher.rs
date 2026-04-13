@@ -134,28 +134,7 @@ pub struct LaunchResult {
 /// Find tool executable path with fallbacks.
 /// Claude has special fallback locations; other tools just use PATH.
 fn find_tool_path(tool: &str) -> Option<String> {
-    // First check PATH
-    if let Some(path) = crate::terminal::which_bin(tool) {
-        return Some(path);
-    }
-
-    // Claude fallback locations (native installer, alias-based)
-    if tool == "claude" {
-        if let Ok(home) = std::env::var("HOME") {
-            let home = Path::new(&home);
-            for fallback in &[
-                home.join(".claude").join("local").join("claude"),
-                home.join(".local").join("bin").join("claude"),
-                home.join(".claude").join("bin").join("claude"),
-            ] {
-                if fallback.exists() && fallback.is_file() {
-                    return Some(fallback.to_string_lossy().to_string());
-                }
-            }
-        }
-    }
-
-    None
+    crate::terminal::which_bin(tool)
 }
 
 /// Check if tool CLI is installed (PATH + fallbacks).

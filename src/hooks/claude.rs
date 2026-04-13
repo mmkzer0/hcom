@@ -972,9 +972,7 @@ fn inject_bootstrap_if_needed(
 /// Check for unread messages to deliver at PostToolUse.
 fn get_posttooluse_messages(db: &HcomDb, instance_name: &str) -> Option<Value> {
     let raw_messages = db.get_unread_messages(instance_name);
-    let Some(batch) = common::prepare_delivery_batch(db, instance_name, raw_messages) else {
-        return None;
-    };
+    let batch = common::prepare_delivery_batch(db, instance_name, raw_messages)?;
     let model_context = batch.format_model_context(db, instance_name);
 
     // Claude needs user-facing display in addition to model context

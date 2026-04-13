@@ -111,8 +111,14 @@ pub fn handle_device_gone(db: &HcomDb, device_id: &str) {
     }
     let prefix = super::device_id_prefix(device_id);
     let label = short_id.as_deref().unwrap_or(prefix);
-    emit_device_event(db, super::ACTION_DEVICE_LEAVE, label, prefix,
-        &format!("device {} left the relay", label), false);
+    emit_device_event(
+        db,
+        super::ACTION_DEVICE_LEAVE,
+        label,
+        prefix,
+        &format!("device {} left the relay", label),
+        false,
+    );
     log::log_info("relay", "relay.device_gone", &format!("device={}", prefix));
 }
 
@@ -246,8 +252,8 @@ pub fn handle_state_message(
                 &format!(
                     "short_id={} existing={} incoming={}",
                     short_id,
-                    &cached[..8.min(cached.len())],
-                    &device_id[..8.min(device_id.len())]
+                    super::device_id_prefix(cached),
+                    super::device_id_prefix(device_id)
                 ),
             );
             return false; // Skip to prevent data corruption
@@ -259,14 +265,26 @@ pub fn handle_state_message(
         let now = crate::shared::time::now_epoch_f64();
         if last_sync > 0.0 && (now - last_sync) > super::DEVICE_STALE_SECS {
             let prefix = super::device_id_prefix(device_id);
-            emit_device_event(db, super::ACTION_DEVICE_JOIN, &short_id, prefix,
-                &format!("device {} reconnected", short_id), true);
+            emit_device_event(
+                db,
+                super::ACTION_DEVICE_JOIN,
+                &short_id,
+                prefix,
+                &format!("device {} reconnected", short_id),
+                true,
+            );
         }
     } else {
         safe_kv_set(db, &format!("relay_short_{}", short_id), Some(device_id));
         let prefix = super::device_id_prefix(device_id);
-        emit_device_event(db, super::ACTION_DEVICE_JOIN, &short_id, prefix,
-            &format!("new device {} joined the relay", short_id), false);
+        emit_device_event(
+            db,
+            super::ACTION_DEVICE_JOIN,
+            &short_id,
+            prefix,
+            &format!("new device {} joined the relay", short_id),
+            false,
+        );
     }
     // Cache the peer's advertised capabilities. Distinguish three states:
     //   - "null"  → peer state arrived without a `capabilities` field at all
@@ -745,7 +763,6 @@ fn parse_ts(value: Option<&Value>) -> f64 {
         _ => 0.0,
     }
 }
-
 
 #[cfg(test)]
 mod tests {

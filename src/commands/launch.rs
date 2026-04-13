@@ -39,8 +39,7 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
     let terminal_for_output = terminal.clone();
 
     let hcom_config = load_hcom_config();
-    let (_, preview_background, _) =
-        prepare_launch_execution(&tool, &tool_args, &hcom_config, headless);
+    let preview_background = headless || is_background_from_args(&tool, &tool_args);
 
     let ctx = HcomContext::from_os();
     if ctx.is_inside_ai_tool() && !flags.go && (!tool_args.is_empty() || count > 5) {

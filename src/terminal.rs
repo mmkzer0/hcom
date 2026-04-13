@@ -391,6 +391,26 @@ pub fn which_bin(name: &str) -> Option<String> {
             return Some(candidate.to_string_lossy().to_string());
         }
     }
+
+    // Fallback: well-known install locations not always in PATH
+    if let Ok(home) = std::env::var("HOME") {
+        let home = Path::new(&home);
+        let fallbacks: &[std::path::PathBuf] = match name {
+            "claude" => &[
+                home.join(".claude").join("local").join("claude"),
+                home.join(".local").join("bin").join("claude"),
+                home.join(".claude").join("bin").join("claude"),
+            ],
+            "opencode" => &[home.join(".opencode").join("bin").join("opencode")],
+            _ => &[],
+        };
+        for fallback in fallbacks {
+            if fallback.exists() && fallback.is_file() {
+                return Some(fallback.to_string_lossy().to_string());
+            }
+        }
+    }
+
     None
 }
 

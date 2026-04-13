@@ -8,7 +8,6 @@ use rumqttc::v5::mqttbytes::QoS;
 use serde_json::{Value, json};
 use std::time::Instant;
 
-use crate::config::HcomConfig;
 use crate::db::HcomDb;
 use crate::log;
 
@@ -18,7 +17,7 @@ use super::{device_short_id, safe_kv_get, safe_kv_set, set_relay_status, state_t
 /// Build current instance state snapshot for publishing.
 /// Only includes local instances (no origin_device_id).
 pub fn build_state(db: &HcomDb, device_uuid: &str) -> Value {
-    let short_id = device_short_id(&device_uuid);
+    let short_id = device_short_id(device_uuid);
 
     let instances = match db.conn().prepare(
         "SELECT name, status, status_context, status_detail, status_time, parent_name,
@@ -98,8 +97,7 @@ pub fn build_state(db: &HcomDb, device_uuid: &str) -> Value {
         .flatten()
         .and_then(|ts| parse_iso_timestamp_to_epoch(&ts))
         .unwrap_or(0.0);
-    let config = HcomConfig::load(None).unwrap_or_default();
-    let capabilities = json!(super::control::advertised_remote_capabilities(&config));
+    let capabilities = json!(super::control::advertised_remote_capabilities());
 
     json!({
         "instances": instances,
