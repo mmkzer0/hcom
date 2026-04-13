@@ -575,14 +575,43 @@ pub fn install_opencode_plugin() -> std::io::Result<bool> {
 }
 
 /// Remove hcom.ts from ALL OpenCode plugin directories.
+///
+/// Checks all candidate directories directly (without filtering by dir existence)
+/// to avoid missing stale plugins when path resolution differs between install/remove.
 pub fn remove_opencode_plugin() -> std::io::Result<()> {
     let mut paths = vec![get_opencode_plugin_path()];
-    for d in scan_plugin_dirs() {
-        let p = d.join(PLUGIN_FILENAME);
+
+    // Build candidate paths from all known locations (skip dir-exists filter
+    // that scan_plugin_dirs uses — a dir might not show as existing due to
+    // mount/symlink differences but the file inside might still be reachable).
+    let xdg_base = std::path::PathBuf::from(xdg_config_home()).join("opencode");
+    for sub in &["plugin", "plugins"] {
+        let p = xdg_base.join(sub).join(PLUGIN_FILENAME);
         if !paths.contains(&p) {
             paths.push(p);
         }
     }
+    if let Ok(custom_dir) = std::env::var("OPENCODE_CONFIG_DIR") {
+        let custom_base = std::path::PathBuf::from(custom_dir);
+        for sub in &["plugin", "plugins"] {
+            let p = custom_base.join(sub).join(PLUGIN_FILENAME);
+            if !paths.contains(&p) {
+                paths.push(p);
+            }
+        }
+    }
+    let tool_root = crate::runtime_env::tool_config_root();
+    let home = current_home_dir();
+    if tool_root != home {
+        let tool_base = tool_root.join(".opencode");
+        for sub in &["plugin", "plugins"] {
+            let p = tool_base.join(sub).join(PLUGIN_FILENAME);
+            if !paths.contains(&p) {
+                paths.push(p);
+            }
+        }
+    }
+
     for p in paths {
         if p.exists() {
             std::fs::remove_file(&p)?;

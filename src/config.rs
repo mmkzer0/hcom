@@ -570,10 +570,12 @@ impl HcomConfig {
                     TomlFieldValue::Bool(b) => {
                         let _ = config.set_field(bool_field, if b { "1" } else { "0" });
                     }
+                    TomlFieldValue::Int(i) => {
+                        let _ = config.set_field(bool_field, if i == 0 { "0" } else { "1" });
+                    }
                     TomlFieldValue::Str(s) => {
                         let _ = config.set_field(bool_field, if is_falsy(&s) { "0" } else { "1" });
                     }
-                    _ => {}
                 }
             }
         }

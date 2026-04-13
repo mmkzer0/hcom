@@ -1821,11 +1821,15 @@ fn build_claude_permissions() -> Vec<String> {
         .collect()
 }
 
+/// Legacy commands that were once in SAFE_HCOM_COMMANDS or auto-approved.
+/// Kept here so removal cleans up permissions from older installs.
+const LEGACY_HCOM_COMMANDS: &[&str] = &["daemon"];
+
 /// Build ALL permission patterns (both "hcom" and "uvx hcom" prefixes) for removal.
 fn build_all_claude_permission_patterns() -> Vec<String> {
     let mut patterns = Vec::new();
     for prefix in &["hcom", "uvx hcom"] {
-        for cmd in SAFE_HCOM_COMMANDS {
+        for cmd in SAFE_HCOM_COMMANDS.iter().chain(LEGACY_HCOM_COMMANDS.iter()) {
             patterns.push(format_claude_permission(prefix, cmd));
         }
     }
@@ -1888,79 +1892,78 @@ fn remove_hcom_hooks_from_settings(settings: &mut Value) -> bool {
         None => return false,
     };
 
-    let hooks = match obj.get_mut("hooks").and_then(|v| v.as_object_mut()) {
-        Some(h) => h,
-        None => return false,
-    };
+    // Process each hook type (if hooks section exists)
+    if let Some(hooks) = obj.get_mut("hooks").and_then(|v| v.as_object_mut()) {
+        for event in CLAUDE_HOOK_TYPES {
+            let event_matchers = match hooks.get_mut(*event) {
+                Some(v) => v,
+                None => continue,
+            };
 
-    // Process each hook type
-    for event in CLAUDE_HOOK_TYPES {
-        let event_matchers = match hooks.get_mut(*event) {
-            Some(v) => v,
-            None => continue,
-        };
-
-        let matchers = match event_matchers.as_array_mut() {
-            Some(a) => a,
-            None => {
-                // Malformed event value (not a list) — skip and preserve
-                continue;
-            }
-        };
-
-        let mut updated_matchers = Vec::new();
-        for matcher in matchers.iter() {
-            let matcher_obj = match matcher.as_object() {
-                Some(o) => o,
+            let matchers = match event_matchers.as_array_mut() {
+                Some(a) => a,
                 None => {
-                    // Malformed matcher — preserve as-is
-                    updated_matchers.push(matcher.clone());
+                    // Malformed event value (not a list) — skip and preserve
                     continue;
                 }
             };
 
-            let hooks_field = match matcher_obj.get("hooks") {
-                Some(v) => match v.as_array() {
-                    Some(a) => a,
+            let mut updated_matchers = Vec::new();
+            for matcher in matchers.iter() {
+                let matcher_obj = match matcher.as_object() {
+                    Some(o) => o,
                     None => {
-                        // Malformed hooks field — preserve
+                        // Malformed matcher — preserve as-is
                         updated_matchers.push(matcher.clone());
                         continue;
                     }
-                },
-                None => {
-                    // No hooks field — preserve matcher
-                    updated_matchers.push(matcher.clone());
-                    continue;
+                };
+
+                let hooks_field = match matcher_obj.get("hooks") {
+                    Some(v) => match v.as_array() {
+                        Some(a) => a,
+                        None => {
+                            // Malformed hooks field — preserve
+                            updated_matchers.push(matcher.clone());
+                            continue;
+                        }
+                    },
+                    None => {
+                        // No hooks field — preserve matcher
+                        updated_matchers.push(matcher.clone());
+                        continue;
+                    }
+                };
+
+                // Filter out hcom hooks
+                let non_hcom_hooks: Vec<&Value> = hooks_field
+                    .iter()
+                    .filter(|hook| {
+                        let command =
+                            hook.get("command").and_then(|v| v.as_str()).unwrap_or("");
+                        !is_hcom_hook_command(command)
+                    })
+                    .collect();
+
+                if non_hcom_hooks.len() < hooks_field.len() {
+                    removed_any = true;
                 }
-            };
 
-            // Filter out hcom hooks
-            let non_hcom_hooks: Vec<&Value> = hooks_field
-                .iter()
-                .filter(|hook| {
-                    let command = hook.get("command").and_then(|v| v.as_str()).unwrap_or("");
-                    !is_hcom_hook_command(command)
-                })
-                .collect();
-
-            if non_hcom_hooks.len() < hooks_field.len() {
-                removed_any = true;
+                // Only keep matcher if it has non-hcom hooks remaining
+                if !non_hcom_hooks.is_empty() {
+                    let mut matcher_copy = matcher.clone();
+                    matcher_copy["hooks"] =
+                        Value::Array(non_hcom_hooks.into_iter().cloned().collect());
+                    updated_matchers.push(matcher_copy);
+                }
+                // If all hooks were hcom, drop the entire matcher
             }
 
-            // Only keep matcher if it has non-hcom hooks remaining
-            if !non_hcom_hooks.is_empty() {
-                let mut matcher_copy = matcher.clone();
-                matcher_copy["hooks"] = Value::Array(non_hcom_hooks.into_iter().cloned().collect());
-                updated_matchers.push(matcher_copy);
+            if updated_matchers.is_empty() {
+                hooks.remove(*event);
+            } else {
+                hooks.insert(event.to_string(), Value::Array(updated_matchers));
             }
-            // If all hooks were hcom, drop the entire matcher
-        }
-
-        if updated_matchers.is_empty() {
-            hooks.remove(*event);
-        } else {
-            hooks.insert(event.to_string(), Value::Array(updated_matchers));
         }
     }
 
@@ -2564,9 +2567,12 @@ mod tests {
     fn test_build_all_claude_permission_patterns() {
         let patterns = build_all_claude_permission_patterns();
         // Should have both hcom and uvx hcom variants
-        assert_eq!(patterns.len(), SAFE_HCOM_COMMANDS.len() * 2);
+        let expected = (SAFE_HCOM_COMMANDS.len() + LEGACY_HCOM_COMMANDS.len()) * 2;
+        assert_eq!(patterns.len(), expected);
         assert!(patterns.iter().any(|p| p.contains("hcom send")));
         assert!(patterns.iter().any(|p| p.contains("uvx hcom send")));
+        // Legacy commands included for removal
+        assert!(patterns.iter().any(|p| p.contains("hcom daemon")));
     }
 
     #[test]
