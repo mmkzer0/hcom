@@ -111,6 +111,12 @@ pub struct MqttRelay {
 impl MqttRelay {
     const INBOUND_PUSH_DEBOUNCE: Duration = Duration::from_millis(150);
 
+    /// If no MQTT event (success or error) arrives from the connection thread
+    /// within this duration, the connection is presumed dead and the worker
+    /// exits. Set to 2x the MQTT keepalive (30s) to allow for normal idle
+    /// periods where only PingResp events flow.
+    const LIVENESS_TIMEOUT: Duration = Duration::from_secs(90);
+
     /// Create and connect the MQTT relay client.
     ///
     /// Returns (MqttRelay, Connection, command_sender). The Connection must be
@@ -220,6 +226,11 @@ impl MqttRelay {
         let mut last_push = Instant::now();
         let mut pending_push_at: Option<Instant> = None;
         let mut connected = false;
+        // Track last time we received ANY event (success or error) from the
+        // connection thread. If this goes stale, the connection thread is dead
+        // and we should exit so a fresh worker can spawn.
+        let mut last_event_from_conn = Instant::now();
+        let mut consecutive_errors: u32 = 0;
 
         // Initial subscribe
         if let Err(e) = self.subscribe() {
@@ -235,7 +246,7 @@ impl MqttRelay {
                     return;
                 }
                 Ok(RelayCommand::Push) => {
-                    self.do_push_cycle();
+                    self.do_push_cycle(connected);
                     last_push = Instant::now();
                     pending_push_at = None;
                 }
@@ -249,27 +260,54 @@ impl MqttRelay {
 
             // Periodic push
             if connected && last_push.elapsed() >= self.push_interval {
-                self.do_push_cycle();
+                self.do_push_cycle(connected);
                 last_push = Instant::now();
                 pending_push_at = None;
             }
 
             if connected && pending_push_at.is_some_and(|deadline| Instant::now() >= deadline) {
-                self.do_push_cycle();
+                self.do_push_cycle(connected);
                 last_push = Instant::now();
                 pending_push_at = None;
             }
 
-            // During backoff, skip event processing and just sleep
+            // During backoff, skip event processing and just sleep.
+            // Reset liveness timer so backoff periods don't trigger false alarms
+            // — the connection thread may be queuing errors that we'll drain after
+            // backoff expires.
             if Instant::now() < backoff_until {
+                last_event_from_conn = Instant::now();
                 thread::sleep(Duration::from_millis(100));
                 continue;
+            }
+
+            // Liveness check: if no event (success or error) from the connection
+            // thread for well beyond the keepalive interval, the thread is stuck
+            // or dead but hasn't closed the channel. Exit so a fresh worker spawns.
+            // Only checked outside backoff — during backoff, events queue in the
+            // channel and last_event_from_conn is held fresh above.
+            if last_event_from_conn.elapsed() > Self::LIVENESS_TIMEOUT {
+                log::log_warn(
+                    "relay",
+                    "relay.liveness_timeout",
+                    &format!(
+                        "no MQTT events for {}s, connection presumed dead — exiting",
+                        last_event_from_conn.elapsed().as_secs()
+                    ),
+                );
+                if let Ok(db) = HcomDb::open() {
+                    set_relay_status(&db, "error", Some("liveness timeout"), true);
+                }
+                self.shutdown_graceful(&event_rx);
+                return;
             }
 
             // Poll MQTT events with timeout (allows command checks between polls)
             match event_rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(Ok(event)) => {
                     backoff.reset();
+                    last_event_from_conn = Instant::now();
+                    consecutive_errors = 0;
                     if self.handle_event(event, &mut connected) {
                         let next_push = last_push + Self::INBOUND_PUSH_DEBOUNCE;
                         pending_push_at = Some(
@@ -278,10 +316,24 @@ impl MqttRelay {
                     }
                 }
                 Ok(Err(conn_err)) => {
+                    last_event_from_conn = Instant::now();
+                    consecutive_errors += 1;
+                    let err_msg = format!("{:?}", conn_err);
+
+                    // Log first error, then every 10th, and when backoff maxes out
+                    if connected || consecutive_errors <= 1 || consecutive_errors % 10 == 0 {
+                        log::log_warn(
+                            "relay",
+                            "relay.disconnected",
+                            &format!(
+                                "{} (consecutive={})",
+                                err_msg, consecutive_errors
+                            ),
+                        );
+                    }
+
                     if connected {
                         connected = false;
-                        let err_msg = format!("{:?}", conn_err);
-                        log::log_warn("relay", "relay.disconnected", &err_msg);
                         if let Ok(db) = HcomDb::open() {
                             set_relay_status(&db, "error", Some(&err_msg), true);
                         }
@@ -317,7 +369,7 @@ impl MqttRelay {
                         log::log_warn("relay", "relay.subscribe_err", &e);
                     }
                     // Push immediately on connect to sync state
-                    self.do_push_cycle();
+                    self.do_push_cycle(true);
                     false
                 }
                 Packet::Publish(publish) => {
@@ -443,7 +495,7 @@ impl MqttRelay {
     }
 
     /// Execute a push cycle: build state + events, publish to MQTT.
-    fn do_push_cycle(&self) {
+    fn do_push_cycle(&self, mqtt_connected: bool) {
         let db = match HcomDb::open() {
             Ok(db) => db,
             Err(e) => {
@@ -471,6 +523,7 @@ impl MqttRelay {
                 &self.device_uuid,
                 &psk,
                 true,
+                mqtt_connected,
             ) {
                 Ok((true, has_more)) => {
                     if has_more && Instant::now() < deadline {

@@ -165,6 +165,10 @@ pub fn build_push_payload(db: &HcomDb, device_uuid: &str) -> (Value, Vec<Value>,
 
 /// Push state and events via MQTT. Returns (success, has_more).
 /// `is_worker` should be true when called from the daemon relay thread.
+/// `mqtt_connected` indicates whether the MQTT connection is known to be live.
+/// When false, events are still published (rumqttc may buffer and deliver on
+/// reconnect) but the cursor is NOT advanced — events will be re-sent on the
+/// next push after the connection recovers, preventing silent event loss.
 pub fn push(
     db: &HcomDb,
     client: &Client,
@@ -172,6 +176,7 @@ pub fn push(
     device_uuid: &str,
     psk: &[u8; 32],
     is_worker: bool,
+    mqtt_connected: bool,
 ) -> Result<(bool, bool), String> {
     let (state, events, max_id, has_more) = build_push_payload(db, device_uuid);
 
@@ -189,25 +194,27 @@ pub fn push(
 
     let t0 = Instant::now();
 
-    // Blocking publish — waits for rumqttc's internal channel to accept the message.
-    // rumqttc handles retransmission via QoS::AtLeastOnce, so if the broker eventually
-    // acks, the message is delivered. If the process crashes before PUBACK, the cursor
-    // stays at the old position and events are re-sent on next push cycle.
-    // Note: rumqttc's Client API
-    // doesn't expose per-message PUBACK tracking, so we advance the cursor after
-    // successful enqueue and rely on rumqttc's QoS retransmission for reliability.
+    // Enqueue into rumqttc's internal channel. With QoS::AtLeastOnce rumqttc
+    // handles retransmission if the connection is live. When disconnected,
+    // the message may sit in the internal buffer and be delivered on reconnect,
+    // but we cannot guarantee it — so we only advance the cursor when
+    // mqtt_connected is true.
     client
         .publish(&topic, QoS::AtLeastOnce, true, sealed)
         .map_err(|e| format!("publish: {}", e))?;
 
     let publish_ms = t0.elapsed().as_millis();
 
-    // Advance cursor after publish enqueued (rumqttc QoS retransmission handles reliability)
-    let now = crate::shared::time::now_epoch_f64();
-    safe_kv_set(db, "relay_last_push", Some(&now.to_string()));
-    safe_kv_set(db, "relay_last_push_id", Some(&max_id.to_string()));
-    safe_kv_set(db, "relay_last_sync", Some(&now.to_string()));
-    set_relay_status(db, "ok", None, is_worker);
+    if mqtt_connected {
+        // Connection is live — advance cursor so these events aren't re-sent.
+        let now = crate::shared::time::now_epoch_f64();
+        safe_kv_set(db, "relay_last_push", Some(&now.to_string()));
+        safe_kv_set(db, "relay_last_push_id", Some(&max_id.to_string()));
+        safe_kv_set(db, "relay_last_sync", Some(&now.to_string()));
+        set_relay_status(db, "ok", None, is_worker);
+    }
+    // When disconnected: publish is best-effort (rumqttc may buffer), but
+    // cursor stays put so events are re-sent after reconnect.
 
     log::log_with_fields(
         "INFO",
