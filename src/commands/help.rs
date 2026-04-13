@@ -644,7 +644,6 @@ const CLAUDE_SPEC: ToolHelpSpec = ToolHelpSpec {
     name: "claude",
     label: "Claude",
     unique_examples: &[
-        ("hcom 3 claude -p \"prompt\"", "3 headless in background"),
         ("hcom 1 claude --agent <name>", ".claude/agents/<name>.md"),
         (
             "hcom claude --model sonnet|opus|haiku",
@@ -747,6 +746,8 @@ fn generate_tool_help(spec: &ToolHelpSpec) -> String {
     lines.push("    --tag <name>                 Group tag (names become tag-*)".to_string());
     lines.push("    --terminal <preset>          Where new windows open".to_string());
     lines.push("    --dir <path>                  Working directory for launch".to_string());
+    lines.push("    --headless                   Run in background (no terminal window)".to_string());
+    lines.push("    --device <name>              Launch on a remote relay device".to_string());
     lines.push("    --hcom-prompt <text>          Initial prompt".to_string());
     lines.push("    --hcom-system-prompt <text>   System prompt".to_string());
 
@@ -902,6 +903,29 @@ pub fn get_command_help(name: &str) -> String {
     // Tool launch commands use the template generator
     if let Some(spec) = get_tool_spec(name) {
         return generate_tool_help(spec);
+    }
+
+    // Resume / Fork shortcuts
+    if name == "r" || name == "resume" {
+        return "Usage:\n\
+                \x20 hcom r <name> [tool-args...]    Resume a stopped agent by name\n\
+                \n\
+                Extra args are forwarded to the tool on relaunch.\n\
+                \n\
+                See also:\n\
+                \x20 hcom f <name>                   Fork an agent session (claude/codex/opencode)"
+            .to_string();
+    }
+    if name == "f" || name == "fork" {
+        return "Usage:\n\
+                \x20 hcom f <name> [tool-args...]    Fork an agent session (active or stopped)\n\
+                \n\
+                Creates a new agent that continues from the forked session.\n\
+                Supported tools: claude, codex, opencode.\n\
+                \n\
+                See also:\n\
+                \x20 hcom r <name>                   Resume a stopped agent"
+            .to_string();
     }
 
     let entries: Option<&[HelpEntry]> = match name {

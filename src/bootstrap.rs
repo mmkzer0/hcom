@@ -75,7 +75,7 @@ const TAG_NOTICE: &str = r#"
 You are tagged "{tag}". Message your group: send @{tag}- -- msg"#;
 
 const RELAY_NOTICE: &str = r#"
-Remote agents have suffix (e.g., `luna:BOXE`). @luna = local only; @luna:BOXE = remote. Remote event IDs 42:BOXE."#;
+Remote agents have suffix (e.g., `luna:BOXE`). @luna = local only; @luna:BOXE = remote. Remote event IDs 42:BOXE. Remote launch needs --device BOXE and --dir passed in."#;
 
 const HEADLESS_NOTICE: &str = r#"
 Headless mode: No one sees your chat, only hcom messages. Communicate via hcom send."#;
