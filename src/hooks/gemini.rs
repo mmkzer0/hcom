@@ -36,8 +36,16 @@ pub fn derive_gemini_transcript_path(session_id: &str) -> Option<String> {
         return None;
     }
 
-    let home = env::var("HOME").ok()?;
-    let gemini_tmp = PathBuf::from(&home).join(".gemini").join("tmp");
+    let gemini_base = if let Ok(cli_home) = env::var("GEMINI_CLI_HOME") {
+        if !cli_home.is_empty() {
+            PathBuf::from(cli_home).join(".gemini")
+        } else {
+            PathBuf::from(env::var("HOME").ok()?).join(".gemini")
+        }
+    } else {
+        PathBuf::from(env::var("HOME").ok()?).join(".gemini")
+    };
+    let gemini_tmp = gemini_base.join("tmp");
     if !gemini_tmp.exists() {
         return None;
     }
@@ -786,14 +794,25 @@ fn build_all_permission_patterns() -> Vec<String> {
     patterns
 }
 
+/// Resolve the Gemini config directory.
+///
+/// Priority: GEMINI_CLI_HOME env var (+ .gemini suffix) → tool_config_root()/.gemini
+fn gemini_config_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("GEMINI_CLI_HOME") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir).join(".gemini");
+        }
+    }
+    crate::runtime_env::tool_config_root().join(".gemini")
+}
+
 /// Get path to Gemini policies directory.
 ///
+/// Respects GEMINI_CLI_HOME env var, then falls back to:
 /// If HCOM_DIR is set (sandbox), uses HCOM_DIR parent.
 /// Otherwise uses global (~/.gemini/policies/).
 fn get_gemini_policies_path() -> PathBuf {
-    crate::runtime_env::tool_config_root()
-        .join(".gemini")
-        .join("policies")
+    gemini_config_dir().join("policies")
 }
 
 /// Build policy TOML content for hcom.toml.
@@ -861,12 +880,11 @@ fn remove_policy_from_path(policies_dir: &Path) -> bool {
 
 /// Get path to Gemini settings file.
 ///
+/// Respects GEMINI_CLI_HOME env var, then falls back to:
 /// If HCOM_DIR is set (sandbox), uses HCOM_DIR parent.
 /// Otherwise uses global (~/.gemini/settings.json).
 pub fn get_gemini_settings_path() -> PathBuf {
-    crate::runtime_env::tool_config_root()
-        .join(".gemini")
-        .join("settings.json")
+    gemini_config_dir().join("settings.json")
 }
 
 /// Load Gemini settings from JSON file.
@@ -1238,10 +1256,18 @@ pub fn remove_gemini_hooks() -> bool {
     let global_path = dirs::home_dir()
         .map(|h| h.join(".gemini").join("settings.json"))
         .unwrap_or_default();
+    let env_path = std::env::var("GEMINI_CLI_HOME")
+        .ok()
+        .filter(|d| !d.is_empty())
+        .map(|d| PathBuf::from(d).join(".gemini").join("settings.json"));
     let local_path = get_gemini_settings_path();
 
     let global_ok = remove_hooks_from_path(&global_path);
-    let local_ok = if local_path != global_path {
+    let env_ok = match env_path {
+        Some(ref p) if *p != global_path => remove_hooks_from_path(p),
+        _ => true,
+    };
+    let local_ok = if local_path != global_path && Some(&local_path) != env_path.as_ref() {
         remove_hooks_from_path(&local_path)
     } else {
         true
@@ -1251,16 +1277,26 @@ pub fn remove_gemini_hooks() -> bool {
     let global_policies = dirs::home_dir()
         .map(|h| h.join(".gemini").join("policies"))
         .unwrap_or_default();
+    let env_policies = std::env::var("GEMINI_CLI_HOME")
+        .ok()
+        .filter(|d| !d.is_empty())
+        .map(|d| PathBuf::from(d).join(".gemini").join("policies"));
     let local_policies = get_gemini_policies_path();
 
     let global_policy_ok = remove_policy_from_path(&global_policies);
-    let local_policy_ok = if local_policies != global_policies {
+    let env_policy_ok = match env_policies {
+        Some(ref p) if *p != global_policies => remove_policy_from_path(p),
+        _ => true,
+    };
+    let local_policy_ok = if local_policies != global_policies
+        && Some(&local_policies) != env_policies.as_ref()
+    {
         remove_policy_from_path(&local_policies)
     } else {
         true
     };
 
-    global_ok && local_ok && global_policy_ok && local_policy_ok
+    global_ok && env_ok && local_ok && global_policy_ok && env_policy_ok && local_policy_ok
 }
 
 fn remove_hooks_from_path(path: &Path) -> bool {

@@ -428,23 +428,31 @@ pub fn dispatch_codex_hook_native(hook_name: &str) -> i32 {
 // Settings management — hooks.json, config.toml, execpolicy
 // ---------------------------------------------------------------------------
 
-fn codex_base_dir() -> PathBuf {
-    crate::runtime_env::tool_config_root()
+/// Resolve the Codex config directory.
+///
+/// Priority: CODEX_HOME env var → tool_config_root()/.codex
+fn codex_config_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("CODEX_HOME") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
+    crate::runtime_env::tool_config_root().join(".codex")
 }
 
 /// Get path to Codex config.toml.
 pub fn get_codex_config_path() -> PathBuf {
-    codex_base_dir().join(".codex").join("config.toml")
+    codex_config_dir().join("config.toml")
 }
 
 /// Get path to Codex hooks.json.
 pub fn get_codex_hooks_path() -> PathBuf {
-    codex_base_dir().join(".codex").join("hooks.json")
+    codex_config_dir().join("hooks.json")
 }
 
 /// Get path to Codex execpolicy rules directory.
 pub fn get_codex_rules_path() -> PathBuf {
-    codex_base_dir().join(".codex").join("rules")
+    codex_config_dir().join("rules")
 }
 
 fn build_codex_hook_command(command: &str) -> String {
@@ -800,12 +808,12 @@ pub fn verify_codex_hooks_installed(check_permissions: bool) -> bool {
     true
 }
 
-/// Remove hcom hooks from Codex config.
-pub fn remove_codex_hooks() -> bool {
-    let hooks_path = get_codex_hooks_path();
+/// Remove hcom hooks from a single Codex hooks.json + execpolicy at the given base dir.
+fn remove_codex_hooks_from_dir(base: &std::path::Path) -> bool {
+    let hooks_path = base.join("hooks.json");
+    let rules_file = base.join("rules").join("hcom.rules");
     let mut ok = true;
 
-    // Remove hcom entries from hooks.json.
     if hooks_path.exists() {
         match std::fs::read_to_string(&hooks_path) {
             Ok(content) => {
@@ -824,7 +832,32 @@ pub fn remove_codex_hooks() -> bool {
         }
     }
 
-    ok && remove_codex_execpolicy()
+    if rules_file.exists() {
+        ok &= std::fs::remove_file(&rules_file).is_ok();
+    }
+
+    ok
+}
+
+/// Remove hcom hooks from Codex config.
+///
+/// Cleans both the default (~/.codex) and env-var (CODEX_HOME) paths.
+pub fn remove_codex_hooks() -> bool {
+    let default_dir = dirs::home_dir()
+        .map(|h| h.join(".codex"))
+        .unwrap_or_default();
+    let env_dir = std::env::var("CODEX_HOME")
+        .ok()
+        .filter(|d| !d.is_empty())
+        .map(PathBuf::from);
+
+    let default_ok = remove_codex_hooks_from_dir(&default_dir);
+    let env_ok = match env_dir {
+        Some(ref d) if *d != default_dir => remove_codex_hooks_from_dir(d),
+        _ => true,
+    };
+
+    default_ok && env_ok
 }
 
 #[cfg(test)]

@@ -1766,15 +1766,25 @@ static RE_HCOM_PY_COMMANDS: LazyLock<Regex> = LazyLock::new(|| {
 });
 static RE_SH_HCOM: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"sh\s+-c.*hcom").unwrap());
 
+/// Resolve the Claude config directory.
+///
+/// Priority: CLAUDE_CONFIG_DIR env var → tool_config_root()/.claude
+fn claude_config_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
+    paths::get_project_root().join(".claude")
+}
+
 /// Get path to Claude settings.json.
 ///
-/// Uses `paths::get_project_root()` which respects HCOM_DIR:
+/// Respects CLAUDE_CONFIG_DIR env var, then falls back to:
 /// - HCOM_DIR set → project_root is HCOM_DIR parent → {parent}/.claude/settings.json
 /// - Otherwise → ~/.hcom parent = ~ → ~/.claude/settings.json
 pub fn get_claude_settings_path() -> PathBuf {
-    paths::get_project_root()
-        .join(".claude")
-        .join("settings.json")
+    claude_config_dir().join("settings.json")
 }
 
 /// Load and parse Claude settings.json. Returns None on error or missing file.
@@ -2241,16 +2251,24 @@ pub fn remove_claude_hooks() -> bool {
     let global_path = dirs::home_dir()
         .map(|h| h.join(".claude").join("settings.json"))
         .unwrap_or_default();
+    let env_path = std::env::var("CLAUDE_CONFIG_DIR")
+        .ok()
+        .filter(|d| !d.is_empty())
+        .map(|d| PathBuf::from(d).join("settings.json"));
     let local_path = get_claude_settings_path();
 
     let global_ok = remove_hooks_from_settings_path(&global_path);
-    let local_ok = if local_path != global_path {
+    let env_ok = match env_path {
+        Some(ref p) if *p != global_path => remove_hooks_from_settings_path(p),
+        _ => true,
+    };
+    let local_ok = if local_path != global_path && Some(&local_path) != env_path.as_ref() {
         remove_hooks_from_settings_path(&local_path)
     } else {
         true
     };
 
-    global_ok && local_ok
+    global_ok && env_ok && local_ok
 }
 
 #[cfg(test)]

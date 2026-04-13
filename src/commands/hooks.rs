@@ -213,72 +213,40 @@ pub fn cmd_hooks_remove(argv: &[String]) -> i32 {
         return 1;
     };
 
-    // Check current status before removing
+    // Check status for messaging, but always attempt removal for all paths
+    // to clean up stale hooks at old paths (e.g. before env var override was set).
     let pre_status = get_tool_status();
-
-    // Remove hooks — propagate error detail where available
-    // Outcome: "already" = was not installed, "removed" = newly removed, "failed" = error
-    enum RemoveResult {
-        AlreadyRemoved,
-        Removed,
-        Failed(Option<String>),
-    }
-    let mut results: Vec<(&str, RemoveResult)> = Vec::new();
+    let mut fail_count = 0;
     for tool in &tools {
-        let installed = pre_status
+        let was_installed = pre_status
             .iter()
             .find(|(t, _, _)| t == tool)
             .map(|(_, installed, _)| *installed)
             .unwrap_or(false);
-        if !installed {
-            results.push((tool, RemoveResult::AlreadyRemoved));
-            continue;
-        }
-        let outcome = match *tool {
-            "claude" => {
-                if crate::hooks::claude::remove_claude_hooks() {
-                    RemoveResult::Removed
-                } else {
-                    RemoveResult::Failed(None)
-                }
-            }
-            "gemini" => {
-                if crate::hooks::gemini::remove_gemini_hooks() {
-                    RemoveResult::Removed
-                } else {
-                    RemoveResult::Failed(None)
-                }
-            }
-            "codex" => {
-                if crate::hooks::codex::remove_codex_hooks() {
-                    RemoveResult::Removed
-                } else {
-                    RemoveResult::Failed(None)
-                }
-            }
-            "opencode" => match crate::hooks::opencode::remove_opencode_plugin() {
-                Ok(()) => RemoveResult::Removed,
-                Err(e) => RemoveResult::Failed(Some(e.to_string())),
-            },
-            _ => RemoveResult::Failed(None),
-        };
-        results.push((tool, outcome));
-    }
 
-    // Report results
-    let mut fail_count = 0;
-    for (tool, outcome) in &results {
-        match outcome {
-            RemoveResult::AlreadyRemoved => println!("{tool} hooks already removed"),
-            RemoveResult::Removed => println!("Removed {tool} hooks"),
-            RemoveResult::Failed(Some(e)) => {
-                eprintln!("Failed to remove {tool} hooks: {e}");
-                fail_count += 1;
+        let ok = match *tool {
+            "claude" => crate::hooks::claude::remove_claude_hooks(),
+            "gemini" => crate::hooks::gemini::remove_gemini_hooks(),
+            "codex" => crate::hooks::codex::remove_codex_hooks(),
+            "opencode" => match crate::hooks::opencode::remove_opencode_plugin() {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("Failed to remove {tool} hooks: {e}");
+                    fail_count += 1;
+                    continue;
+                }
+            },
+            _ => false,
+        };
+        if ok {
+            if was_installed {
+                println!("Removed {tool} hooks");
+            } else {
+                println!("{tool} hooks already removed");
             }
-            RemoveResult::Failed(None) => {
-                eprintln!("Failed to remove {tool} hooks");
-                fail_count += 1;
-            }
+        } else {
+            eprintln!("Failed to remove {tool} hooks");
+            fail_count += 1;
         }
     }
 
