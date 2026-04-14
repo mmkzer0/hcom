@@ -1,15 +1,13 @@
-# hcom - multi-agent communication
+# hcom
 
 [![PyPI](https://img.shields.io/pypi/v/hcom)](https://pypi.org/project/hcom/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/Built_with-Rust-dea584)](https://www.rust-lang.org/)
 [![GitHub stars](https://img.shields.io/github/stars/aannoo/hcom)](https://github.com/aannoo/hcom/stargazers)
 
-> #### Let AI agents message, watch, and spawn each other across terminals
+> **Hook your coding agents together**
 
-Prefix any agent with `hcom` and they're connected.
-
-Works with Claude Code, Gemini CLI, Codex, OpenCode, and any AI tool that can run shell commands.
+Prefix agents with `hcom` to let them message, watch, and spawn each other across terminals.
 
 https://github.com/user-attachments/assets/1ce23ed9-f529-4be0-8124-816aa4c2fd43
 
@@ -39,17 +37,16 @@ uv tool install hcom  # or: pip install hcom
 
 ## Quickstart
 
-Run agents with `hcom` in front:
-
 ```bash
-hcom claude  # / gemini / codex / opencode
+hcom claude  # gemini / codex / opencode
 ```
 
 Prompt:
 
 - `send a message to codex`
-- `review what claude did`
-- `spawn 2x gemini and subscribe to their file edits`
+- `review what claude did and send fixes`
+- `spawn 3x gemini, split work, collect results`
+- `fork yourself to investigate the bug and report back`
 
 Open the TUI:
 
@@ -61,61 +58,155 @@ hcom
 
 ## What agents can do
 
-**Spawn**: launch one or many, resume, fork, kill. Any terminal emulator. Scriptable workflows.
+**Message** each other in real-time, bundle context for handoffs.
 
-**Observe**: read other agent's transcript slices, inspect file edits and commands, view and inject into terminal screens.
+**Observe** each other: transcripts, file edits, terminal screens, command history.
 
-**Subscribe**: watch when others are idle, blocked, file changes, specific events. Act on them automatically.
+**Subscribe** to each other: notify on status changes, file edits, specific events. React automatically.
 
-**Message**: direct, broadcast, groups, across devices. Bundle file/transcript/event attachments for handoffs.
+**Spawn**, **fork**, **resume**, **kill** each other, in any terminal emulator.
 
 ---
 
 ## How it works
 
-hcom acts as a local message bus and event log.
+Hooks record activity to a local SQLite database and deliver messages from it.
 
 ```bash
-# hooks record activity to db and deliver messages from the db
-agent → hooks/cli → db → hooks/pty → other agent
+agent → hooks → db → hooks → other agent
 ```
 
-When an agent does something, hooks record it as an event. When other agents do something, hooks deliver relevant events (unread messages, file edit collisions, watch subscriptions) to them from the database. If an agent is idle, pty wakes it so hooks can deliver new events immediately.
+For **Claude Code**, **Gemini CLI**, **Codex**, and **OpenCode**, messages arrive mid-turn (injected between tool calls) or wake idle agents immediately. Any other AI tool can join by running `hcom start`. Any process can wake agents with `hcom send`.
 
-At session start, agents get a ~700-token hcom cli primer through hooks. Hooks sit in each tool's config directory and fire automatically with no modifications to Claude, Codex, OpenCode, or Gemini.
+Hooks go into tool config dirs under `~/` (or `HCOM_DIR`) on first run. If you aren't using hcom, the hooks do nothing.
 
 ---
 
-## Multi-agent workflows
+## Terminal
 
-Bundled and user scripts (`~/.hcom/scripts/`) for multi-agent patterns:
+Every agent runs in a real terminal you can see, scroll, and interrupt. Any emulator works for spawning; **kitty**, **wezterm**, and **tmux** additionally support closing panes from `hcom kill`.
 
 ```bash
-hcom run                   # list available scripts
-hcom run debate "topic"    # run one
-hcom run docs              # tell agent to run this to create any new workflow
+hcom config terminal --info   # tell agent to run this to configure other terminals
 ```
 
-<details><summary>Included Scripts</summary>
+---
 
-**`hcom run confess`** - An agent (or background clone) writes an honesty self-eval. A spawned calibrator reads the target's transcript independently. A judge compares both reports and sends back a verdict via hcom message.
+## Cross-device
 
-**`hcom run debate`** - A judge spawns and sets up a debate with existing agents. It coordinates rounds in a shared thread where all agents see each other's arguments, with shared context of workspace files and transcripts.
+Connect agents across machines via MQTT relay.
 
-**`hcom run fatcow`** — headless agent reads every file in a path, subscribes to file edit events to stay current, and answers other agents on demand.
+```bash
+hcom relay new                 # get token
+hcom relay connect <token>     # on each device
+```
+
+```bash
+hcom relay status              # check connection
+hcom relay off|on              # toggle
+```
+
+<details>
+<summary>Relay Security</summary>
+
+### Security
+
+- Relay payloads are end-to-end encrypted. Brokers do not see data.
+- Treat the join token like an SSH key or API key.
+- If the token may have leaked, run `hcom relay off --all` to disconnect all devices.
+- Use a private/custom/self-hosted broker with `--broker` and `--password` for better security.
+
+### Security model
+
+`hcom relay` is one trust domain for one operator's devices. Membership is all-or-nothing. There are no scoped roles, read-only peers, or per-device permissions.
+
+Relay payloads use a shared PSK with XChaCha20-Poly1305. The encryption binds each payload to the relay, topic, and timestamp. A replay guard drops duplicate envelopes inside a freshness window.
+
+Brokers and network observers cannot read or forge payloads without the PSK. They can still see metadata: topic names, timing, message sizes, and connection patterns.
+
+### What the token means
+
+The join token contains the relay ID, broker URL, and raw PSK. hcom does not ask a server to validate it. It has no expiry, no scope, and no revocation list.
+
+On public brokers, a leaked token gives an attacker full control of the relay. They can decrypt captured traffic, publish authenticated relay traffic, send text to listening agents, launch agents on enrolled devices, kill running agents, and use remote relay RPCs. If those agents can run tools, treat that as shell access on every enrolled device in the relay.
+
+On private brokers with `--password`, the token still leaks the PSK, so captured traffic is still exposed. But the token alone is not enough to publish unless the attacker also has the broker password. Use a private broker when broker-side access control matters, or when the metadata shape of your traffic is itself sensitive. `--password` is broker access control, not another layer of message encryption.
+
+### Limits by design
+
+- Forward secrecy. A leaked PSK can decrypt old captured traffic.
+- Per-device attribution inside a relay. Sender identity is routing metadata, not authorization. Every enrolled device speaks with full authority.
+- Prompt injection from an authenticated peer. Enrollment is total trust — a peer can launch, kill, and drive agents via RPC, not just send messages. Only enroll devices you would give shell access to.
+- Local OS compromise. hcom trusts the local user account and `~/.hcom/config.toml`. It does not defend against another user on the same account or malware with filesystem access.
+
+### Storage
+
+The PSK is stored in `~/.hcom/config.toml`. On Unix, hcom writes that file with mode `0600`.
+
+hcom keeps the PSK out of environment variables. Remote `config_get` and `config_set` refuse `relay_psk`, `relay_token`, `relay_id`, and the broker URL. `hcom relay status` shows only a short fingerprint so two devices can verify they share the same key without printing it.
+
+Anyone who can read that file — another user on the same OS account, malware, or a backup written without preserving permissions — has the full PSK.
+
+### Incident response
+
+Run `hcom relay off --all`. It asks every reachable trusted peer to disable the relay, then disables it locally, so your agents stop acting on attacker messages. It is best-effort damage control, not containment: the attacker's device ignores the request.
+
+The PSK cannot be revoked. There is no server to notify and no denylist to update. Anyone who has the PSK can keep using the old relay until you stop using it.
+
+To keep using relay after a leak, create a new relay with `hcom relay new` and move every trusted device to the new token. Rotation also changes the `relay_id`, so retained state on the old broker topics is orphaned.
 
 </details>
 
 ---
 
-## Tools
+## Troubleshoot
 
-Claude Code, Gemini CLI, Codex, and OpenCode have automatic message delivery via hooks. Any other AI tool can join by running `hcom start`. Any process can wake agents with `hcom send`.
+```bash
+hcom status           # diagnostics
+hcom reset all        # clear and archive: database + hooks + config
+hcom run docs         # tell agent to run
+```
+
+---
+
+## Uninstall
+
+```bash
+hcom hooks remove                     # safely remove all hcom hooks
+brew uninstall hcom                   # or: rm $(which hcom)
+```
+
+---
+
+## Reference
 
 <details>
-<summary>Claude Code headless and subagents</summary>
+<summary>Tools & Launch</summary>
 
-Detached background processes stay alive. Manage through the TUI.
+### Supported tools
+
+| Tool | Automatic delivery | Connect |
+|---|---|---|
+| Claude Code | yes, hooks | `hcom claude` |
+| Gemini CLI | yes, hooks | `hcom gemini` |
+| Codex CLI | yes, hooks | `hcom codex` |
+| OpenCode | yes, plugin | `hcom opencode` |
+| Anything else | manual poll via `hcom listen` | `hcom start` (run inside tool) |
+
+### Launch
+
+**`hcom [N] <tool> [tool-args] [hcom-flags]`**
+
+```bash
+hcom 3 claude                 # launch 3 instances
+hcom claude --model sonnet    # unknown args forwarded to tool
+hcom claude --terminal kitty  # launch in a specific terminal
+hcom claude --headless        # run in background with hcom pty
+```
+
+### Claude Code headless and subagents
+
+Detached background processes in print mode stay alive. Manage them through the TUI.
 
 ```bash
 hcom claude -p 'say hi in hcom'
@@ -127,692 +218,73 @@ For subagents, run `hcom claude`, then prompt:
 
 </details>
 
----
-
-## Configuration
-
-```bash
-hcom config                        # show current config
-hcom config --edit                 # open config.toml
-```
-
-Per project or in a sandbox:
-
-```bash
-HCOM_DIR=$PWD/.hcom               # isolate state and hooks to a folder
-```
-
----
-
-## Launch
-
-**`hcom [N] <tool> [tool-args] [hcom-flags]`**
-
-```bash
-hcom 3 claude                 # launch 3 instances
-hcom claude --model sonnet    # all args forwarded to tool
-hcom claude --terminal tmux   # launch in specific terminal
-```
-
----
-
-## Terminal
-
-Spawning works with any terminal emulator. Killing/closing works with **kitty**, **wezterm**, and **tmux**.
-
-Run for more info / custom setup: `hcom config terminal --info`
-
-```bash
-hcom config terminal default       # auto-detect
-hcom config terminal kitty         # set
-```
-
----
-
-## Cross-device
-
-Connect agents across machines via MQTT relay:
-
-```bash
-# get token
-hcom relay new
-
-# on each device
-hcom relay connect <token>
-```
-
----
-
-## What gets installed
-
-Hooks go into `~/` (or `HCOM_DIR`) on first run. If you aren't using hcom, the hooks do nothing.
-
-```bash
-hcom hooks remove                  # safely remove only hcom hooks
-```
-
-```bash
-hcom status                        # hcom diagnostics and hook status
-```
-
----
-
-## Uninstall
-
-First remove hooks, then delete the binary:
-
-```bash
-hcom reset all       # remove hooks, reset hcom config and db
-brew uninstall hcom  # or: rm $(which hcom)
-```
-
----
-
-## Reference
 
 <details>
 <summary>CLI</summary>
 
+### CLI commands
+
+What you might type from a shell. Agents run their own commands that they learn from the hcom CLI primer (~700 tokens) at launch. `hcom <command> --help` for full flags.
+
+### Spawn
+
+```bash
+hcom                                # TUI dashboard
+hcom [N] claude|gemini|codex|opencode   # launch N agents (default 1)
+hcom r <name>                       # resume stopped agent
+hcom f <name>                       # fork session (claude/codex/opencode)
+hcom kill <name|tag:T|all>          # kill + close terminal pane
 ```
-hcom (hook-comms) v0.7.10 - multi-agent communication
 
-Usage:
-hcom                                  TUI dashboard
-hcom <command>                        Run command
-
-Launch:
-hcom [N] claude|gemini|codex|opencode [flags] [tool-args]
-hcom r <name>                         Resume stopped agent
-hcom f <name>                         Fork agent session
-hcom kill <name(s)|tag:T|all>         Kill + close terminal pane
-
-Commands:
-send         Send message to your buddies
-listen       Block until message or event arrives
-list         Show agents, status, unread counts
-events       Query event stream, manage subscriptions
-bundle       Structured context packages for handoffs
-transcript   Read another agent's conversation
-start        Connect to hcom (run inside any AI tool)
-stop         Disconnect from hcom
-config       Get/set global and per-agent settings
-run          Execute workflow scripts
-relay        Cross-device sync + relay daemon
-archive      Query past hcom sessions
-reset        Archive and clear database
-hooks        Add or remove hooks
-status       Installation and diagnostics
-term         View/inject into agent PTY screens
-update       Check and apply updates
-
-
-## send
-
-Usage:
-    send @name -- message text     Direct message
-    send @name1 @name2 -- message  Multiple targets
-    send -- message text           Broadcast to all
-    send @name                     Message from stdin (pipe or heredoc)
-    send @name --file <path>       Message from file
-    send @name --base64 <encoded>  Message from base64 string
-
-  Everything after -- is the message (no quotes needed).
-  All flags must come before --.
-
-
-Target matching:
-    @luna                          base name (matches luna, api-luna)
-    @api-luna                      exact full name
-    @api-                          prefix: all with tag 'api'
-    @luna:BOXE                     remote agent on another device
-  Underscore blocks prefix: @luna does NOT match luna_reviewer_1
-
-
-Envelope:
-    --intent <type>                request | inform | ack
-    request: expect a response
-    inform: FYI, no response needed
-    ack: replying to a request (requires --reply-to)
-    --reply-to <id>                Link to event ID (42 or 42:BOXE)
-    --thread <name>                Threaded routing: seed recipients once, then reuse thread members
-    broadcast + --thread reuses prior thread members; seed with @mentions first
-
-
-Sender:
-    --from <name>                  External sender identity (alias: -b)
-    --name <name>                  Your identity (agent name or UUID)
-
-
-Inline bundle (attach structured context):
-    --title <text>                 Create and attach bundle inline
-    --description <text>           Bundle description (required with --title)
-    --events <ids>                 Event IDs/ranges: 1,2,5-10
-    --files <paths>                Comma-separated file paths
-    --transcript <ranges>          Format: 3-14:normal,6:full,22-30:detailed
-    --extends <id>                 Parent bundle (optional)
-  See 'hcom bundle --help' for bundle details
-
-
-Examples:
-    hcom send @luna -- Hello there! 
-    hcom send @luna @nova --intent request -- Can you help? 
-    hcom send -- Broadcast message to everyone 
-    echo 'Complex message' | hcom send @luna 
-    hcom send @luna <<'EOF'        
-    Multi-line message with special chars 
-    EOF                            
-
-## list
-
-Usage:
-  hcom list                       All alive agents, read receipts
-    -v                             Verbose (directory, session, etc)
-    --json                         JSON array of all agents
-    --names                        Just names, one per line
-    --format TPL                   Template per agent: --format '{name} {status}'
-    Fields: name, base_name, status, status_context, status_detail,
-    status_age_seconds, description, unread_count, tool, tag, directory,
-    session_id, parent_name, agent_id, headless, created_at,
-    hooks_bound, process_bound, transcript_path, background_log_file,
-    launch_context
-
-  hcom list [self|<name>]         Single agent details
-    [field]                        Print specific field (status, directory, session_id, ...)
-    --json                         Output as JSON
-    --sh                           Shell exports: eval "$(hcom list self --sh)"
-
-  hcom list --stopped [name]      Stopped agents (from events)
-    --all                          All stopped (default: last 20)
-
-
-Status icons:
-  ▶  active      processing, reads messages very soon
-  ◉  listening   idle, reads messages in <1s
-  ■  blocked     needs human approval
-  ○  inactive    dead or stale
-  ◦  unknown     neutral
-
-
-Tool labels:
-  [CLAUDE] [GEMINI] [CODEX] [OPENCODE]  hcom-launched (PTY + hooks)
-  [claude] [gemini] [codex] [opencode]  vanilla (hooks only)
-  [AD-HOC]                              manual polling
-
-## events
-
-Usage:
-  Query the event stream (messages, status changes, file edits, lifecycle)
-
-
-Query:
-    events                         Last 20 events as JSON
-    --last N                       Limit count (default: 20)
-    --all                          Include archived sessions
-    --wait [SEC]                   Block until match (default: 60s)
-    --sql EXPR                     Raw SQL WHERE (ANDed with flags)
-
-
-Filters (same flag repeated = OR, different flags = AND):
-    --agent NAME                   Agent name
-    --type TYPE                    message | status | life
-    --status VAL                   listening | active | blocked
-    --context PATTERN              tool:Bash | deliver:X (supports * wildcard)
-    --action VAL                   created | started | ready | stopped | batch_launched
-    --cmd PATTERN                  Shell command (contains, ^prefix, =exact)
-    --file PATH                    File write (*.py for glob, file.py for contains)
-    --collision                    Two agents edit same file within 30s
-    --from NAME                    Sender
-    --mention NAME                 @mention target
-    --intent VAL                   request | inform | ack
-    --thread NAME                  Thread name
-    --after TIME                   After timestamp (ISO-8601)
-    --before TIME                  Before timestamp (ISO-8601)
-
-
-Shortcuts:
-    --idle NAME                    --agent NAME --status listening
-    --blocked NAME                 --agent NAME --status blocked
-
-
-Subscribe (next matching event delivered as messages from [hcom-events]):
-    events sub list                List active subscriptions
-    events sub [filters] [--once]  Subscribe using filter flags (listed above)
-    events sub "SQL WHERE" [--once] Subscribe using raw SQL
-      --once                       Auto-remove after first match
-      --for <name>                 Subscribe on behalf of another agent
-    events unsub <id>              Remove subscription
-
-
-Examples:
-    events --cmd git --agent peso  
-    events sub --idle peso         Notified when peso goes idle
-    events sub --file '*.py' --once One-shot: next .py file write
-
-
-SQL reference (events_v view):
-    Base                           id, timestamp, type, instance
-    msg_*                          from, text, scope, sender_kind, delivered_to[], mentions[], intent, thread, reply_to
-    status_*                       val, context, detail
-    life_*                         action, by, batch_id, reason
-
-    type                           message, status, life
-    msg_scope                      broadcast, mentions
-    msg_sender_kind                instance, external, system
-    status_context                 tool:X, deliver:X, approval, prompt, exit:X
-    life_action                    created, started, ready, stopped, batch_launched
-
-  delivered_to/mentions are JSON arrays — use LIKE '%name%' not = 'name'
-  Use <> instead of != for SQL negation
-
-## stop
-
-Usage:
-  hcom stop                       Disconnect self from hcom
-  hcom stop <name>                Disconnect specific agent
-  hcom stop <n1> <n2> ...         Disconnect multiple
-  hcom stop tag:<name>            Disconnect all with tag
-  hcom stop all                   Disconnect all agents
-
-
-## start
-
-Usage:
-  hcom start                      Connect to hcom (from inside any AI session)
-  hcom start --as <name>          Reclaim identity (after compaction/resume/clear)
-  hcom start --orphan <name|pid>  Recover orphaned PTY process from pidtrack
-
-
-  Inside a sandbox? Prefix all hcom commands with: HCOM_DIR=$PWD/.hcom
-
-## listen
-
-Usage:
-  hcom listen [timeout]           Block until message arrives
-    [timeout]                      Timeout in seconds (alias for --timeout)
-    --timeout N                    Timeout in seconds (default: 86400)
-    --json                         Output messages as JSON
-
-
-Filter flags:
-  Supports all filter flags from 'events' command
-  (--agent, --type, --status, --file, --cmd, --from, --intent, etc.)
-  Run 'hcom events --help' for full list
-  Filters combine with --sql using AND logic
-
-
-SQL filter mode:
-    --sql "type='message'"         Custom SQL against events_v
-    --sql stopped:name             Preset: wait for agent to stop
-    --idle NAME                    Shortcut: wait for agent to go idle
-
-
-Exit codes:
-    0                              Message received / event matched
-    1                              Timeout or error
-
-  Quick unread check: hcom listen 1
-
-## status
-
-Usage:
-  hcom status                     Installation status and diagnostics
-  hcom status --logs              Include recent errors and warnings
-  hcom status --json              Machine-readable output
-
-## config
-
-Usage:
-  hcom config                     Show effective config (with sources)
-  hcom config <key>               Get one key
-  hcom config <key> <value>       Set one key
-  hcom config <key> --info        Detailed help for a key
-    --json / --edit / --reset      
-
-
-Per-agent:
-  hcom config -i <name|self> [key] [val] tag, timeout, hints, subagent_timeout
-
-
-Keys:
-    tag                            Group/label (agents become tag-*)
-    terminal                       Where new agent windows open
-    hints                          Text appended to all messages agent receives
-    notes                          Notes appended to agent bootstrap
-    subagent_timeout               Subagent keep-alive seconds after task
-    claude_args / gemini_args / codex_args / opencode_args 
-    auto_approve                   Auto-approve safe hcom commands
-    auto_subscribe                 Event auto-subscribe presets
-    name_export                    Export agent name to custom env var
-  hcom config <key> --info for details
-
-  Precedence: defaults < config.toml < env vars
-  Files: ~/.hcom/config.toml, ~/.hcom/config.env
-  HCOM_DIR: isolate per project (see 'hcom reset --help')
-
-## hooks
-
-Usage:
-  hcom hooks                      Show hook status
-  hcom hooks status               Same as above
-  hcom hooks add [tool]           Add hooks (claude | gemini | codex | opencode | all)
-  hcom hooks remove [tool]        Remove hooks (claude | gemini | codex | opencode | all)
-
-  Hooks enable automatic message delivery and status tracking.
-  Without hooks, use ad-hoc mode (run hcom start inside any AI tool).
-  Restart the tool after adding hooks to activate.
-  Remove cleans both global (~/) and HCOM_DIR-local if set.
-
-## archive
-
-Usage:
-  hcom archive                    List archived sessions (numbered)
-  hcom archive <N>                Query events from archive (1 = most recent)
-  hcom archive <N> agents         Query agents from archive
-  hcom archive <name>             Query by stable name (prefix match)
-    --here                         Filter to archives from current directory
-    --sql "expr"                   SQL WHERE filter
-    --last N                       Limit events (default: 20)
-    --json                         JSON output
-
-## reset
-
-Usage:
-  hcom reset                      Archive conversation, clear database
-  hcom reset all                  Stop all + clear db + remove hooks + reset config
-
-
-Sandbox / local mode:
-  If you can't write to ~/.hcom, set:
-    export HCOM_DIR="$PWD/.hcom"
-  Hooks install under $PWD (.claude/.gemini/.codex) or ~/.config/opencode/, state in $HCOM_DIR
-
-  To remove local setup:
-    hcom hooks remove && rm -rf "$HCOM_DIR"
-
-  Explicit location:
-    export HCOM_DIR=/your/path/.hcom
-
-
-## transcript
-
-Usage:
-  hcom transcript <name>          View agent's conversation (last 10)
-  hcom transcript <name> N        Show exchange N
-  hcom transcript <name> N-M      Show exchanges N through M
-  hcom transcript timeline        User prompts across all agents by time
-    --last N                       Limit to last N exchanges (default: 10)
-    --full                         Show complete assistant responses
-    --detailed                     Show tool I/O, file edits, errors
-    --json                         JSON output
-
-  hcom transcript search "pattern" Search hcom-tracked transcripts (rg/grep)
-    --live                         Only currently alive agents
-    --all                          All transcripts (includes non-hcom sessions)
-    --limit N                      Max results (default: 20)
-    --agent TYPE                   Filter: claude | gemini | codex | opencode
-    --exclude-self                 Exclude the searching agent's own transcript
-    --json                         JSON output
-
-  Tip: Reference ranges in messages instead of copying:
-  "read my transcript range 7-10 --full"
-
-## bundle
-
-Usage:
-  hcom bundle                     List recent bundles (alias: bundle list)
-  hcom bundle list                List recent bundles
-    --last N                       Limit count (default: 20)
-    --json                         Output JSON
-
-  hcom bundle cat <id>            Expand full bundle content
-  Shows: metadata, files (metadata only), transcript (respects detail level), events
-
-  hcom bundle prepare             Show recent context, suggest template
-    --for <agent>                  Prepare for specific agent (default: self)
-    --last-transcript N            Transcript entries to suggest (default: 20)
-    --last-events N                Events to scan per category (default: 30)
-    --json                         Output JSON
-    --compact                      Hide how-to section
-  Shows suggested transcript ranges, relevant events, files
-  Outputs ready-to-use bundle create command
-  TIP: Skip 'bundle create' — use bundle flags directly in 'hcom send'
-
-  hcom bundle show <id>           Show bundle by id/prefix
-    --json                         Output JSON
-
-  hcom bundle create "title"      Create bundle (positional or --title)
-    --title <text>                 Bundle title (alternative to positional)
-    --description <text>           Bundle description (required)
-    --events 1,2,5-10              Event IDs/ranges, comma-separated (required)
-    --files a.py,b.py              Comma-separated file paths (required)
-    --transcript RANGES            Transcript with detail levels (required)
-      Format: range:detail (3-14:normal,6:full,22-30:detailed)
-      normal = truncated | full = complete | detailed = tools+edits
-    --extends <id>                 Parent bundle for chaining
-    --bundle JSON                  Create from JSON payload
-    --bundle-file FILE             Create from JSON file
-    --json                         Output JSON
-
-
-JSON format:
-  {
-    "title": "Bundle Title",
-    "description": "What happened, decisions, state, next steps",
-    "refs": {
-      "events": ["123", "124-130"],
-      "files": ["src/auth.py", "tests/test_auth.py"],
-      "transcript": ["10-15:normal", "20:full", "30-35:detailed"]
-    },
-    "extends": "bundle:abc123"
-  }
-
-  hcom bundle chain <id>          Show bundle lineage
-    --json                         Output JSON
-
-## kill
-
-Usage:
-  hcom kill <name>                Kill process (+ close terminal pane)
-  hcom kill tag:<name>            Kill all with tag
-  hcom kill all                   Kill all with tracked PIDs
-
-
-## term
-
-Usage:
-  hcom term                       Screen dump (all PTY instances)
-  hcom term [name]                Screen dump for specific agent
-    --json                         Raw JSON output
-
-  hcom term inject <name> [text]  Inject text into agent PTY
-    --enter                        Append \r (submit). Works alone or with text.
-
-  hcom term debug on              Enable PTY debug logging (all instances)
-  hcom term debug off             Disable PTY debug logging
-  hcom term debug logs            List debug log files
-
-
-JSON fields: lines[], size[rows,cols], cursor[row,col],
-  ready, prompt_empty, input_text
-
-  Debug toggle; instances detect within ~10s.
-  Logs: ~/.hcom/.tmp/logs/pty_debug/
-
-## relay
-
-Usage:
-  hcom relay                      Show status and token
-  hcom relay new                  Create new relay group
-  hcom relay connect <token>      Join relay group
-  hcom relay on / off             Enable/disable sync
-
-
-Setup:
-  1. 'relay new' to get token
-  2. 'relay connect <token>' on each device
-
-
-Custom broker:
-  hcom relay new --broker mqtts://host:port --password <broker-auth-secret> 
-  hcom relay connect <token> --password <secret> 
-
-
-Daemon:
-  hcom relay daemon               Show daemon status
-  hcom relay daemon start         Start the relay daemon
-  hcom relay daemon stop          Stop the daemon (SIGKILL after 5s)
-  hcom relay daemon restart       Restart the daemon
-
-
-## run
-
-Usage:
-  hcom run                        List available workflow/launch scripts and more info
-  hcom run <name> [args]          Execute script
-  hcom run <name> --help          Script options
-  hcom run docs                   CLI reference + config + script creation guide
-
-  Docs sections:
-    hcom run docs --cli            CLI reference only
-    hcom run docs --config         Config settings only
-    hcom run docs --scripts        Script creation guide
-
-  User scripts: ~/.hcom/scripts/
-
-## update
-
-Usage:
-  hcom update                     Check for and apply updates
-  hcom update --check             Only check — print status without applying
-
-  Detects install method and runs the right update command:
-    brew install    → brew upgrade hcom
-    uv tool install → uv tool upgrade hcom
-    pip install     → pip install -U hcom
-    curl installer  → re-run hcom-installer.sh
-
-## claude
-
-Usage:
-  hcom [N] claude [args...]       Launch N Claude agents (default N=1)
-
-    hcom claude                        Runs in current terminal
-    hcom 3 claude                      Opens 3 new terminal windows
-    hcom 3 claude -p "prompt"          3 headless in background
-    hcom 1 claude --agent <name>       .claude/agents/<name>.md
-    hcom claude --model sonnet|opus|haiku Use a specific model
-
-hcom Flags:
-    --tag <name>                 Group tag (names become tag-*)
-    --terminal <preset>          Where new windows open
-    --hcom-prompt <text>          Initial prompt
-    --hcom-system-prompt <text>   System prompt
-
-Environment:
-    HCOM_CLAUDE_ARGS             Default args (merged with CLI)
-    HCOM_TAG                     Group tag (agents become tag-*)
-    HCOM_TERMINAL                default | <preset> | "cmd {script}"
-    HCOM_HINTS                   Appended to messages received
-    HCOM_NOTES                   One-time bootstrap notes
-    HCOM_SUBAGENT_TIMEOUT        Seconds subagents keep-alive after task
-
-Resume / Fork:
-    hcom r <name>                  Resume stopped agent by name
-    hcom f <name>                  Fork agent session (active or stopped)
-
-  Run "claude --help" for claude options.
-  Run "hcom config terminal --info" for terminal presets.
-
-## gemini
-
-Usage:
-  hcom [N] gemini [args...]       Launch N Gemini agents (default N=1)
-
-    hcom gemini                        Runs in current terminal
-    hcom 3 gemini                      Opens 3 new terminal windows
-    hcom N gemini --yolo               Flags forwarded to gemini
-    hcom gemini --model gemini-3.1-pro-preview|gemini-2.5-flash Use a specific model
-
-hcom Flags:
-    --tag <name>                 Group tag (names become tag-*)
-    --terminal <preset>          Where new windows open
-    --hcom-prompt <text>          Initial prompt
-    --hcom-system-prompt <text>   System prompt
-
-Environment:
-    HCOM_GEMINI_ARGS             Default args (merged with CLI)
-    HCOM_TAG                     Group tag (agents become tag-*)
-    HCOM_TERMINAL                default | <preset> | "cmd {script}"
-    HCOM_HINTS                   Appended to messages received
-    HCOM_NOTES                   One-time bootstrap notes
-    HCOM_GEMINI_SYSTEM_PROMPT    System prompt (env var)
-
-Resume:
-    hcom r <name>                  Resume stopped agent by name
-  Gemini does not support session forking (hcom f).
-
-  Run "gemini --help" for gemini options.
-  Run "hcom config terminal --info" for terminal presets.
-
-## codex
-
-Usage:
-  hcom [N] codex [args...]       Launch N Codex agents (default N=1)
-
-    hcom codex                         Runs in current terminal
-    hcom 3 codex                       Opens 3 new terminal windows
-    hcom codex --sandbox danger-full-access Flags forwarded to codex
-    hcom codex --model gpt-5.4|gpt-5.4-mini Use a specific model
-
-hcom Flags:
-    --tag <name>                 Group tag (names become tag-*)
-    --terminal <preset>          Where new windows open
-    --hcom-prompt <text>          Initial prompt
-    --hcom-system-prompt <text>   System prompt
-
-Environment:
-    HCOM_CODEX_ARGS              Default args (merged with CLI)
-    HCOM_TAG                     Group tag (agents become tag-*)
-    HCOM_TERMINAL                default | <preset> | "cmd {script}"
-    HCOM_HINTS                   Appended to messages received
-    HCOM_NOTES                   One-time bootstrap notes
-    HCOM_CODEX_SYSTEM_PROMPT     System prompt (env var or config)
-
-Resume / Fork:
-    hcom r <name>                  Resume stopped agent by name
-    hcom f <name>                  Fork agent session (active or stopped)
-
-  Run "codex --help" for codex options.
-  Run "hcom config terminal --info" for terminal presets.
-
-## opencode
-
-Usage:
-  hcom [N] opencode [args...]       Launch N OpenCode agents (default N=1)
-
-    hcom opencode                      Runs in current terminal
-    hcom 3 opencode                    Opens 3 new terminal windows
-    hcom opencode --model anthropic/claude-sonnet-4-6|openai/gpt-5.4 Use a specific model
-
-hcom Flags:
-    --tag <name>                 Group tag (names become tag-*)
-    --terminal <preset>          Where new windows open
-    --hcom-prompt <text>          Initial prompt
-    --hcom-system-prompt <text>   System prompt
-
-Environment:
-    HCOM_OPENCODE_ARGS           Default args (merged with CLI)
-    HCOM_TAG                     Group tag (agents become tag-*)
-    HCOM_TERMINAL                default | <preset> | "cmd {script}"
-    HCOM_HINTS                   Appended to messages received
-    HCOM_NOTES                   One-time bootstrap notes
-
-Resume / Fork:
-    hcom r <name>                  Resume stopped agent by name
-    hcom f <name>                  Fork agent session (active or stopped)
-
-  Run "opencode --help" for opencode options.
-  Run "hcom config terminal --info" for terminal presets.
+hcom launch flags:
+
+| Flag | Purpose |
+|---|---|
+| `--tag <name>` | Group label — agents spawn as `tag-name` and can be addressed as `@tag` |
+| `--terminal <preset>` | Where windows open: `kitty`, `wezterm`, `tmux`, `cmux`, `iterm`, … |
+| `--dir <path>` | Working directory for the agent |
+| `--headless` | Run in background with no terminal window |
+| `--device <name>` | Spawn on a remote device (via relay) |
+| `--hcom-prompt <text>` | Initial user prompt |
+| `--hcom-system-prompt <text>` | System prompt override |
+
+Anything else is forwarded to the tool: `--model sonnet`, `--yolo`, `--sandbox danger-full-access`, `-p`, etc.
+
+### Observe
+
+```bash
+hcom list                           # who's alive, status, unread counts
+hcom term [name]                    # view/inject into an agent's PTY screen
+hcom transcript <name> [N-M]        # read an agent's conversation
+hcom events --agent <name>          # event history (messages, file edits, lifecycle)
+```
+
+### Drive
+
+```bash
+hcom send -b @luna -- hey           # one-off message to an agent
+hcom run <script>                   # run a workflow (debate, confess, fatcow, …)
+hcom run                            # list available scripts
+```
+
+### Configure
+
+```bash
+hcom hooks add|remove [tool]        # install/remove tool hooks
+hcom config                         # view/edit global + per-agent settings
+hcom status [--logs]                # installation + diagnostics
+hcom archive [N]                    # browse past sessions
+hcom reset [all]                    # archive + clear (+ reset hooks/config)
+hcom update                         # self-update
+```
+
+### Sync across devices
+
+```bash
+hcom relay new                      # create group, get join token
+hcom relay connect <token>          # join from another device
+hcom relay on|off                   # toggle sync
+hcom relay daemon start|stop        # manage background daemon
 ```
 
 </details>
@@ -820,370 +292,82 @@ Resume / Fork:
 <details>
 <summary>Config</summary>
 
+### Configuration
+
+Config lives in `~/.hcom/config.toml`. Precedence: defaults < `config.toml` < env vars.
+
+```bash
+hcom config                       # show all values with sources
+hcom config <key>                 # get
+hcom config <key> <value>         # set
+hcom config <key> --info          # detailed help for a key
+hcom config --edit                # open config.toml in $EDITOR
+hcom config -i <name|self> ...    # per-agent override (tag, timeout, hints, subagent_timeout)
 ```
-# Config Settings
 
-File: ~/.hcom/config.toml
-Precedence: defaults < config.toml < env vars
-
-Commands:
-  hcom config                 Show all values
-  hcom config <key> <val>     Set value
-  hcom config <key> --info    Detailed help for a setting
-  hcom config --edit          Open in $EDITOR
-
-HCOM_TAG - Group tag for launched instances
-
-Purpose:
-  Creates named groups of agents that can be addressed together.
-  When set, launched instances get names like: <tag>-<name>
-
-Usage:
-  hcom config tag myteam        # Set tag
-  hcom config tag ""            # Clear tag
-
-  # Or via environment:
-  HCOM_TAG=myteam hcom 3 claude
-
-Effect:
-  Without tag: launches create → luna, nova, kira
-  With tag "dev": launches create → dev-luna, dev-nova, dev-kira
-
-Addressing:
-  @dev         → sends to all agents with tag "dev"
-  @dev-luna    → sends to specific agent
-
-Allowed characters: letters, numbers, hyphens (a-z, A-Z, 0-9, -)
-
-HCOM_HINTS - Text injected with all messages
-
-Purpose:
-  Appends text to every message received by launched agents.
-  Useful for persistent instructions or context.
-
-Usage:
-  hcom config hints "Always respond in JSON format"
-  hcom config hints ""   # Clear hints
-
-Example:
-  hcom config hints "You are part of team-alpha. Coordinate with @team-alpha members."
-
-Notes:
-  - Hints are appended to message content, not system prompt
-  - Each agent can have different hints (set via hcom config -i <name> hints)
-  - Global hints apply to all new launches
-
-HCOM_NOTES - One-time notes appended to bootstrap
-
-  Custom text added to agent system context at startup.
-  Unlike HCOM_HINTS (per-message), this is injected once and does not repeat.
-
-Usage:
-  hcom config notes "Always check hcom list before spawning new agents"
-  hcom config notes ""                            # Clear
-  HCOM_NOTES="tips" hcom 1 claude                 # Per-launch override
-
-  Changing after launch has no effect (bootstrap already delivered).
-
-HCOM_TIMEOUT - Advanced: idle timeout for headless/vanilla Claude (seconds)
-
-Default: 86400 (24 hours)
-
-This setting only applies to:
-  - Headless Claude: hcom N claude -p
-  - Vanilla Claude: claude + hcom start
-
-Does NOT apply to:
-  - Interactive PTY mode: hcom N claude (main path)
-  - Gemini or Codex
-
-How it works:
-  - Claude's Stop hook runs when Claude goes idle
-  - Hook waits up to TIMEOUT seconds for a message
-  - If no message within timeout, instance is unregistered
-
-Usage (if needed):
-  hcom config HCOM_TIMEOUT 3600   # 1 hour
-  export HCOM_TIMEOUT=3600        # via environment
-
-HCOM_SUBAGENT_TIMEOUT - Timeout for Claude subagents (seconds)
-
-Default: 30
-
-Purpose:
-  How long Claude waits for a subagent (Task tool) to complete.
-  Shorter than main timeout since subagents should be quick.
-
-Usage:
-  hcom config subagent_timeout 60    # 1 minute
-  hcom config subagent_timeout 30    # 30 seconds (default)
-
-Notes:
-  - Only applies to Claude Code's Task tool spawned agents
-  - Parent agent blocks until subagent completes or times out
-  - Increase for complex subagent tasks
-
-HCOM_CLAUDE_ARGS - Default args passed to claude on launch
-
-Example: hcom config claude_args "--model opus"
-Clear:   hcom config claude_args ""
-
-Merged with launch-time cli args (launch args win on conflict).
-
-HCOM_GEMINI_ARGS - Default args passed to gemini on launch
-
-Example: hcom config gemini_args "--model gemini-2.5-flash"
-Clear:   hcom config gemini_args ""
-
-Merged with launch-time cli args (launch args win on conflict).
-
-HCOM_CODEX_ARGS - Default args passed to codex on launch
-
-Example: hcom config codex_args "--search"
-Clear:   hcom config codex_args ""
-
-Merged with launch-time cli args (launch args win on conflict).
-
-HCOM_OPENCODE_ARGS - Default args passed to opencode on launch
-
-Example: hcom config opencode_args "--model o3"
-Clear:   hcom config opencode_args ""
-
-Merged with launch-time cli args (launch args win on conflict).
-
-HCOM_CODEX_SANDBOX_MODE - Codex sandbox mode (e.g., off) (string)
-
-HCOM_GEMINI_SYSTEM_PROMPT - System prompt for gemini on launch (string)
-
-HCOM_CODEX_SYSTEM_PROMPT - System prompt for codex on launch (string)
-
-HCOM_TERMINAL — where hcom opens new agent windows
-
-Managed (open + close on kill):
-  kitty          auto split/tab/window
-  wezterm        auto tab/split/window
-  tmux           detached sessions
-  cmux           workspaces
-
-  Variants:
-    kitty: kitty-window, kitty-tab, kitty-split
-    wezterm: wezterm-window, wezterm-tab, wezterm-split
-    tmux: tmux-split
-
-Other (opens window only):
-  terminal.app
-  iterm
-  ghostty
-  alacritty
-  ttab
-  zellij
-  waveterm
-
-Custom command (open only):
-  hcom config terminal "my-terminal -e bash {script}"
-
-Custom preset with close (~/.hcom/config.toml):
-  [terminal.presets.myterm]
-  open = "myterm spawn -- bash {script}"
-  close = "myterm kill --id {pane_id}"
-  binary = "myterm"
-  pane_id_env = "MYTERM_PANE_ID"
-
-Placeholders:
-  {script}     = hcom-generated launch wrapper script path
-  {pane_id}    = pane/window/workspace ID from pane_id_env; falls back to {id}
-  {process_id} = HCOM_PROCESS_ID for the launched agent
-  {pid}        = launched terminal process ID
-  {id}         = first line of stdout captured from the open command
-
-Set:    hcom config terminal kitty
-Reset:  hcom config terminal default
-
-HCOM_AUTO_APPROVE - Auto-approve safe hcom commands
-
-Purpose:
-  When enabled, Claude/Gemini/Codex auto-approve "safe" hcom commands
-  without requiring user confirmation.
-
-Usage:
-  hcom config auto_approve 1    # Enable auto-approve
-  hcom config auto_approve 0    # Disable (require approval)
-
-Safe commands (auto-approved when enabled):
-  send, start, list, events, listen, relay, config,
-  transcript, archive, status, help, --help, --version
-
-Always require approval:
-  - hcom reset          (archives and clears database)
-  - hcom stop           (stops instances)
-  - hcom <N> claude     (launches new instances)
-
-Values: 1, true, yes, on (enabled) | 0, false, no, off, "" (disabled)
-
-HCOM_AUTO_SUBSCRIBE - Auto-subscribe event presets for new instances
-
-Default: collision
-
-Purpose:
-  Comma-separated list of event subscriptions automatically added
-  when an instance registers with 'hcom start'.
-
-Usage:
-  hcom config auto_subscribe "collision,created"
-  hcom config auto_subscribe ""   # No auto-subscribe
-
-Available presets:
-  collision    - Alert when agents edit same file (within 30s window)
-  created      - Notify when new instances join
-  stopped      - Notify when instances leave
-  blocked      - Notify when any instance is blocked (needs approval)
-
-Notes:
-  - Instances can add/remove subscriptions at runtime
-  - See 'hcom events --help' for subscription management
-
-HCOM_NAME_EXPORT - Export instance name to custom env var
-
-Purpose:
-  When set, launched instances will have their name exported to
-  the specified environment variable. Useful for scripts that need
-  to reference the current instance name.
-
-Usage:
-  hcom config name_export "MY_AGENT_NAME"   # Export to MY_AGENT_NAME
-  hcom config name_export ""                 # Disable export
-
-Example:
-  # Set export variable
-  hcom config name_export "HCOM_NAME"
-
-  # Now launched instances have:
-  # HCOM_NAME=luna (or whatever name was generated)
-
-  # Scripts can use it:
-  # hcom send "@$HCOM_NAME completed task"
-
-Notes:
-  - Only affects hcom-launched instances (hcom N claude/gemini/codex)
-  - Variable name must be a valid shell identifier
-  - Works alongside HCOM_PROCESS_ID (always set) for identity
-
-HCOM_RELAY - MQTT broker URL
-
-Empty = use public brokers (broker.emqx.io, broker.hivemq.com, test.mosquitto.org).
-Set automatically by 'hcom relay new' (pins first working broker).
-Stored in `[relay]` in `config.toml`; relay fields are file-only and are not overridden from the environment.
-
-Private broker: hcom relay new --broker mqtts://host:port
-
-HCOM_RELAY_ID - Shared UUID for relay group
-
-Generated by 'hcom relay new'. Other devices join with 'hcom relay connect <token>'.
-Stored in `[relay]` in `config.toml`; relay fields are file-only and are not overridden from the environment.
-All devices with the same relay_id sync state via MQTT pub/sub.
-
-HCOM_RELAY_TOKEN - Auth token for MQTT broker
-
-Optional. Set via 'hcom relay new --password <secret>' or directly here.
-Stored in `[relay]` in `config.toml`; relay fields are file-only and are not overridden from the environment.
-Only needed if your broker requires authentication.
-
-HCOM_RELAY_ENABLED - Enable or disable relay sync
-
-Default: true (when relay is configured)
-Stored in `[relay]` in `config.toml`; relay fields are file-only and are not overridden from the environment.
-
-Usage:
-  hcom config relay_enabled false    Disable relay sync
-  hcom config relay_enabled true     Re-enable relay sync
-
-Temporarily disables MQTT sync without removing relay configuration.
-
-Per-instance config: hcom config -i <name> <key> [value]
-  Keys: tag, timeout, hints, subagent_timeout
+### Keys
+
+| Key | Purpose |
+|---|---|
+| `tag` | Group label — launched agents become `tag-name` |
+| `hints` | Text appended to every message the agent receives |
+| `notes` | Text appended to bootstrap (one-time, at launch) |
+| `auto_approve` | Auto-approve safe hcom commands (send/list/events/…) |
+| `auto_subscribe` | Event subscription presets: `collision`, `created`, `stopped`, `blocked` |
+| `timeout` | Idle timeout for headless/vanilla Claude (seconds) |
+| `subagent_timeout` | Keep-alive for Claude subagents (seconds) |
+| `name_export` | Export instance name to a custom env var |
+| `terminal` | Where new agent windows open (`hcom config terminal --info`) |
+| `claude_args` / `gemini_args` / `codex_args` / `opencode_args` | Default args passed to the tool (launch-time args win) |
+| `codex_sandbox_mode` | `off`, `workspace`, … |
+| `gemini_system_prompt` / `codex_system_prompt` | System prompt injected on launch |
+| `relay` / `relay_id` / `relay_token` / `relay_psk` / `relay_enabled` | Relay config (see `hcom relay --help`) |
+
+### Scope
+
+```bash
+hcom config tag mycrew                          # global
+hcom config -i luna hints "respond in JSON"     # per-agent
+HCOM_TAG=dev hcom 3 claude                      # per-launch env
 ```
+
+### Per-project isolation
+
+```bash
+export HCOM_DIR="$PWD/.hcom"    # isolate state + hooks to this project
+hcom hooks remove && rm -rf "$HCOM_DIR"
+```
+
+Run `hcom config <key> --info` or `hcom run docs --config` for the full per-key reference.
+
+Edit `~/.hcom/env` to set env vars passed to every launched agent (e.g. `ANTHROPIC_MODEL`, `GEMINI_MODEL`, API keys). Any non-`HCOM_*` key works.
 
 </details>
 
 <details>
-<summary>Scripts</summary>
+<summary>Workflow Scripts</summary>
 
+### Multi-agent workflows
+
+Bundled and user scripts (`~/.hcom/scripts/`) for multi-agent patterns:
+
+```bash
+hcom run                   # list available scripts
+hcom run debate "topic"    # run one
+hcom run docs              # tell agent to run this to create any new workflow
 ```
-# Creating Custom Scripts
 
-## Location
+### Included Scripts
 
-  User scripts:    ~/.hcom/scripts/
-  File types:      *.sh (bash), *.py (python3)
+Tell agent to run them:
 
-User scripts shadow bundled scripts with the same name.
-Scripts are discovered automatically — drop a file and run `hcom run <name>`.
-Add a description comment on line 2 (after shebang) — it shows in `hcom run` listings.
+**`hcom run confess`** — An agent (or background clone) writes an honesty self-eval. A spawned calibrator reads the target's transcript independently. A judge compares both reports and sends back a verdict via hcom message.
 
-## Shell Script Template
+**`hcom run debate`** — A judge spawns and sets up a debate with existing agents. It coordinates rounds in a shared thread where all agents see each other's arguments, with shared context of workspace files and transcripts.
 
-  #!/usr/bin/env bash
-  # Brief description shown in hcom run list.
-  set -euo pipefail
+**`hcom run fatcow`** — headless agent reads every file in a path, subscribes to file edit events to stay current, and answers other agents on demand.
 
-  name_flag=""
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      -h|--help) echo "Usage: hcom run myscript [OPTIONS]"; exit 0 ;;
-      --name) name_flag="$2"; shift 2 ;;
-      --target) target="$2"; shift 2 ;;
-      *) shift ;;
-    esac
-  done
-
-  name_arg=""
-  [[ -n "$name_flag" ]] && name_arg="--name $name_flag"
-
-  # Your logic here
-  hcom send "@${target}" $name_arg --intent request -- "Do the task"
-
-## Identity Handling
-
-hcom passes --name to scripts automatically. Always parse and forward it:
-
-  name_arg=""
-  [[ -n "$name_flag" ]] && name_arg="--name $name_flag"
-  hcom send @target $name_arg -- "message"
-  hcom list self --json $name_arg
-
-## Launching & Cleaning Up Agents
-
-Launch output includes "Names: <name>" — parse to track spawned agents:
-
-  LAUNCHED_NAMES=()
-  track_launch() {
-    local output="$1"
-    local names
-    names=$(echo "$output" | grep '^Names: ' | sed 's/^Names: //' | tr ',' '\n' | xargs)
-    for n in $names; do LAUNCHED_NAMES+=("$n"); done
-  }
-  cleanup() {
-    for name in "${LAUNCHED_NAMES[@]}"; do
-      hcom kill "$name" --go 2>/dev/null || true
-    done
-  }
-  trap cleanup ERR INT TERM
-
-  launch_out=$(hcom 1 claude --tag worker --go --headless 2>&1)
-  track_launch "$launch_out"
-
-## Reference Examples
-
-View source of any bundled or user script:
-
-  hcom run <name> --source
-
-See `hcom run docs --cli` for full CLI command reference.
-Available scripts:
-  hcom run confess --source
-  hcom run debate --source
-  hcom run fatcow --source
-```
+Custom scripts: drop `*.sh` or `*.py` into `~/.hcom/scripts/` — auto-discovered, override bundled scripts of the same name. Ask an agent to author one; `hcom run docs --scripts` is the authoring guide.
 
 </details>
 
@@ -1200,8 +384,6 @@ cd hcom
 cargo test
 cargo build
 ```
-
----
 
 ### Using local build
 
@@ -1224,7 +406,7 @@ hcom -v    # run local build
 For concurrent worktrees, scope each to its own DB:
 
 ```bash
-HCOM_DIR=$(pwd)/.hcom HCOM_DEV_ROOT=$(pwd) hcom claude
+HCOM_DIR=$PWD/.hcom HCOM_DEV_ROOT=$PWD hcom claude
 ```
 
 </details>
