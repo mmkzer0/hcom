@@ -77,7 +77,11 @@ const EVENTS_HELP_2: &[HelpEntry] = &[
     ),
     ("    --once", "Auto-remove after first match"),
     ("    --for <name>", "Subscribe on behalf of another agent"),
-    ("  events unsub <id>", "Remove subscription"),
+    (
+        "    --device ID",
+        "Install/list sub on remote device (requires --for for create)",
+    ),
+    ("  events unsub <id> [--device ID]", "Remove subscription (local or remote)"),
     ("", ""),
     ("Examples:", ""),
     ("  events --cmd git --agent peso", ""),

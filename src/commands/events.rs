@@ -71,6 +71,9 @@ pub struct EventsSubArgs {
     /// Subscribe on behalf of another agent
     #[arg(long = "for")]
     pub for_agent: Option<String>,
+    /// Target remote device short_id (e.g., NUVA) — installs the sub on that device
+    #[arg(long)]
+    pub device: Option<String>,
     /// Composable event filters
     #[command(flatten)]
     pub filters: EventFilterArgs,
@@ -83,6 +86,9 @@ pub struct EventsSubArgs {
 pub struct EventsUnsubArgs {
     /// Subscription ID to remove
     pub id: String,
+    /// Target remote device short_id (e.g., NUVA) — removes the sub on that device
+    #[arg(long)]
+    pub device: Option<String>,
 }
 
 /// Args for `hcom events launch`.
@@ -309,31 +315,26 @@ fn events_sub_filter(
     create_filter_subscription(db, filters, sql_parts, caller, once, false)
 }
 
-/// Core subscription creation logic. When `silent` is true, suppresses all stdout output.
-/// Used by both the CLI `events sub` command and `auto_subscribe_defaults`.
-pub(crate) fn create_filter_subscription(
+/// Outcome of a subscription insert attempt.
+pub(crate) enum SubCreateOutcome {
+    Created { id: String, final_sql: String },
+    AlreadyExists { id: String },
+}
+
+/// Build and insert a filter-based subscription row into `kv`.
+/// No printing — callers format output as appropriate.
+pub(crate) fn build_and_insert_filter_subscription(
     db: &HcomDb,
     filters: &HashMap<String, Vec<String>>,
     sql_parts: &[String],
     caller: &str,
     once: bool,
-    silent: bool,
-) -> i32 {
+) -> Result<SubCreateOutcome, String> {
     // Build SQL from filters
     let mut sql = match build_sql_from_flags(filters) {
         Ok(s) if !s.is_empty() => s,
-        Ok(_) => {
-            if !silent {
-                eprintln!("Error: No valid filters provided");
-            }
-            return 1;
-        }
-        Err(e) => {
-            if !silent {
-                eprintln!("Error: Filter error: {e}");
-            }
-            return 1;
-        }
+        Ok(_) => return Err("No valid filters provided".to_string()),
+        Err(e) => return Err(format!("Filter error: {e}")),
     };
 
     // Validate and combine user-provided SQL parts
@@ -343,10 +344,7 @@ pub(crate) fn create_filter_subscription(
             &format!("SELECT 1 FROM events_v WHERE ({manual_sql}) LIMIT 0"),
             [],
         ) {
-            if !silent {
-                eprintln!("Error: Invalid SQL: {e}");
-            }
-            return 1;
+            return Err(format!("Invalid SQL: {e}"));
         }
         sql = format!("({sql}) AND ({manual_sql})");
     }
@@ -374,10 +372,7 @@ pub(crate) fn create_filter_subscription(
 
     // Check duplicate
     if db.kv_get(&sub_key).ok().flatten().is_some() {
-        if !silent {
-            println!("Subscription {sub_id} already exists");
-        }
-        return 0;
+        return Ok(SubCreateOutcome::AlreadyExists { id: sub_id });
     }
 
     let now = crate::shared::time::now_epoch_f64();
@@ -395,49 +390,83 @@ pub(crate) fn create_filter_subscription(
 
     let _ = db.kv_set(&sub_key, Some(&sub_data.to_string()));
 
-    if !silent {
-        println!("Subscription {sub_id} created");
+    Ok(SubCreateOutcome::Created {
+        id: sub_id,
+        final_sql: sql,
+    })
+}
 
-        // Show historical match count
-        if let Ok(count) = db.conn().query_row(
-            &format!("SELECT COUNT(*) FROM events_v WHERE ({sql})"),
-            [],
-            |row| row.get::<_, i64>(0),
-        ) {
-            if count > 0 {
-                println!("  historical matches: {count} events");
-                println!("  You will be notified on the next matching event(s)");
+/// Core subscription creation logic. When `silent` is true, suppresses all stdout output.
+/// Used by both the CLI `events sub` command and `auto_subscribe_defaults`.
+pub(crate) fn create_filter_subscription(
+    db: &HcomDb,
+    filters: &HashMap<String, Vec<String>>,
+    sql_parts: &[String],
+    caller: &str,
+    once: bool,
+    silent: bool,
+) -> i32 {
+    let outcome = match build_and_insert_filter_subscription(db, filters, sql_parts, caller, once) {
+        Ok(o) => o,
+        Err(e) => {
+            if !silent {
+                eprintln!("Error: {e}");
+            }
+            return 1;
+        }
+    };
+
+    match outcome {
+        SubCreateOutcome::AlreadyExists { id } => {
+            if !silent {
+                println!("Subscription {id} already exists");
             }
         }
+        SubCreateOutcome::Created { id, final_sql } => {
+            if !silent {
+                println!("Subscription {id} created");
 
-        maybe_show_tip(db, caller, "sub:created");
+                if let Ok(count) = db.conn().query_row(
+                    &format!("SELECT COUNT(*) FROM events_v WHERE ({final_sql})"),
+                    [],
+                    |row| row.get::<_, i64>(0),
+                ) {
+                    if count > 0 {
+                        println!("  historical matches: {count} events");
+                        println!("  You will be notified on the next matching event(s)");
+                    }
+                }
+
+                maybe_show_tip(db, caller, "sub:created");
+            }
+        }
     }
 
     0
 }
 
-/// Create a raw SQL subscription.
-fn events_sub_sql(db: &HcomDb, sql_parts: &[String], caller: &str, once: bool) -> i32 {
+/// Build and insert a raw-SQL subscription row into `kv`. No printing.
+pub(crate) fn build_and_insert_sql_subscription(
+    db: &HcomDb,
+    sql_parts: &[String],
+    caller: &str,
+    once: bool,
+) -> Result<SubCreateOutcome, String> {
     let sql = sql_parts.join(" ").replace("\\!", "!");
 
-    // Validate SQL
     if let Err(e) = db
         .conn()
         .execute(&format!("SELECT 1 FROM events_v WHERE ({sql}) LIMIT 0"), [])
     {
-        eprintln!("Invalid SQL: {e}");
-        return 1;
+        return Err(format!("Invalid SQL: {e}"));
     }
 
-    // Generate ID (deterministic — deduplicates same SQL+caller+once mode)
     let hash = sha256_hash(&format!("{caller}{sql}{once}"));
     let sub_id = format!("sub-{}", &hash[..8]);
     let sub_key = format!("events_sub:{sub_id}");
 
-    // Check duplicate
     if db.kv_get(&sub_key).ok().flatten().is_some() {
-        println!("Subscription {sub_id} already exists");
-        return 0;
+        return Ok(SubCreateOutcome::AlreadyExists { id: sub_id });
     }
 
     let now = crate::shared::time::now_epoch_f64();
@@ -453,6 +482,30 @@ fn events_sub_sql(db: &HcomDb, sql_parts: &[String], caller: &str, once: bool) -
     });
 
     let _ = db.kv_set(&sub_key, Some(&sub_data.to_string()));
+
+    Ok(SubCreateOutcome::Created {
+        id: sub_id,
+        final_sql: sql,
+    })
+}
+
+/// Create a raw SQL subscription.
+fn events_sub_sql(db: &HcomDb, sql_parts: &[String], caller: &str, once: bool) -> i32 {
+    let outcome = match build_and_insert_sql_subscription(db, sql_parts, caller, once) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+
+    let (sub_id, sql) = match outcome {
+        SubCreateOutcome::AlreadyExists { id } => {
+            println!("Subscription {id} already exists");
+            return 0;
+        }
+        SubCreateOutcome::Created { id, final_sql } => (id, final_sql),
+    };
 
     // Output
     println!("{sub_id}");
@@ -495,8 +548,17 @@ fn events_sub_sql(db: &HcomDb, sql_parts: &[String], caller: &str, once: bool) -
 
 /// Handle `hcom events sub` subcommand.
 fn cmd_events_sub(db: &HcomDb, args: &EventsSubArgs, caller_name: Option<&str>) -> i32 {
-    // Handle 'list' subcommand
-    if args.rest.first().map(|s| s.as_str()) == Some("list") {
+    let is_list = args.rest.first().map(|s| s.as_str()) == Some("list");
+
+    // Remote dispatch: install/list subscriptions on another device.
+    if let Some(device) = args.device.as_deref() {
+        if is_list {
+            return cmd_events_sub_remote_list(db, device);
+        }
+        return cmd_events_sub_remote_create(db, args, device);
+    }
+
+    if is_list {
         return events_sub_list(db);
     }
 
@@ -602,6 +664,10 @@ fn cmd_events_unsub(db: &HcomDb, args: &EventsUnsubArgs) -> i32 {
         sub_id = format!("sub-{sub_id}");
     }
 
+    if let Some(device) = args.device.as_deref() {
+        return cmd_events_unsub_remote(db, device, &sub_id);
+    }
+
     let key = format!("events_sub:{sub_id}");
 
     // Check exists
@@ -614,6 +680,162 @@ fn cmd_events_unsub(db: &HcomDb, args: &EventsUnsubArgs) -> i32 {
     let _ = db.kv_set(&key, None);
     println!("Removed {sub_id}");
     0
+}
+
+/// Install a subscription on a remote device via SUB_CREATE RPC.
+fn cmd_events_sub_remote_create(db: &HcomDb, args: &EventsSubArgs, device: &str) -> i32 {
+    let caller = match args.for_agent.as_deref() {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => {
+            eprintln!("Error: --for <name> is required when using --device (the remote device needs a caller to notify)");
+            return 1;
+        }
+    };
+
+    // Build filter map from CLI flags (no local name resolution — the remote side owns the namespace)
+    let filters = args.filters.to_filter_map();
+    let sql_parts: Vec<String> = args.rest.clone();
+
+    // Must have at least filters or sql_parts
+    if filters.is_empty() && sql_parts.is_empty() {
+        eprintln!("Error: provide at least one filter or SQL WHERE clause");
+        return 1;
+    }
+
+    let params = json!({
+        "caller": caller,
+        "filters": filters,
+        "sql_parts": sql_parts,
+        "once": args.once,
+    });
+
+    match crate::relay::control::dispatch_remote(
+        db,
+        device,
+        None,
+        crate::relay::control::rpc_action::SUB_CREATE,
+        &params,
+        crate::relay::control::RPC_DEFAULT_TIMEOUT,
+    ) {
+        Ok(result) => {
+            let id = result.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+            let resolved_caller = result
+                .get("caller")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&caller);
+            let already = result
+                .get("already_existed")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if already {
+                println!("Subscription {id} already exists on {device}");
+            } else {
+                println!("Subscription {id} created on {device} for {resolved_caller}");
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("Remote sub_create failed: {e}");
+            1
+        }
+    }
+}
+
+/// List subscriptions on a remote device via SUB_LIST RPC.
+fn cmd_events_sub_remote_list(db: &HcomDb, device: &str) -> i32 {
+    match crate::relay::control::dispatch_remote(
+        db,
+        device,
+        None,
+        crate::relay::control::rpc_action::SUB_LIST,
+        &json!({}),
+        crate::relay::control::RPC_DEFAULT_TIMEOUT,
+    ) {
+        Ok(result) => {
+            let empty = Vec::new();
+            let subs = result.get("subs").and_then(|v| v.as_array()).unwrap_or(&empty);
+            if subs.is_empty() {
+                println!("No active subscriptions on {device}");
+                return 0;
+            }
+            println!("{:<10} {:<12} {:<10} FILTER", "ID", "FOR", "MODE");
+            for sub in subs {
+                let id = sub.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                let caller = sub.get("caller").and_then(|v| v.as_str()).unwrap_or("");
+                let is_thread_member = sub
+                    .get("auto_thread_member")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let mode = if is_thread_member {
+                    "thread"
+                } else if sub.get("once").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    "once"
+                } else {
+                    "continuous"
+                };
+                let filter_display = if is_thread_member {
+                    let thread = sub
+                        .get("thread_name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?");
+                    format!("thread-member:{thread}")
+                } else if let Some(f) = sub.get("filters") {
+                    let s = f.to_string();
+                    if s.len() > 35 {
+                        let end = (0..=35).rev().find(|&i| s.is_char_boundary(i)).unwrap_or(0);
+                        format!("{}...", &s[..end])
+                    } else {
+                        s
+                    }
+                } else {
+                    let sql = sub.get("sql").and_then(|v| v.as_str()).unwrap_or("");
+                    if sql.len() > 35 {
+                        let end = (0..=35).rev().find(|&i| sql.is_char_boundary(i)).unwrap_or(0);
+                        format!("{}...", &sql[..end])
+                    } else {
+                        sql.to_string()
+                    }
+                };
+                println!("{id:<10} {caller:<12} {mode:<10} {filter_display}");
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("Remote sub_list failed: {e}");
+            1
+        }
+    }
+}
+
+/// Remove a subscription on a remote device via SUB_UNSUB RPC.
+fn cmd_events_unsub_remote(db: &HcomDb, device: &str, sub_id: &str) -> i32 {
+    let params = json!({ "id": sub_id });
+    match crate::relay::control::dispatch_remote(
+        db,
+        device,
+        None,
+        crate::relay::control::rpc_action::SUB_UNSUB,
+        &params,
+        crate::relay::control::RPC_DEFAULT_TIMEOUT,
+    ) {
+        Ok(result) => {
+            let removed = result
+                .get("removed")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if removed {
+                println!("Removed {sub_id} on {device}");
+                0
+            } else {
+                eprintln!("Not found on {device}: {sub_id}");
+                1
+            }
+        }
+        Err(e) => {
+            eprintln!("Remote sub_unsub failed: {e}");
+            1
+        }
+    }
 }
 
 /// Handle `hcom events launch [batch_id] [--timeout N]`.

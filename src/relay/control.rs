@@ -392,6 +392,9 @@ pub mod rpc_action {
     pub const TERM_INJECT: &str = "term_inject";
     pub const TRANSCRIPT: &str = "transcript";
     pub const EVENTS: &str = "events";
+    pub const SUB_CREATE: &str = "sub_create";
+    pub const SUB_LIST: &str = "sub_list";
+    pub const SUB_UNSUB: &str = "sub_unsub";
 }
 
 type RemoteRpcHandler = fn(&HcomDb, &Value, &str, &HcomConfig) -> Result<Value, String>;
@@ -407,6 +410,9 @@ const REMOTE_RPC_HANDLERS: &[(&str, RemoteRpcHandler)] = &[
     (rpc_action::TERM_INJECT, handle_remote_term_inject),
     (rpc_action::TRANSCRIPT, handle_remote_transcript),
     (rpc_action::EVENTS, handle_remote_events),
+    (rpc_action::SUB_CREATE, handle_remote_sub_create),
+    (rpc_action::SUB_LIST, handle_remote_sub_list),
+    (rpc_action::SUB_UNSUB, handle_remote_sub_unsub),
 ];
 
 pub fn advertised_remote_capabilities() -> Vec<&'static str> {
@@ -1016,6 +1022,124 @@ fn handle_remote_events(
     Ok(out)
 }
 
+fn handle_remote_sub_create(
+    db: &HcomDb,
+    params: &Value,
+    _initiated_by: &str,
+    _config: &HcomConfig,
+) -> Result<Value, String> {
+    let caller_input = required_param(params, "caller")?;
+    // Mirror local --for resolution: exact match, then prefix fallback.
+    let caller = crate::instances::resolve_display_name(db, caller_input)
+        .or_else(|| {
+            db.conn()
+                .query_row(
+                    "SELECT name FROM instances WHERE name = ?",
+                    rusqlite::params![caller_input],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok()
+        })
+        .or_else(|| {
+            db.conn()
+                .query_row(
+                    "SELECT name FROM instances WHERE name LIKE ? LIMIT 1",
+                    rusqlite::params![format!("{caller_input}%")],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok()
+        })
+        .ok_or_else(|| format!("caller '{caller_input}' not found on this device"))?;
+
+    let mut filters: crate::core::filters::FilterMap = match params.get("filters") {
+        Some(v) if !v.is_null() => serde_json::from_value(v.clone())
+            .map_err(|e| format!("invalid filters param: {e}"))?,
+        _ => crate::core::filters::FilterMap::new(),
+    };
+    // Resolve display/tag names against the remote (local-to-handler) instances table.
+    crate::core::filters::resolve_filter_names(&mut filters, db);
+    let sql_parts: Vec<String> = params
+        .get("sql_parts")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let once = bool_param(params, "once", false);
+
+    if filters.is_empty() && sql_parts.is_empty() {
+        return Err("provide at least one filter or SQL WHERE clause".to_string());
+    }
+
+    let outcome = if filters.is_empty() {
+        crate::commands::events::build_and_insert_sql_subscription(db, &sql_parts, &caller, once)?
+    } else {
+        crate::commands::events::build_and_insert_filter_subscription(
+            db, &filters, &sql_parts, &caller, once,
+        )?
+    };
+
+    match outcome {
+        crate::commands::events::SubCreateOutcome::Created { id, .. } => Ok(json!({
+            "id": id,
+            "caller": caller,
+            "already_existed": false,
+        })),
+        crate::commands::events::SubCreateOutcome::AlreadyExists { id } => Ok(json!({
+            "id": id,
+            "caller": caller,
+            "already_existed": true,
+        })),
+    }
+}
+
+fn handle_remote_sub_list(
+    db: &HcomDb,
+    _params: &Value,
+    _initiated_by: &str,
+    _config: &HcomConfig,
+) -> Result<Value, String> {
+    let rows: Vec<String> = db
+        .conn()
+        .prepare("SELECT value FROM kv WHERE key LIKE 'events_sub:%'")
+        .map_err(|e| format!("sql error: {e}"))?
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|e| format!("sql error: {e}"))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let subs: Vec<Value> = rows
+        .iter()
+        .filter_map(|v| serde_json::from_str::<Value>(v).ok())
+        .collect();
+
+    Ok(json!({ "subs": subs }))
+}
+
+fn handle_remote_sub_unsub(
+    db: &HcomDb,
+    params: &Value,
+    _initiated_by: &str,
+    _config: &HcomConfig,
+) -> Result<Value, String> {
+    let id_raw = required_param(params, "id")?;
+    let sub_id = if id_raw.starts_with("sub-") {
+        id_raw.to_string()
+    } else {
+        format!("sub-{id_raw}")
+    };
+    let key = format!("events_sub:{sub_id}");
+
+    let exists = db.kv_get(&key).ok().flatten().is_some();
+    if !exists {
+        return Ok(json!({ "id": sub_id, "removed": false }));
+    }
+    let _ = db.kv_set(&key, None);
+    Ok(json!({ "id": sub_id, "removed": true }))
+}
+
 /// Process incoming control events targeting this device.
 /// Deduplicates by timestamp to avoid re-processing.
 pub fn handle_control_events(
@@ -1506,6 +1630,9 @@ mod tests {
                 "term_inject",
                 "transcript",
                 "events",
+                "sub_create",
+                "sub_list",
+                "sub_unsub",
             ]
         );
     }
