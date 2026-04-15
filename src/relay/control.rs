@@ -1029,27 +1029,34 @@ fn handle_remote_sub_create(
     _config: &HcomConfig,
 ) -> Result<Value, String> {
     let caller_input = required_param(params, "caller")?;
-    // Mirror local --for resolution: exact match, then prefix fallback.
-    let caller = crate::instances::resolve_display_name(db, caller_input)
-        .or_else(|| {
-            db.conn()
-                .query_row(
-                    "SELECT name FROM instances WHERE name = ?",
-                    rusqlite::params![caller_input],
-                    |row| row.get::<_, String>(0),
-                )
-                .ok()
-        })
-        .or_else(|| {
-            db.conn()
-                .query_row(
-                    "SELECT name FROM instances WHERE name LIKE ? LIMIT 1",
-                    rusqlite::params![format!("{caller_input}%")],
-                    |row| row.get::<_, String>(0),
-                )
-                .ok()
-        })
-        .ok_or_else(|| format!("caller '{caller_input}' not found on this device"))?;
+    let caller_is_external = bool_param(params, "caller_is_external", false);
+    // External callers (e.g. bigboss via --as / -b) are used verbatim with no
+    // instance lookup. Instance callers follow the local --for semantics:
+    // exact match, then prefix fallback.
+    let caller = if caller_is_external {
+        caller_input.to_string()
+    } else {
+        crate::instances::resolve_display_name(db, caller_input)
+            .or_else(|| {
+                db.conn()
+                    .query_row(
+                        "SELECT name FROM instances WHERE name = ?",
+                        rusqlite::params![caller_input],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .ok()
+            })
+            .or_else(|| {
+                db.conn()
+                    .query_row(
+                        "SELECT name FROM instances WHERE name LIKE ? LIMIT 1",
+                        rusqlite::params![format!("{caller_input}%")],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .ok()
+            })
+            .ok_or_else(|| format!("caller '{caller_input}' not found on this device"))?
+    };
 
     let mut filters: crate::core::filters::FilterMap = match params.get("filters") {
         Some(v) if !v.is_null() => serde_json::from_value(v.clone())
@@ -1073,11 +1080,14 @@ fn handle_remote_sub_create(
         return Err("provide at least one filter or SQL WHERE clause".to_string());
     }
 
+    let on_hit = params.get("on_hit").and_then(|v| v.as_str());
     let outcome = if filters.is_empty() {
-        crate::commands::events::build_and_insert_sql_subscription(db, &sql_parts, &caller, once, None)?
+        crate::commands::events::build_and_insert_sql_subscription(
+            db, &sql_parts, &caller, once, on_hit,
+        )?
     } else {
         crate::commands::events::build_and_insert_filter_subscription(
-            db, &filters, &sql_parts, &caller, once, None,
+            db, &filters, &sql_parts, &caller, once, on_hit,
         )?
     };
 

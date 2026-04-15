@@ -730,13 +730,25 @@ fn cmd_events_unsub(db: &HcomDb, args: &EventsUnsubArgs) -> i32 {
 
 /// Install a subscription on a remote device via SUB_CREATE RPC.
 fn cmd_events_sub_remote_create(db: &HcomDb, args: &EventsSubArgs, device: &str) -> i32 {
-    let caller = match args.for_agent.as_deref() {
-        Some(s) if !s.is_empty() => s.to_string(),
-        _ => {
-            eprintln!("Error: --for <name> is required when using --device (the remote device needs a caller to notify)");
-            return 1;
-        }
-    };
+    // Identity selection for the remote sub:
+    //   --as NAME / -b → external caller (any name, not required to exist on remote)
+    //   --for NAME     → existing remote instance caller
+    let (caller, caller_is_external) =
+        if args.from_bigboss || args.as_name.is_some() {
+            let name = args
+                .as_name
+                .clone()
+                .unwrap_or_else(|| crate::shared::constants::SENDER.to_string());
+            (name, true)
+        } else {
+            match args.for_agent.as_deref() {
+                Some(s) if !s.is_empty() => (s.to_string(), false),
+                _ => {
+                    eprintln!("Error: --for <name>, --as <name>, or -b is required when using --device");
+                    return 1;
+                }
+            }
+        };
 
     // Build filter map from CLI flags (no local name resolution — the remote side owns the namespace)
     let filters = args.filters.to_filter_map();
@@ -748,12 +760,16 @@ fn cmd_events_sub_remote_create(db: &HcomDb, args: &EventsSubArgs, device: &str)
         return 1;
     }
 
-    let params = json!({
+    let mut params = json!({
         "caller": caller,
+        "caller_is_external": caller_is_external,
         "filters": filters,
         "sql_parts": sql_parts,
         "once": args.once,
     });
+    if let Some(text) = args.on_hit.as_deref() {
+        params["on_hit"] = json!(text);
+    }
 
     match crate::relay::control::dispatch_remote(
         db,
