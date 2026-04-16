@@ -83,14 +83,18 @@ impl App {
             .collect();
         self.ui.selected.retain(|n| live_names.contains(n));
 
-        // Detect relay_status transition to "ok" → show "relay connected" text for 5s
-        let new_status = new_data.relay_status.as_deref();
-        let old_status = self.ui.last_relay_status.as_deref();
-        if new_status == Some("ok") && old_status != Some("ok") {
+        // Edge-trigger the "relay connected" 5-second flash on not-Connected
+        // → Connected. Tracks against the derived RelayHealth, not raw KV, so
+        // the flash semantics match what the indicator actually shows.
+        let now_connected = matches!(
+            new_data.relay_health,
+            crate::relay::RelayHealth::Connected
+        );
+        if now_connected && !self.ui.last_relay_was_connected {
             self.ui.relay_text_until =
                 Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
         }
-        self.ui.last_relay_status = new_data.relay_status.clone();
+        self.ui.last_relay_was_connected = now_connected;
 
         self.data = new_data;
 

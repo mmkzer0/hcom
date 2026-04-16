@@ -201,14 +201,17 @@ fn load_all(conn: &Connection, default_limit: usize) -> DataState {
     messages.sort_by(|a, b| a.time.total_cmp(&b.time));
     events.sort_by(|a, b| a.time.total_cmp(&b.time));
 
-    // Relay status
-    let relay_enabled = check_relay_enabled();
+    // Read relay config flags once per snapshot — both relay_enabled and
+    // load_relay_state need them, so reading config.toml twice would be
+    // pointless I/O on the TUI's hot path.
+    let (configured, enabled) = read_relay_config_flags();
+    let relay_enabled = configured && enabled;
 
     // Sort agents by created_at descending (newest first)
     agents.sort_by(|a, b| b.created_at.total_cmp(&a.created_at));
     remote_agents.sort_by(|a, b| b.created_at.total_cmp(&a.created_at));
 
-    let (relay_status, relay_error) = load_relay_health(conn);
+    let relay_health = load_relay_state(conn, configured, enabled);
 
     DataState {
         agents,
@@ -218,8 +221,7 @@ fn load_all(conn: &Connection, default_limit: usize) -> DataState {
         messages,
         events,
         relay_enabled,
-        relay_status,
-        relay_error,
+        relay_health,
         search_results: None,
     }
 }
@@ -1064,25 +1066,29 @@ fn truncate_path(path: &str, max_len: usize) -> String {
 
 // ── Relay ───────────────────────────────────────────────────────
 
-/// Check relay config from config.toml (relay_id + relay_enabled live there, not KV).
-fn check_relay_enabled() -> bool {
-    (|| -> Option<bool> {
-        let table = read_config_toml()?;
-        let relay = table.get("relay")?.as_table()?;
-        let id = relay.get("id")?.as_str()?;
-        if id.is_empty() {
-            return None;
-        }
-        // Default true when absent
-        Some(
-            relay
-                .get("enabled")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true),
-        )
-    })()
-    .unwrap_or(false)
+/// Read (configured, enabled) flags from config.toml. `configured` is true
+/// when `relay.id` is a non-empty string; `enabled` is the `relay.enabled`
+/// flag (defaults true when absent — matches HcomConfig::default).
+fn read_relay_config_flags() -> (bool, bool) {
+    let Some(table) = read_config_toml() else {
+        return (false, false);
+    };
+    let Some(relay) = table.get("relay").and_then(|v| v.as_table()) else {
+        return (false, false);
+    };
+    let Some(id) = relay.get("id").and_then(|v| v.as_str()) else {
+        return (false, false);
+    };
+    if id.is_empty() {
+        return (false, false);
+    }
+    let enabled = relay
+        .get("enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    (true, enabled)
 }
+
 
 /// Read a non-empty string value from the kv table. Returns None if missing or empty.
 fn kv_get(conn: &Connection, key: &str) -> Option<String> {
@@ -1093,12 +1099,31 @@ fn kv_get(conn: &Connection, key: &str) -> Option<String> {
     .filter(|s: &String| !s.is_empty())
 }
 
-/// Load relay health: status ("ok"/"error"/None) and error message.
-fn load_relay_health(conn: &Connection) -> (Option<String>, Option<String>) {
-    (
-        kv_get(conn, "relay_status"),
-        kv_get(conn, "relay_last_error"),
-    )
+/// Build a RelayObservation from the TUI's raw connection + pidfile + caller-
+/// supplied config flags, then derive RelayHealth. The TUI snapshot path
+/// doesn't carry an HcomConfig/HcomDb pair, so we reconstruct the observation
+/// locally rather than threading those types through every snapshot call.
+/// `configured` and `enabled` are passed in so the caller can read config.toml
+/// once per snapshot rather than us re-reading it here.
+fn load_relay_state(conn: &Connection, configured: bool, enabled: bool) -> crate::relay::RelayHealth {
+    let raw_status = kv_get(conn, "relay_status");
+    let raw_error = kv_get(conn, "relay_last_error");
+    let heartbeat_age_s = kv_get(conn, crate::relay::HEARTBEAT_KEY)
+        .and_then(|s| s.parse::<f64>().ok())
+        .map(|ts| (crate::shared::time::now_epoch_f64() - ts).max(0.0));
+    let pidfile = crate::relay::worker::observe_pid_file();
+
+    let obs = crate::relay::RelayObservation {
+        configured,
+        enabled,
+        raw_status,
+        raw_error,
+        heartbeat_age_s,
+        pidfile,
+        last_push: 0.0,
+        broker: None,
+    };
+    crate::relay::derive_relay_health(&obs)
 }
 
 // ── Timestamp parsing ───────────────────────────────────────────

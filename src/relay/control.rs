@@ -855,23 +855,28 @@ fn reject_remote_secret_field(field: &str) -> Result<(), String> {
     Err(format!("{secret} is not remotely queryable"))
 }
 
-pub fn disable_local_relay(config: &HcomConfig) -> Result<bool, String> {
+pub fn disable_local_relay(config: &HcomConfig, db: &HcomDb) -> Result<bool, String> {
     let cleared_remote_state = if config.relay_enabled {
         super::client::clear_retained_state(config)
     } else {
         false
     };
     crate::commands::config::config_set("relay_enabled", "false")?;
+    // Wipe runtime-health KV so a stale "ok"/error/heartbeat from the previous
+    // session can't leak into status / TUI / JSON after the subsystem is off.
+    // Activity watermarks (relay_last_push_id etc.) are intentionally preserved
+    // — see RUNTIME_HEALTH_KV_KEYS for the rationale.
+    super::clear_runtime_relay_kv(db);
     Ok(cleared_remote_state)
 }
 
 fn handle_remote_relay_off(
-    _db: &HcomDb,
+    db: &HcomDb,
     _params: &Value,
     _initiated_by: &str,
     config: &HcomConfig,
 ) -> Result<Value, String> {
-    let cleared_remote_state = disable_local_relay(config)?;
+    let cleared_remote_state = disable_local_relay(config, db)?;
     if super::worker::is_relay_worker_running() {
         std::thread::spawn(|| {
             std::thread::sleep(Duration::from_millis(100));

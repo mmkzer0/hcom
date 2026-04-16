@@ -278,10 +278,19 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
             "relay": {
                 "configured": relay.configured,
                 "enabled": relay.enabled,
-                "status": relay.status,
-                "error": relay.error,
-                "last_push": relay.last_push,
                 "broker": relay.broker,
+                "last_push": relay.last_push,
+                // Canonical effective state — switch on `health.kind`. New consumers
+                // should prefer this over `raw` for display decisions.
+                "health": serde_json::to_value(&relay.health).unwrap_or(serde_json::Value::Null),
+                // Raw underlying signals for forensics ("why does kind=stale?").
+                // Not for display logic — that's what `health` is for.
+                "raw": {
+                    "status": relay.status,
+                    "error": relay.error,
+                    "heartbeat_age_s": relay.heartbeat_age,
+                    "pid": relay.pidfile_pid,
+                },
             },
             "delivery": {},
             "logs": {
@@ -384,46 +393,69 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
         println!("agents:    {}", parts.join(", "));
     }
 
-    // Relay — show detailed status
-    if relay.configured {
-        if relay.enabled {
-            match relay.status.as_deref() {
-                Some("ok") => println!("relay:     connected"),
-                Some("error") => {
-                    let err = relay.error.as_deref().unwrap_or("unknown error");
-                    println!("relay:     error ({err})");
-                }
-                _ => println!("relay:     enabled (not synced)"),
-            }
-        } else {
-            println!("relay:     disabled");
+    // Relay summary + worker process line both branch on the canonical
+    // RelayHealth derivation. Single source of truth — see relay/mod.rs for
+    // the precedence rules and unit tests.
+    use crate::relay::{RelayErrorReason, RelayHealth};
+    match &relay.health {
+        RelayHealth::NotConfigured => println!("relay:     not configured"),
+        RelayHealth::Disabled => println!("relay:     disabled"),
+        RelayHealth::Waiting => println!("relay:     enabled (not synced)"),
+        RelayHealth::Starting { pid } => {
+            println!("relay:     starting (PID {pid})");
         }
-    } else {
-        println!("relay:     not configured");
+        RelayHealth::Connected => println!("relay:     connected"),
+        RelayHealth::Stale { age_s, pid } => {
+            println!("relay:     stale ({:.0}s, PID {pid})", age_s);
+        }
+        RelayHealth::Error { reason, detail, pid } => {
+            println!(
+                "relay:     error ({})",
+                reason.clone().label(detail.as_deref(), *pid)
+            );
+        }
     }
 
-    // Relay worker process status — only show when relay is enabled
-    if relay.configured && relay.enabled {
-        let relay_pid_path = crate::paths::hcom_dir().join(".tmp").join("relay.pid");
-        let relay_running = if let Ok(pid_str) = std::fs::read_to_string(&relay_pid_path) {
-            if let Ok(pid) = pid_str.trim().parse::<u32>() {
-                crate::pidtrack::is_alive(pid)
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-        if relay_running {
-            let pid_str = std::fs::read_to_string(&relay_pid_path)
-                .ok()
-                .and_then(|s| s.trim().parse::<u32>().ok())
-                .map(|p| format!(" (PID {p})"))
-                .unwrap_or_default();
-            println!("relay-worker: running{pid_str}");
-        } else {
-            println!("relay-worker: not running");
+    // Worker process line: only meaningful when relay is enabled. The worker
+    // line is independent of the "relay:" line — relay can be in Error state
+    // while the worker process is still alive in backoff (Reported error with
+    // pid present), and we want to surface that distinction here so this line
+    // doesn't contradict reality.
+    match &relay.health {
+        RelayHealth::NotConfigured | RelayHealth::Disabled => {
+            // No worker line for these — the "relay:" line above is enough.
         }
+        RelayHealth::Waiting => println!("relay-worker: not running"),
+        RelayHealth::Connected | RelayHealth::Starting { .. } => {
+            let pid = crate::relay::worker::observe_pid_file().map(|(p, _)| p);
+            let pid_str = pid.map(|p| format!(" (PID {p})")).unwrap_or_default();
+            println!("relay-worker: running{pid_str}");
+        }
+        RelayHealth::Stale { .. } => {
+            // Relay summary line above already prints "stale (Ns, PID p)" —
+            // duplicating that as a worker line buys nothing, just clutters.
+        }
+        RelayHealth::Error { reason, detail, pid } => match reason {
+            RelayErrorReason::StalePidfile => {
+                let pid_str = pid.map(|p| p.to_string()).unwrap_or_else(|| "?".into());
+                println!("relay-worker: not running (stale pidfile, PID {pid_str})");
+            }
+            // Reported error with a live pid means the worker is up and retrying
+            // — usually MQTT backoff after disconnect/auth failure. Show it as
+            // running so this line matches reality and doesn't contradict the
+            // user's `ps` output.
+            RelayErrorReason::Reported => match pid {
+                Some(p) => {
+                    let why = detail
+                        .as_deref()
+                        .map(|d| format!(": {d}"))
+                        .unwrap_or_default();
+                    println!("relay-worker: running (PID {p}, retrying after error{why})");
+                }
+                None => println!("relay-worker: not running"),
+            },
+            RelayErrorReason::Ghost => println!("relay-worker: not running"),
+        },
     }
 
     // Logs — always show summary; show recent entries when issues exist

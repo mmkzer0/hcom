@@ -232,12 +232,31 @@ impl MqttRelay {
         let mut last_event_from_conn = Instant::now();
         let mut consecutive_errors: u32 = 0;
 
+        // Heartbeat: write epoch timestamp to KV every ~1s so readers can detect
+        // unclean exits (SIGKILL, panic) that leave a stale pidfile behind. Held
+        // open across the loop to avoid repeated open() overhead, but reopened
+        // on each tick if the previous open failed — otherwise a transient DB
+        // open failure at startup would leave the worker forever heartbeat-less,
+        // which derive_relay_health would (correctly) report as Starting.
+        let mut hb_db: Option<HcomDb> = HcomDb::open().ok();
+        let mut last_heartbeat: Option<Instant> = None;
+
         // Initial subscribe
         if let Err(e) = self.subscribe() {
             log::log_warn("relay", "relay.subscribe_err", &e);
         }
 
         loop {
+            if last_heartbeat.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) {
+                if hb_db.is_none() {
+                    hb_db = HcomDb::open().ok();
+                }
+                if let Some(ref db) = hb_db {
+                    super::write_worker_heartbeat(db);
+                }
+                last_heartbeat = Some(Instant::now());
+            }
+
             // Check for commands (non-blocking, always responsive)
             match self.cmd_rx.try_recv() {
                 Ok(RelayCommand::Shutdown) => {

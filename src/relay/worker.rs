@@ -27,6 +27,12 @@ fn pid_file_path() -> PathBuf {
 fn write_pid_file() {
     let pid = std::process::id().to_string();
     crate::paths::atomic_write(&pid_file_path(), &pid);
+    // Seed heartbeat alongside the pidfile so readers in the startup window
+    // (before the main loop starts ticking) don't see pid-alive + no-heartbeat
+    // and falsely declare the worker dead.
+    if let Ok(db) = HcomDb::open() {
+        super::write_worker_heartbeat(&db);
+    }
 }
 
 fn read_pid_file() -> Option<u32> {
@@ -34,22 +40,47 @@ fn read_pid_file() -> Option<u32> {
     let content = std::fs::read_to_string(&path).ok()?;
     let pid: u32 = content.trim().parse().ok()?;
     if crate::pidtrack::is_alive(pid) {
+        // NB: we deliberately do NOT gate this on heartbeat freshness. A
+        // heartbeat-stale-but-alive PID may be a wedged worker (e.g. DB
+        // contention blocking its tick writes), and forgetting its ownership
+        // here would let a second worker spawn on top of the first and would
+        // let stop_relay_worker SIGTERM the wrong process once the PID gets
+        // reused. Display-layer callers (status, relay) cross-check heartbeat
+        // themselves to avoid reporting a false-green "running".
         Some(pid)
     } else {
-        // Stale PID file — clean up
-        let _ = std::fs::remove_file(&path);
+        // Stale PID file — delegate to remove_pid_file so the cleanup steps
+        // (pidfile + heartbeat) stay in one place and can't drift apart.
+        remove_pid_file();
         None
     }
 }
 
-/// Remove PID file.
+/// Remove PID file and clear heartbeat KV.
 fn remove_pid_file() {
     let _ = std::fs::remove_file(pid_file_path());
+    if let Ok(db) = HcomDb::open() {
+        super::clear_worker_heartbeat(&db);
+    }
 }
 
 /// Check if a relay-worker process is currently running.
 pub fn is_relay_worker_running() -> bool {
     read_pid_file().is_some()
+}
+
+/// Pure pidfile observer for `derive_relay_health`. Unlike `read_pid_file`,
+/// never mutates the pidfile — needed because derivation must be side-effect
+/// free (every status render would otherwise be a hidden state transition).
+///
+/// Returns:
+///   None           — no pidfile on disk
+///   Some(pid,true) — pidfile present, PID is alive
+///   Some(pid,false) — pidfile present, PID is dead (stale)
+pub fn observe_pid_file() -> Option<(u32, bool)> {
+    let content = std::fs::read_to_string(&pid_file_path()).ok()?;
+    let pid: u32 = content.trim().parse().ok()?;
+    Some((pid, crate::pidtrack::is_alive(pid)))
 }
 
 // ── Drop guard for PID file cleanup ─────────────────────────────────

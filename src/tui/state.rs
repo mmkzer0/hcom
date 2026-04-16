@@ -14,8 +14,13 @@ pub struct DataState {
     pub messages: Vec<Message>,
     pub events: Vec<Event>,
     pub relay_enabled: bool,
-    pub relay_status: Option<String>,
-    pub relay_error: Option<String>,
+    /// Canonical effective relay state. All UI render branches should switch
+    /// on this rather than on `relay_enabled` + raw KV to avoid the false-green
+    /// / disabled-but-showing-ok class of bugs. Raw underlying signals (status
+    /// KV, last_error, heartbeat age, pid) are intentionally not held here —
+    /// they're only meaningful via the derivation, and the JSON output exposes
+    /// them under `raw` for forensics.
+    pub relay_health: crate::relay::RelayHealth,
     /// FTS search results. `Some` when a text search query is active (both inline and vertical modes).
     pub search_results: Option<(Vec<Message>, Vec<Event>)>,
 }
@@ -30,8 +35,7 @@ impl DataState {
             messages: vec![],
             events: vec![],
             relay_enabled: false,
-            relay_status: None,
-            relay_error: None,
+            relay_health: crate::relay::RelayHealth::NotConfigured,
             search_results: None,
         }
     }
@@ -73,8 +77,11 @@ pub struct UiState {
     pub view_mode: ViewMode,
     pub relay_popup: Option<RelayPopupState>,
     pub relay_text_until: Option<std::time::Instant>,
-    /// Previous relay_status for transition detection (None = never seen)
-    pub last_relay_status: Option<String>,
+    /// Whether the last observed snapshot's relay health was Connected.
+    /// Drives the "relay connected" flash on the not-Connected → Connected
+    /// edge. Started as false (we haven't seen any snapshot yet, so the
+    /// first Connected snapshot triggers the flash, which is what we want).
+    pub last_relay_was_connected: bool,
     pub remote_expanded: bool,
     pub stopped_expanded: bool,
     pub show_all_stopped: bool,

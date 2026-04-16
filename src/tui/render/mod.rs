@@ -832,50 +832,67 @@ fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
 
     let mut right: Vec<Span> = Vec::new();
 
-    // Relay indicator (right side, before status counts)
-    if app.data.relay_enabled {
-        match app.data.relay_status.as_deref() {
-            Some("error") => {
-                if let Some(ref err) = app.data.relay_error {
+    // Relay indicator (right side, before status counts). Branches off the
+    // canonical RelayHealth — same enum the CLI and JSON render from, so
+    // the indicator can't disagree with `hcom relay` / `hcom status`.
+    use crate::relay::{RelayErrorReason, RelayHealth};
+    match &app.data.relay_health {
+        RelayHealth::Connected => {
+            let show_text = app
+                .ui
+                .relay_text_until
+                .is_some_and(|t| std::time::Instant::now() < t);
+            if show_text {
+                right.push(Span::styled(
+                    "relay connected ",
+                    Style::default().fg(palette::GREEN),
+                ));
+            }
+            right.push(Span::styled(
+                "\u{21c4}  ",
+                Style::default().fg(palette::GREEN),
+            ));
+        }
+        RelayHealth::Error { reason, detail, .. } => {
+            // Show short detail only for worker-reported errors — StalePidfile
+            // and Ghost are operational anomalies the user can't act on inline.
+            if matches!(reason, RelayErrorReason::Reported) {
+                if let Some(err) = detail {
                     let truncated: String = err.chars().take(20).collect();
                     right.push(Span::styled(
                         format!("{} ", truncated),
                         Style::default().fg(palette::RED),
                     ));
                 }
-                right.push(Span::styled(
-                    "\u{21c4}  ",
-                    Style::default().fg(palette::RED),
-                ));
             }
-            Some("ok") => {
-                let show_text = app
-                    .ui
-                    .relay_text_until
-                    .is_some_and(|t| std::time::Instant::now() < t);
-                if show_text {
-                    right.push(Span::styled(
-                        "relay connected ",
-                        Style::default().fg(palette::GREEN),
-                    ));
-                }
-                right.push(Span::styled(
-                    "\u{21c4}  ",
-                    Style::default().fg(palette::GREEN),
-                ));
-            }
-            _ => {
-                right.push(Span::styled(
-                    "\u{21c4}  ",
-                    Style::default().fg(palette::FG_DIM),
-                ));
-            }
+            right.push(Span::styled(
+                "\u{21c4}  ",
+                Style::default().fg(palette::RED),
+            ));
         }
-    } else if app.data.relay_status.is_some() {
-        right.push(Span::styled(
-            "\u{21c4}  ",
-            Style::default().fg(palette::FG_DIM),
-        ));
+        RelayHealth::Stale { .. } => {
+            right.push(Span::styled(
+                "\u{21c4}  ",
+                Style::default().fg(palette::RED),
+            ));
+        }
+        RelayHealth::Starting { .. } | RelayHealth::Waiting => {
+            right.push(Span::styled(
+                "\u{21c4}  ",
+                Style::default().fg(palette::FG_DIM),
+            ));
+        }
+        RelayHealth::Disabled => {
+            // Disabled means relay_id is set but enabled=false — show a dim
+            // arrow so the user knows the toggle exists. (Previously this was
+            // gated on raw_status being present, which broke once disable
+            // started clearing runtime KV.)
+            right.push(Span::styled(
+                "\u{21c4}  ",
+                Style::default().fg(palette::FG_DIM),
+            ));
+        }
+        RelayHealth::NotConfigured => {}
     }
 
     let counts = [

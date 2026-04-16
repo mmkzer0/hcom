@@ -16,6 +16,8 @@ pub mod replay;
 pub mod token;
 pub mod worker;
 
+pub use worker::observe_pid_file;
+
 use crate::config::HcomConfig;
 use crate::db::HcomDb;
 use crate::instance_names;
@@ -32,6 +34,17 @@ pub const DEFAULT_BROKERS: &[(&str, u16)] = &[
 /// Threshold (seconds) after which a device with no state updates is considered offline.
 /// Used for reconnect detection, stale-device cleanup, and status display.
 pub const DEVICE_STALE_SECS: f64 = 90.0;
+
+/// KV key where the relay worker writes a monotonically-increasing epoch timestamp
+/// on every event-loop tick. Readers use this as the authoritative liveness signal
+/// — it survives unclean exit (SIGKILL/panic) because a dead process can't refresh it,
+/// which the pidfile alone cannot detect (PID reuse, bash launcher collision).
+pub const HEARTBEAT_KEY: &str = "relay_worker_heartbeat";
+
+/// Heartbeat older than this is considered stale — the worker is either dead or
+/// wedged. Worker ticks heartbeat every ~1s, so 10s tolerates normal jitter while
+/// flagging real unresponsiveness well before users notice queue backups.
+pub const HEARTBEAT_STALE_SECS: f64 = 10.0;
 
 /// Life event actions for device join/leave notifications.
 pub const ACTION_DEVICE_JOIN: &str = "relay_device_join";
@@ -169,6 +182,31 @@ pub(crate) fn safe_kv_set(db: &HcomDb, key: &str, value: Option<&str>) {
     let _ = db.kv_set(key, value);
 }
 
+/// Record a fresh worker heartbeat. Called by the worker's main loop ~once per second
+/// and once at pidfile-write so the startup window doesn't look stale.
+pub(crate) fn write_worker_heartbeat(db: &HcomDb) {
+    let now = crate::shared::time::now_epoch_f64();
+    safe_kv_set(db, HEARTBEAT_KEY, Some(&format!("{now}")));
+}
+
+/// Clear the heartbeat on clean worker shutdown so readers see "no worker" immediately
+/// instead of waiting out HEARTBEAT_STALE_SECS.
+pub(crate) fn clear_worker_heartbeat(db: &HcomDb) {
+    safe_kv_set(db, HEARTBEAT_KEY, None);
+}
+
+/// Age in seconds of the last heartbeat write, or None if no heartbeat is recorded.
+pub fn worker_heartbeat_age(db: &HcomDb) -> Option<f64> {
+    let ts: f64 = safe_kv_get(db, HEARTBEAT_KEY)?.parse().ok()?;
+    let now = crate::shared::time::now_epoch_f64();
+    Some((now - ts).max(0.0))
+}
+
+/// True iff a heartbeat is recorded and it is younger than HEARTBEAT_STALE_SECS.
+pub fn is_worker_heartbeat_fresh(db: &HcomDb) -> bool {
+    worker_heartbeat_age(db).is_some_and(|age| age < HEARTBEAT_STALE_SECS)
+}
+
 /// Clear all per-device relay KV entries and reset global relay counters.
 /// Called on `relay new` so stale device mappings from the previous relay group
 /// don't contaminate the new one.
@@ -206,24 +244,123 @@ pub fn clear_relay_device_state(db: &HcomDb) {
     );
 }
 
-/// Relay status for TUI/CLI display.
-#[derive(Debug, Clone)]
-pub struct RelayStatus {
+// ── Relay health: derived effective state ──────────────────────────
+//
+// Two types split responsibility cleanly:
+//   RelayObservation — pure snapshot of all relay-related signals (config flags,
+//     raw KV, pidfile state, daemon port). Readers produce one with `observe_relay`.
+//   RelayHealth — the derived effective answer every UI surface renders. Computed
+//     purely from RelayObservation by `derive_relay_health` — no filesystem, no
+//     DB access, no side effects. Unit tests assemble an observation by hand and
+//     assert the enum variant.
+//
+// The split exists so "what should we display" lives in exactly one function,
+// not duplicated across commands/status.rs, commands/relay.rs, and tui/render.
+
+/// Values the worker writes to `relay_status` KV. Constants instead of literals
+/// so derivation precedence and KV producers can't drift on a typo.
+pub const RAW_STATUS_OK: &str = "ok";
+pub const RAW_STATUS_ERROR: &str = "error";
+
+/// Why a relay is in error, for the `RelayHealth::Error` variant. Readers can
+/// branch on this for nicer wording without having to reparse `detail`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayErrorReason {
+    /// Worker wrote `relay_status=error` itself — most commonly an MQTT auth or
+    /// broker disconnect. `detail` carries the message the worker stored.
+    Reported,
+    /// Pidfile points at a PID that is no longer alive. Worker crashed without
+    /// running PidFileGuard::drop (SIGKILL, OOM, panic during Drop).
+    StalePidfile,
+    /// No worker process, no heartbeat, but `relay_status=ok` is still in KV.
+    /// The worker was reaped and nothing flipped the status — the "false-green"
+    /// bug that motivated this whole machinery.
+    Ghost,
+}
+
+impl RelayErrorReason {
+    /// Render this reason as the user-facing detail string, given the optional
+    /// pid the derive layer attached. Lives here so commands/status.rs and
+    /// commands/relay.rs can't drift on the wording.
+    pub fn label(self, detail: Option<&str>, pid: Option<u32>) -> String {
+        match self {
+            RelayErrorReason::Reported => detail
+                .map(str::to_string)
+                .unwrap_or_else(|| "unknown error".to_string()),
+            RelayErrorReason::StalePidfile => match pid {
+                Some(p) => format!("stale pidfile (PID {p} not running)"),
+                None => "stale pidfile".to_string(),
+            },
+            RelayErrorReason::Ghost => {
+                "worker died without clearing status (no process, no heartbeat)".to_string()
+            }
+        }
+    }
+}
+
+/// Effective relay state. Every user-facing surface should match on this and
+/// render accordingly. Raw KV values live in `RelayObservation` for forensics.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RelayHealth {
+    /// No relay configured (`relay_id` empty).
+    NotConfigured,
+    /// Relay configured but disabled (`relay_enabled = false`).
+    Disabled,
+    /// Enabled but nothing is running and nothing is wrong — cold-start before
+    /// first auto-spawn, or quiescent after a clean shutdown.
+    Waiting,
+    /// Worker process exists and is alive but hasn't produced a heartbeat yet
+    /// (startup window between `write_pid_file` and the first main-loop tick).
+    Starting { pid: u32 },
+    /// Worker is alive, heartbeat is fresh, and the worker last self-reported
+    /// `relay_status=ok` — the only "all good" variant. Carries no payload:
+    /// the heartbeat age changes every tick by construction, so storing it
+    /// here would defeat enum-equality short-circuiting in render diffing.
+    /// Forensic age is in JSON's `raw.heartbeat_age_s`.
+    Connected,
+    /// Worker process alive but heartbeat is older than `HEARTBEAT_STALE_SECS`
+    /// — main loop is wedged (DB contention, deadlock) but hasn't died.
+    Stale { age_s: f64, pid: u32 },
+    /// Something's wrong; see `reason` and `detail` for why.
+    Error {
+        reason: RelayErrorReason,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pid: Option<u32>,
+    },
+}
+
+/// Pure snapshot of every observable relay signal. `derive_relay_health`
+/// consumes this; tests assemble it by hand.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RelayObservation {
     pub configured: bool,
     pub enabled: bool,
-    pub status: Option<String>,
-    pub error: Option<String>,
+    pub raw_status: Option<String>,
+    pub raw_error: Option<String>,
+    pub heartbeat_age_s: Option<f64>,
+    /// `(pid, is_alive)` when a pidfile exists, else `None`. Split so the
+    /// derivation can distinguish "no pidfile" (legitimate idle) from "pidfile
+    /// points at dead PID" (worker crashed without cleanup).
+    pub pidfile: Option<(u32, bool)>,
     pub last_push: f64,
     pub broker: Option<String>,
 }
 
-/// Get relay status from config + DB.
-pub fn get_relay_status(config: &HcomConfig, db: &HcomDb) -> RelayStatus {
-    RelayStatus {
+/// Read every relay signal from config + DB + filesystem into a plain struct.
+/// Pure read — no KV writes, no pidfile cleanup. Call `derive_relay_health`
+/// on the result to get the effective state.
+pub fn observe_relay(config: &HcomConfig, db: &HcomDb) -> RelayObservation {
+    RelayObservation {
         configured: !config.relay_id.is_empty(),
         enabled: config.relay_enabled,
-        status: safe_kv_get(db, "relay_status"),
-        error: safe_kv_get(db, "relay_last_error"),
+        raw_status: safe_kv_get(db, "relay_status"),
+        raw_error: safe_kv_get(db, "relay_last_error"),
+        heartbeat_age_s: worker_heartbeat_age(db),
+        pidfile: crate::relay::worker::observe_pid_file(),
         last_push: safe_kv_get(db, "relay_last_push")
             .and_then(|s| s.parse::<f64>().ok())
             .unwrap_or(0.0),
@@ -232,6 +369,145 @@ pub fn get_relay_status(config: &HcomConfig, db: &HcomDb) -> RelayStatus {
         } else {
             Some(config.relay.clone())
         },
+    }
+}
+
+/// Derive effective health from an observation. Pure — no I/O, no mutation.
+///
+/// Precedence (top-down, first match wins):
+///   1. not configured                                       → NotConfigured
+///   2. !enabled                                             → Disabled
+///   3. raw_status="error"                                   → Error(Reported, raw_error)
+///   4. pidfile present, pid dead                            → Error(StalePidfile, pid)
+///   5. pidfile present, pid alive, heartbeat missing        → Starting { pid }
+///   6. pidfile present, pid alive, heartbeat stale          → Stale { age, pid }
+///   7. pidfile present, pid alive, heartbeat fresh, ok      → Connected { age }
+///   8. pidfile present, pid alive, heartbeat fresh, !ok     → Starting { pid }
+///   9. no pidfile, raw_status="ok" (or fresh heartbeat)     → Error(Ghost)
+///   10. no pidfile, anything else                           → Waiting
+pub fn derive_relay_health(obs: &RelayObservation) -> RelayHealth {
+    if !obs.configured {
+        return RelayHealth::NotConfigured;
+    }
+    if !obs.enabled {
+        return RelayHealth::Disabled;
+    }
+
+    // A worker that wrote "error" itself is authoritative — that's the freshest
+    // signal about whether MQTT is working, independent of whether the loop is
+    // ticking heartbeats. Fresh heartbeat + raw=error = worker is alive and
+    // retrying, but last observed state is broken. User-facing: Error.
+    if obs.raw_status.as_deref() == Some(RAW_STATUS_ERROR) {
+        return RelayHealth::Error {
+            reason: RelayErrorReason::Reported,
+            detail: obs.raw_error.clone(),
+            pid: obs.pidfile.map(|(p, _)| p),
+        };
+    }
+
+    match obs.pidfile {
+        Some((pid, false)) => RelayHealth::Error {
+            reason: RelayErrorReason::StalePidfile,
+            detail: None,
+            pid: Some(pid),
+        },
+        Some((pid, true)) => match obs.heartbeat_age_s {
+            None => RelayHealth::Starting { pid },
+            Some(age) if age >= HEARTBEAT_STALE_SECS => RelayHealth::Stale { age_s: age, pid },
+            Some(_) => {
+                if obs.raw_status.as_deref() == Some(RAW_STATUS_OK) {
+                    RelayHealth::Connected
+                } else {
+                    // Ticking but no ConnAck yet — still coming up.
+                    RelayHealth::Starting { pid }
+                }
+            }
+        },
+        None => {
+            // No process evidence. "ok" in KV or a lingering fresh heartbeat
+            // without a pidfile means the worker died ungracefully and the
+            // runtime state wasn't cleared — the ghost case.
+            let hb_fresh = obs
+                .heartbeat_age_s
+                .is_some_and(|age| age < HEARTBEAT_STALE_SECS);
+            if hb_fresh || obs.raw_status.as_deref() == Some(RAW_STATUS_OK) {
+                RelayHealth::Error {
+                    reason: RelayErrorReason::Ghost,
+                    detail: obs.raw_error.clone(),
+                    pid: None,
+                }
+            } else {
+                // Missing / "disconnected" / empty status, no pid, no heartbeat.
+                // Clean idle — either pre-first-spawn or post-clean-shutdown.
+                RelayHealth::Waiting
+            }
+        }
+    }
+}
+
+/// Convenience wrapper for callers that just want the answer.
+pub fn relay_health(config: &HcomConfig, db: &HcomDb) -> RelayHealth {
+    derive_relay_health(&observe_relay(config, db))
+}
+
+/// Runtime-health KV keys cleared on relay disable. Deliberately excludes
+/// activity/watermark keys (`relay_last_push`, `relay_last_push_id`,
+/// `relay_last_sync`) — those are correctness invariants for re-enable in the
+/// same group (watermark tells the worker what's already been pushed). Group
+/// rotation nukes those separately via `clear_relay_device_state`.
+const RUNTIME_HEALTH_KV_KEYS: &[&str] = &[
+    "relay_status",
+    "relay_last_error",
+    "relay_status_owner",
+    "relay_daemon_port",
+    "relay_daemon_fail_count",
+    HEARTBEAT_KEY,
+];
+
+/// Clear runtime-health KV when the subsystem transitions off. Keeps activity
+/// watermarks so a subsequent `relay on` doesn't re-push already-synced events.
+pub fn clear_runtime_relay_kv(db: &HcomDb) {
+    for key in RUNTIME_HEALTH_KV_KEYS {
+        safe_kv_set(db, key, None);
+    }
+}
+
+/// Relay status for TUI/CLI display. Bundles the derived health with the raw
+/// observation so callers can render the canonical answer and still show raw
+/// fields for debugging.
+#[derive(Debug, Clone)]
+pub struct RelayStatus {
+    pub configured: bool,
+    pub enabled: bool,
+    pub status: Option<String>,
+    pub error: Option<String>,
+    pub last_push: f64,
+    pub broker: Option<String>,
+    /// Age of the most recent worker heartbeat, in seconds. None if no heartbeat
+    /// has ever been recorded.
+    pub heartbeat_age: Option<f64>,
+    /// PID recorded in the pidfile (regardless of liveness). Carried so JSON
+    /// callers can populate `raw.pid` without re-observing the pidfile —
+    /// derive already paid for the read.
+    pub pidfile_pid: Option<u32>,
+    /// Derived effective state. All user-facing surfaces should match on this.
+    pub health: RelayHealth,
+}
+
+/// Get relay status from config + DB.
+pub fn get_relay_status(config: &HcomConfig, db: &HcomDb) -> RelayStatus {
+    let obs = observe_relay(config, db);
+    let health = derive_relay_health(&obs);
+    RelayStatus {
+        configured: obs.configured,
+        enabled: obs.enabled,
+        status: obs.raw_status.clone(),
+        error: obs.raw_error.clone(),
+        last_push: obs.last_push,
+        broker: obs.broker.clone(),
+        heartbeat_age: obs.heartbeat_age_s,
+        pidfile_pid: obs.pidfile.map(|(p, _)| p),
+        health,
     }
 }
 
@@ -383,10 +659,10 @@ pub fn set_relay_status(db: &HcomDb, status: &str, error: Option<&str>, is_worke
         return;
     }
 
-    if status == "ok" {
+    if status == RAW_STATUS_OK {
         // Claim ownership and clear error
         safe_kv_set(db, "relay_status_owner", Some(&pid));
-        safe_kv_set(db, "relay_status", Some("ok"));
+        safe_kv_set(db, "relay_status", Some(RAW_STATUS_OK));
         safe_kv_set(db, "relay_last_error", None);
     } else {
         // Only write error if we own the status or daemon isn't active
@@ -463,5 +739,272 @@ mod tests {
 
         config.relay_enabled = false;
         assert!(!is_relay_enabled(&config));
+    }
+
+    // ── RelayHealth derivation matrix ────────────────────────────────
+    //
+    // Each test pins one cell of the 10-row precedence matrix agreed with
+    // dinu. Keep names aligned to precedence rules for grep-friendly failure
+    // output. The `obs()` helper builds an Enabled observation; individual
+    // tests tweak only the fields under test.
+
+    fn obs() -> RelayObservation {
+        RelayObservation {
+            configured: true,
+            enabled: true,
+            raw_status: None,
+            raw_error: None,
+            heartbeat_age_s: None,
+            pidfile: None,
+            last_push: 0.0,
+            broker: None,
+        }
+    }
+
+    #[test]
+    fn derive_01_not_configured() {
+        let o = RelayObservation {
+            configured: false,
+            enabled: true, // shouldn't matter
+            ..obs()
+        };
+        assert_eq!(derive_relay_health(&o), RelayHealth::NotConfigured);
+    }
+
+    #[test]
+    fn derive_02_disabled_takes_precedence_over_runtime_state() {
+        // If disable didn't clear runtime KV we'd still see raw_status=ok here;
+        // Disabled must short-circuit regardless.
+        let o = RelayObservation {
+            enabled: false,
+            raw_status: Some("ok".into()),
+            heartbeat_age_s: Some(1.0),
+            pidfile: Some((12345, true)),
+            ..obs()
+        };
+        assert_eq!(derive_relay_health(&o), RelayHealth::Disabled);
+    }
+
+    #[test]
+    fn derive_03_reported_error_wins_over_pid_and_heartbeat() {
+        // Worker self-report is authoritative — fresh heartbeat doesn't rescue us.
+        let o = RelayObservation {
+            raw_status: Some("error".into()),
+            raw_error: Some("not authorized".into()),
+            heartbeat_age_s: Some(0.5),
+            pidfile: Some((4242, true)),
+            ..obs()
+        };
+        match derive_relay_health(&o) {
+            RelayHealth::Error { reason, detail, pid } => {
+                assert_eq!(reason, RelayErrorReason::Reported);
+                assert_eq!(detail.as_deref(), Some("not authorized"));
+                assert_eq!(pid, Some(4242));
+            }
+            other => panic!("expected Error(Reported), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn derive_04_pidfile_present_pid_dead_is_stale_pidfile_error() {
+        let o = RelayObservation {
+            pidfile: Some((9999, false)),
+            ..obs()
+        };
+        match derive_relay_health(&o) {
+            RelayHealth::Error { reason, pid, .. } => {
+                assert_eq!(reason, RelayErrorReason::StalePidfile);
+                assert_eq!(pid, Some(9999));
+            }
+            other => panic!("expected Error(StalePidfile), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn derive_05_pid_alive_heartbeat_missing_is_starting() {
+        let o = RelayObservation {
+            pidfile: Some((111, true)),
+            heartbeat_age_s: None,
+            ..obs()
+        };
+        assert_eq!(
+            derive_relay_health(&o),
+            RelayHealth::Starting { pid: 111 }
+        );
+    }
+
+    #[test]
+    fn derive_06_pid_alive_heartbeat_stale_is_stale() {
+        let o = RelayObservation {
+            pidfile: Some((222, true)),
+            heartbeat_age_s: Some(HEARTBEAT_STALE_SECS + 5.0),
+            ..obs()
+        };
+        match derive_relay_health(&o) {
+            RelayHealth::Stale { age_s, pid } => {
+                assert!(age_s >= HEARTBEAT_STALE_SECS);
+                assert_eq!(pid, 222);
+            }
+            other => panic!("expected Stale, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn derive_07_pid_alive_heartbeat_fresh_status_ok_is_connected() {
+        let o = RelayObservation {
+            pidfile: Some((333, true)),
+            heartbeat_age_s: Some(0.5),
+            raw_status: Some(RAW_STATUS_OK.into()),
+            ..obs()
+        };
+        assert_eq!(derive_relay_health(&o), RelayHealth::Connected);
+    }
+
+    #[test]
+    fn derive_connected_is_stable_across_heartbeat_ticks() {
+        // Render diffing relies on PartialEq short-circuiting when health hasn't
+        // meaningfully changed. If Connected carried the heartbeat age, every
+        // 1Hz tick would re-render the relay indicator for nothing.
+        let mk = |age: f64| RelayObservation {
+            pidfile: Some((1, true)),
+            heartbeat_age_s: Some(age),
+            raw_status: Some(RAW_STATUS_OK.into()),
+            ..obs()
+        };
+        assert_eq!(derive_relay_health(&mk(0.1)), derive_relay_health(&mk(8.5)));
+    }
+
+    #[test]
+    fn derive_08_pid_alive_heartbeat_fresh_status_not_ok_is_starting() {
+        // Covers the startup window: worker is ticking but hasn't received ConnAck.
+        // raw_status is empty or "disconnected" — anything except "ok" or "error".
+        let o = RelayObservation {
+            pidfile: Some((444, true)),
+            heartbeat_age_s: Some(0.2),
+            raw_status: None,
+            ..obs()
+        };
+        assert_eq!(
+            derive_relay_health(&o),
+            RelayHealth::Starting { pid: 444 }
+        );
+
+        // Also cover explicit "disconnected" sentinel in case any code path writes it.
+        let o = RelayObservation {
+            pidfile: Some((445, true)),
+            heartbeat_age_s: Some(0.2),
+            raw_status: Some("disconnected".into()),
+            ..obs()
+        };
+        assert_eq!(
+            derive_relay_health(&o),
+            RelayHealth::Starting { pid: 445 }
+        );
+    }
+
+    #[test]
+    fn derive_09_no_pid_status_ok_is_ghost_error() {
+        // The pone bug: worker reaped, status KV never flipped to error.
+        let o = RelayObservation {
+            pidfile: None,
+            heartbeat_age_s: None,
+            raw_status: Some("ok".into()),
+            ..obs()
+        };
+        match derive_relay_health(&o) {
+            RelayHealth::Error { reason, pid, .. } => {
+                assert_eq!(reason, RelayErrorReason::Ghost);
+                assert_eq!(pid, None);
+            }
+            other => panic!("expected Error(Ghost), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn derive_09b_no_pid_fresh_heartbeat_is_ghost() {
+        // Heartbeat without pidfile is anomalous — treat as ghost.
+        let o = RelayObservation {
+            pidfile: None,
+            heartbeat_age_s: Some(0.5),
+            raw_status: None,
+            ..obs()
+        };
+        match derive_relay_health(&o) {
+            RelayHealth::Error { reason, .. } => {
+                assert_eq!(reason, RelayErrorReason::Ghost);
+            }
+            other => panic!("expected Error(Ghost), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn derive_10_no_pid_no_heartbeat_no_status_is_waiting() {
+        // Cold start or clean post-shutdown idle.
+        let o = RelayObservation {
+            pidfile: None,
+            heartbeat_age_s: None,
+            raw_status: None,
+            ..obs()
+        };
+        assert_eq!(derive_relay_health(&o), RelayHealth::Waiting);
+
+        // "disconnected" (or any non-ok, non-error status) with no pid also Waiting.
+        let o = RelayObservation {
+            pidfile: None,
+            heartbeat_age_s: None,
+            raw_status: Some("disconnected".into()),
+            ..obs()
+        };
+        assert_eq!(derive_relay_health(&o), RelayHealth::Waiting);
+    }
+
+    // ── disable clears runtime KV, preserves activity watermarks ────
+
+    fn test_db() -> HcomDb {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+        db.init_db().unwrap();
+        std::mem::forget(dir);
+        db
+    }
+
+    #[test]
+    fn clear_runtime_relay_kv_nukes_runtime_health_fields() {
+        let db = test_db();
+        for key in RUNTIME_HEALTH_KV_KEYS {
+            safe_kv_set(&db, key, Some("present"));
+        }
+        clear_runtime_relay_kv(&db);
+        for key in RUNTIME_HEALTH_KV_KEYS {
+            assert!(
+                safe_kv_get(&db, key).is_none(),
+                "{key} should be cleared after disable"
+            );
+        }
+    }
+
+    #[test]
+    fn clear_runtime_relay_kv_preserves_activity_watermarks() {
+        // Regression guard: relay_last_push_id is a broker watermark. Clearing
+        // it on disable would cause re-push of already-synced events when the
+        // user toggles relay back on inside the same group.
+        let db = test_db();
+        safe_kv_set(&db, "relay_last_push_id", Some("12345"));
+        safe_kv_set(&db, "relay_last_push", Some("1700000000.0"));
+        safe_kv_set(&db, "relay_last_sync", Some("1700000001.0"));
+        safe_kv_set(&db, "relay_status", Some("ok"));
+
+        clear_runtime_relay_kv(&db);
+
+        assert_eq!(safe_kv_get(&db, "relay_last_push_id").as_deref(), Some("12345"));
+        assert_eq!(
+            safe_kv_get(&db, "relay_last_push").as_deref(),
+            Some("1700000000.0")
+        );
+        assert_eq!(
+            safe_kv_get(&db, "relay_last_sync").as_deref(),
+            Some("1700000001.0")
+        );
+        assert!(safe_kv_get(&db, "relay_status").is_none());
     }
 }

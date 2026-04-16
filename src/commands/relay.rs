@@ -141,39 +141,51 @@ fn relay_status(db: &HcomDb) -> i32 {
         return 0;
     }
 
-    // Show MQTT connection state from kv store
-    let relay_status_val = db.kv_get("relay_status").ok().flatten().unwrap_or_default();
-    let relay_error = db
-        .kv_get("relay_last_error")
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-
-    match relay_status_val.as_str() {
-        "ok" => println!("Status:    {FG_GREEN}connected{RESET}"),
-        "error" => {
+    // All status display branches off the canonical RelayHealth derivation so
+    // CLI / TUI / JSON can't drift in interpretation of the underlying KV.
+    let health = relay::relay_health(&config, db);
+    match &health {
+        relay::RelayHealth::Connected => {
+            println!("Status:    {FG_GREEN}connected{RESET}");
+        }
+        relay::RelayHealth::Starting { pid } => {
+            println!("Status:    {FG_YELLOW}starting{RESET} (PID {pid}, awaiting connect)");
+        }
+        relay::RelayHealth::Stale { age_s, pid } => {
+            println!(
+                "Status:    {FG_YELLOW}stale{RESET} — worker unresponsive (PID {pid}, {:.0}s since last heartbeat)",
+                age_s
+            );
+        }
+        relay::RelayHealth::Waiting => {
+            println!("Status:    {FG_YELLOW}waiting{RESET} (daemon may not be running)");
+        }
+        relay::RelayHealth::Error { reason, detail, pid } => {
             println!(
                 "Status:    {FG_RED}error{RESET} — {}",
-                if relay_error.is_empty() {
-                    "unknown"
-                } else {
-                    &relay_error
-                }
+                reason.clone().label(detail.as_deref(), *pid)
             );
-            if relay_error.contains("password")
-                || relay_error.contains("auth")
-                || relay_error.contains("not authorized")
-            {
-                let is_public = DEFAULT_BROKERS.iter().any(|&(h, p)| {
-                    config.relay == format!("mqtts://{h}:{p}")
-                        || config.relay == format!("mqtt://{h}:{p}")
-                });
-                if !is_public && config.relay_token.is_empty() {
-                    println!("  Hint: use --password when connecting to private brokers");
+            if matches!(reason, relay::RelayErrorReason::Reported) {
+                let err_text = detail.as_deref().unwrap_or("");
+                if err_text.contains("password")
+                    || err_text.contains("auth")
+                    || err_text.contains("not authorized")
+                {
+                    let is_public = DEFAULT_BROKERS.iter().any(|&(h, p)| {
+                        config.relay == format!("mqtts://{h}:{p}")
+                            || config.relay == format!("mqtt://{h}:{p}")
+                    });
+                    if !is_public && config.relay_token.is_empty() {
+                        println!("  Hint: use --password when connecting to private brokers");
+                    }
                 }
             }
         }
-        _ => println!("Status:    {FG_YELLOW}waiting{RESET} (daemon may not be running)"),
+        // NotConfigured / Disabled never reach here — the early returns above
+        // (config.relay_id empty / !config.relay_enabled) handled them already.
+        relay::RelayHealth::NotConfigured | relay::RelayHealth::Disabled => {
+            println!("Status:    {FG_YELLOW}waiting{RESET}");
+        }
     }
 
     // Broker info
@@ -438,7 +450,7 @@ fn relay_off(db: &HcomDb, argv: &[String]) -> i32 {
         }
     }
 
-    match relay::control::disable_local_relay(&config) {
+    match relay::control::disable_local_relay(&config, db) {
         Ok(cleared_remote_state) => {
             if cleared_remote_state {
                 println!("Cleared remote state");
