@@ -34,6 +34,7 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
   let notifyServer: ReturnType<typeof Bun.listen> | null = null  // TCP notify server for instant message wake
   let lastReportedStatus: string | null = null  // Skip redundant status updates
   let pendingAckId: number | null = null        // Deferred ack: set by deliverPendingToIdle, acked by transform
+  let deliveryInFlight = false                  // Delivery guard flag: rejects concurrent callers (not a queuing mutex)
   let permissionPending = false                  // Exact permission gate from OpenCode events
 
   // SAFE-02: Lazy PATH detection on first hook callback
@@ -74,49 +75,87 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
 
   // Deliver pending messages via promptAsync. Ack is deferred to transform
   // (fires on the loop iteration that actually processes the user message).
+  //
+  // Two-layer serialization:
+  //   deliveryInFlight — guard flag set synchronously before the first await.
+  //     Closes the TOCTOU window where TCP notify and idle-status wake paths
+  //     could both pass a null check before either one set the value.
+  //     Concurrent callers are rejected (not queued); they will retry on the
+  //     next wake event.
+  //   pendingAckId — set after messages are read, cleared by transform.
+  //     Prevents re-delivery while a prior injection is still being processed.
+  //     If promptAsync fails to queue, pendingAckId is cleared immediately.
   async function deliverPendingToIdle(sid: string): Promise<boolean> {
     if (permissionPending) {
       log("DEBUG", "plugin.delivery_skipped", instanceName, { reason: "permission_pending" })
       return false
     }
     if (!instanceName) return false
+    if (deliveryInFlight) {
+      log("DEBUG", "plugin.delivery_skipped", instanceName, { reason: "delivery_in_flight" })
+      return false
+    }
     if (pendingAckId !== null) {
       log("DEBUG", "plugin.delivery_skipped", instanceName, { reason: "pending_ack_in_flight", pending_ack: pendingAckId })
       return false
     }
-    const msgResult = await $.nothrow()`hcom opencode-read --name ${instanceName}`.quiet()
-    if (msgResult.exitCode !== 0) {
-      log("WARN", "plugin.delivery_read_failed", instanceName, { exit_code: msgResult.exitCode, stderr: msgResult.stderr.toString().slice(0, 200) })
-      return false
-    }
-    let rawMessages: any[] = []
-    try { rawMessages = JSON.parse(msgResult.text()) } catch (e) {
-      log("WARN", "plugin.delivery_parse_failed", instanceName, { error: String(e), raw: msgResult.text().slice(0, 200) })
-      return false
-    }
-    if (!Array.isArray(rawMessages) || rawMessages.length === 0) {
-      log("DEBUG", "plugin.delivery_no_messages", instanceName)
-      return false
-    }
+    deliveryInFlight = true
+    try {
+      const msgResult = await $.nothrow()`hcom opencode-read --name ${instanceName}`.quiet()
+      if (msgResult.exitCode !== 0) {
+        log("WARN", "plugin.delivery_read_failed", instanceName, { exit_code: msgResult.exitCode, stderr: msgResult.stderr.toString().slice(0, 200) })
+        return false
+      }
+      let rawMessages: any[] = []
+      try { rawMessages = JSON.parse(msgResult.text()) } catch (e) {
+        log("WARN", "plugin.delivery_parse_failed", instanceName, { error: String(e), raw: msgResult.text().slice(0, 200) })
+        return false
+      }
+      if (!Array.isArray(rawMessages) || rawMessages.length === 0) {
+        log("DEBUG", "plugin.delivery_no_messages", instanceName)
+        return false
+      }
 
-    const maxId = Math.max(...rawMessages.map((m: any) => m.event_id || 0))
-    if (maxId === 0) return false
+      const maxId = Math.max(...rawMessages.map((m: any) => m.event_id || 0))
+      if (maxId === 0) return false
 
-    const formatted = formatMessagesForInjection(rawMessages, instanceName)
-    // Don't ack here — defer to transform so cursor advances only when
-    // the loop is actually processing the message. This keeps messages
-    // unread until delivery is confirmed.
-    pendingAckId = maxId
-    client.session.promptAsync({
-      path: { id: sid },
-      body: { parts: [{ type: "text", text: formatted }] },
-    } as any)
-    log("INFO", "plugin.delivery_pending", instanceName, {
-      msg: `promptAsync, ack deferred to transform (maxId=${maxId})`,
-      count: rawMessages.length,
-      pending_ack: maxId,
-    })
-    return true
+      const formatted = formatMessagesForInjection(rawMessages, instanceName)
+      // Don't ack here — defer to transform so cursor advances only when
+      // the loop is actually processing the message. This keeps messages
+      // unread until delivery is confirmed.
+      pendingAckId = maxId
+      try {
+        const promptAsyncResult = client.session.promptAsync({
+          path: { id: sid },
+          body: { parts: [{ type: "text", text: formatted }] },
+        } as any)
+        if (promptAsyncResult && typeof (promptAsyncResult as Promise<unknown>).then === "function") {
+          void (promptAsyncResult as Promise<unknown>).catch((e) => {
+            if (pendingAckId === maxId) pendingAckId = null
+            log("ERROR", "plugin.delivery_prompt_failed", instanceName, {
+              error: String(e),
+              pending_ack: maxId,
+            })
+          })
+        }
+      } catch (e) {
+        pendingAckId = null
+        log("ERROR", "plugin.delivery_prompt_failed", instanceName, {
+          error: String(e),
+          pending_ack: maxId,
+          sync_throw: true,
+        })
+        return false
+      }
+      log("INFO", "plugin.delivery_pending", instanceName, {
+        msg: `promptAsync, ack deferred to transform (maxId=${maxId})`,
+        count: rawMessages.length,
+        pending_ack: maxId,
+      })
+      return true
+    } finally {
+      deliveryInFlight = false
+    }
   }
 
   // Periodic status sync: polls session status API as a retry mechanism
@@ -307,6 +346,7 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
             bindingPromise = null
             lastReportedStatus = null
             pendingAckId = null
+            deliveryInFlight = false
             permissionPending = false
             break
           case "file.edited": {
