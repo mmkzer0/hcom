@@ -1335,22 +1335,40 @@ fn remove_subagent_from_parent(db: &HcomDb, parent_name: &str, agent_id: &str) {
     instances::update_instance_position(db, parent_name, &updates);
 }
 
-/// Locate a subagent transcript when it isn't at the flat `subagents/agent-{id}.jsonl`.
+/// Maximum depth when searching for nested subagent transcripts.
 ///
-/// Workflow subagents are stored one level deeper under a subdir keyed by
-/// their group (see `agentTranscriptSubdirs` in
-/// claude-code/src/utils/sessionStorage.ts). Walks immediate subdirectories
-/// of `subagent_dir` looking for `agent-{agent_id}.jsonl`. Non-recursive
-/// beyond one level — Claude Code only uses one subdir layer.
+/// Claude Code's `setAgentTranscriptSubdir` takes the subdir key unsanitized
+/// (runAgent.ts:321-352), and the documented example is `workflows/<runId>`
+/// which creates `subagents/workflows/<runId>/agent-*.jsonl`. Bound the
+/// search at 4 levels so a pathological subdir key can't turn the scan
+/// into an unbounded filesystem walk.
+const MAX_SUBAGENT_TRANSCRIPT_DEPTH: u32 = 4;
+
+/// Locate a subagent transcript when it isn't at the flat
+/// `subagents/agent-{id}.jsonl`. Walks subdirectories up to
+/// `MAX_SUBAGENT_TRANSCRIPT_DEPTH` levels looking for `agent-{id}.jsonl`.
 fn find_subagent_transcript(subagent_dir: &Path, agent_id: &str) -> Option<PathBuf> {
     let target = format!("agent-{}.jsonl", agent_id);
-    let entries = std::fs::read_dir(subagent_dir).ok()?;
+    find_subagent_transcript_impl(subagent_dir, &target, 0)
+}
+
+fn find_subagent_transcript_impl(dir: &Path, target: &str, depth: u32) -> Option<PathBuf> {
+    if depth >= MAX_SUBAGENT_TRANSCRIPT_DEPTH {
+        return None;
+    }
+    let entries = std::fs::read_dir(dir).ok()?;
     for entry in entries.flatten() {
-        if entry.file_type().ok()?.is_dir() {
-            let candidate = entry.path().join(&target);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
+        let Ok(ft) = entry.file_type() else { continue };
+        if !ft.is_dir() {
+            continue;
+        }
+        let sub = entry.path();
+        let candidate = sub.join(target);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        if let Some(found) = find_subagent_transcript_impl(&sub, target, depth + 1) {
+            return Some(found);
         }
     }
     None

@@ -1643,25 +1643,21 @@ impl HcomDb {
 
     /// Check whether `name`'s *current* identity is a subagent slot.
     ///
-    /// Returns true if either:
-    /// - the live instance row has a non-empty `parent_name`, OR
-    /// - the *most recent* `life.stopped` event for this name carries a
-    ///   non-empty `snapshot.agent_id`.
+    /// Classification rules, in order:
+    /// 1. If a live instance row exists, it defines the current identity:
+    ///    non-empty `parent_name` → true (subagent); empty → false
+    ///    (top-level, regardless of any historical subagent events).
+    /// 2. Otherwise, consult the *most recent* `life.stopped` event: true
+    ///    iff its snapshot has a non-empty `agent_id`.
     ///
-    /// We look at the latest stopped event only: if a name was once a
-    /// subagent and was later reused as a top-level instance, the newer
-    /// top-level stop (with empty `snapshot.agent_id`) should unblock
-    /// legitimate top-level reclaim. Older subagent history doesn't poison
-    /// a name that has since been used top-level.
+    /// Older subagent history does not poison a name that has since been
+    /// reused top-level (either live or via a more recent top-level stop).
     pub fn was_subagent_name(&self, name: &str) -> bool {
         if let Ok(Some(data)) = self.get_instance(name) {
-            if data
+            return data
                 .get("parent_name")
                 .and_then(|v| v.as_str())
-                .is_some_and(|s| !s.is_empty())
-            {
-                return true;
-            }
+                .is_some_and(|s| !s.is_empty());
         }
 
         self.conn
