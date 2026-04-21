@@ -22,7 +22,7 @@ pub static TOOL_NAME_MAPPINGS: LazyLock<
     let mut claude = HashMap::new();
     claude.insert("bash", vec!["Bash"]);
     claude.insert("file", vec!["Write", "Edit"]);
-    claude.insert("delegate", vec!["Task"]);
+    claude.insert("delegate", vec!["Task", "Agent"]);
     m.insert("claude", claude);
 
     let mut gemini = HashMap::new();

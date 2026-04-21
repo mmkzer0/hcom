@@ -1641,6 +1641,46 @@ impl HcomDb {
         Ok(())
     }
 
+    /// Check whether `name`'s *current* identity is a subagent slot.
+    ///
+    /// Returns true if either:
+    /// - the live instance row has a non-empty `parent_name`, OR
+    /// - the *most recent* `life.stopped` event for this name carries a
+    ///   non-empty `snapshot.agent_id`.
+    ///
+    /// We look at the latest stopped event only: if a name was once a
+    /// subagent and was later reused as a top-level instance, the newer
+    /// top-level stop (with empty `snapshot.agent_id`) should unblock
+    /// legitimate top-level reclaim. Older subagent history doesn't poison
+    /// a name that has since been used top-level.
+    pub fn was_subagent_name(&self, name: &str) -> bool {
+        if let Ok(Some(data)) = self.get_instance(name) {
+            if data
+                .get("parent_name")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.is_empty())
+            {
+                return true;
+            }
+        }
+
+        self.conn
+            .query_row(
+                "SELECT COALESCE(json_extract(data, '$.snapshot.agent_id'), '') != ''
+                 FROM events
+                 WHERE type = 'life'
+                   AND instance = ?
+                   AND json_extract(data, '$.action') = 'stopped'
+                 ORDER BY id DESC LIMIT 1",
+                params![name],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .unwrap_or(false)
+    }
+
     /// Find the most recent stopped instance whose snapshot carries the given
     /// session_id. life.stopped events are the source of truth: they persist
     /// across the `session_bindings` cascade, so they're the right thing to

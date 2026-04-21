@@ -482,6 +482,20 @@ fn start_rebind(
     let target_name = instances::resolve_display_name_or_stopped(db, rebind_target)
         .unwrap_or_else(|| rebind_target.to_string());
 
+    // Guard: refuse to reclaim a subagent slot. Subagents share their parent's
+    // session_id, so `hcom start --as <subagent_name>` from inside a subagent
+    // bash would rebind session_bindings[parent_sid] to the subagent name,
+    // clobbering the parent's identity. `--as` is documented for top-level
+    // restartable identities (compaction/resume/clear), not for subagent
+    // lifecycle — which has its own SubagentStart bootstrap path.
+    if db.was_subagent_name(&target_name) {
+        eprintln!(
+            "Error: '{target_name}' is a subagent slot; cannot be reclaimed with --as.\n\
+             Subagents register via 'hcom start --name <agent-id>' in the SubagentStart context. If your session ended, stop working and end your turn."
+        );
+        return Ok(1);
+    }
+
     let current_name = explicit_name.unwrap_or("");
 
     // Resolve session_id from process binding or existing instance

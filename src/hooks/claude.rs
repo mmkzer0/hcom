@@ -215,13 +215,16 @@ fn route_claude_hook(
 
     // Task transitions
     let tool_name = payload.tool_name.as_str();
-    if hook_type == HOOK_PRE && tool_name == "Task" {
+    // Claude Code renamed the Task tool to Agent (Task kept as legacy alias),
+    // so match both to keep subagent lifecycle tracking working across versions (useless change!).
+    let is_task_tool = tool_name == "Task" || tool_name == "Agent";
+    if hook_type == HOOK_PRE && is_task_tool {
         let task_start = Instant::now();
         let (stdout, exit_code) = start_task(db, &session_id, &payload.raw);
         timing.task_ms = Some(task_start.elapsed().as_secs_f64() * 1000.0);
         return (exit_code, stdout, timing);
     }
-    if hook_type == HOOK_POST && tool_name == "Task" {
+    if hook_type == HOOK_POST && is_task_tool {
         let task_start = Instant::now();
         let stdout = end_task(db, &session_id, &payload.raw, false).unwrap_or_default();
         timing.task_ms = Some(task_start.elapsed().as_secs_f64() * 1000.0);
@@ -1332,6 +1335,27 @@ fn remove_subagent_from_parent(db: &HcomDb, parent_name: &str, agent_id: &str) {
     instances::update_instance_position(db, parent_name, &updates);
 }
 
+/// Locate a subagent transcript when it isn't at the flat `subagents/agent-{id}.jsonl`.
+///
+/// Workflow subagents are stored one level deeper under a subdir keyed by
+/// their group (see `agentTranscriptSubdirs` in
+/// claude-code/src/utils/sessionStorage.ts). Walks immediate subdirectories
+/// of `subagent_dir` looking for `agent-{agent_id}.jsonl`. Non-recursive
+/// beyond one level — Claude Code only uses one subdir layer.
+fn find_subagent_transcript(subagent_dir: &Path, agent_id: &str) -> Option<PathBuf> {
+    let target = format!("agent-{}.jsonl", agent_id);
+    let entries = std::fs::read_dir(subagent_dir).ok()?;
+    for entry in entries.flatten() {
+        if entry.file_type().ok()?.is_dir() {
+            let candidate = entry.path().join(&target);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
 /// Check for dead subagents by checking multiple death signals.
 fn check_dead_subagents(
     db: &HcomDb,
@@ -1346,10 +1370,17 @@ fn check_dead_subagents(
             .unwrap_or(120)
     });
     let stale_threshold = (timeout * 2) as u64;
-    let transcript_dir = if transcript_path.is_empty() {
+    // Claude Code stores subagent transcripts under
+    // `{projectDir}/{sessionId}/subagents/agent-{agentId}.jsonl`
+    // (claude-code/src/utils/sessionStorage.ts getAgentTranscriptPath).
+    // Parent's transcript_path is `{projectDir}/{sessionId}.jsonl`; strip the
+    // `.jsonl` suffix to get the directory that holds `subagents/`.
+    let subagent_dir = if transcript_path.is_empty() {
         None
     } else {
-        Path::new(transcript_path).parent()
+        transcript_path
+            .strip_suffix(".jsonl")
+            .map(|stem| PathBuf::from(stem).join("subagents"))
     };
 
     let mut dead = Vec::new();
@@ -1375,15 +1406,28 @@ fn check_dead_subagents(
             continue;
         }
 
-        let Some(transcript_dir) = transcript_dir else {
-            dead.push(agent_id.to_string());
+        let Some(ref subagent_dir) = subagent_dir else {
+            // No parent transcript path — skip rather than declare dead on
+            // missing signal.
             continue;
         };
 
-        let agent_transcript = transcript_dir.join(format!("agent-{}.jsonl", agent_id));
+        // Primary path: flat `subagents/agent-{id}.jsonl`.
+        // Fallback: workflow subagents live under `subagents/<subdir>/agent-{id}.jsonl`
+        // (claude-code/src/utils/sessionStorage.ts:231-257 agentTranscriptSubdirs).
+        // If the flat path misses, look one level deeper before giving up.
+        let flat = subagent_dir.join(format!("agent-{}.jsonl", agent_id));
+        let agent_transcript = if flat.is_file() {
+            flat
+        } else {
+            find_subagent_transcript(subagent_dir, agent_id).unwrap_or(flat)
+        };
         match std::fs::metadata(&agent_transcript) {
             Err(_) => {
-                dead.push(agent_id.to_string());
+                // Transcript not yet written (brand-new subagent) or layout
+                // differs. A missing file is not evidence of death — skip
+                // and rely on DB-row-missing / stale-mtime / marker checks
+                // on the next tick.
                 continue;
             }
             Ok(meta) => {
@@ -1470,10 +1514,16 @@ fn subagent_start(raw: &Value) -> Option<Value> {
         return None;
     }
 
+    let hcom_cmd = crate::runtime_env::build_hcom_command();
+    let additional_context = format!(
+        "Your agent ID: {agent_id}\n\
+         To use hcom, first run: {hcom_cmd} start --name {agent_id}"
+    );
+
     Some(serde_json::json!({
         "hookSpecificOutput": {
             "hookEventName": "SubagentStart",
-            "additionalContext": format!("Your agent ID: {}", agent_id),
+            "additionalContext": additional_context,
         }
     }))
 }

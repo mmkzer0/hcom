@@ -58,6 +58,22 @@ pub fn instance_not_found_error(name: &str) -> String {
     format!("Instance '{name}' not found. Run 'hcom start --as {name}' to reclaim your identity.")
 }
 
+/// Like `instance_not_found_error`, but suppresses the `--as` prescription when
+/// the missing name corresponds to a subagent slot. Subagents share their
+/// parent's session_id, so `hcom start --as <subagent_name>` from inside a
+/// subagent bash context rebinds the parent's identity — the prescription
+/// itself is the bug trigger. This variant consults live+historical state via
+/// `HcomDb::was_subagent_name` and returns the same "session may have ended"
+/// text used for raw agent_ids instead.
+pub fn instance_not_found_error_for(db: &HcomDb, name: &str) -> String {
+    if looks_like_agent_id(name) || db.was_subagent_name(name) {
+        return format!(
+            "Instance '{name}' not found. Your session may have ended. Stop working and end your turn."
+        );
+    }
+    format!("Instance '{name}' not found. Run 'hcom start --as {name}' to reclaim your identity.")
+}
+
 /// Validate user-provided name input for length and dangerous characters.
 ///
 /// Used for `--name` and `--from` flag validation in CLI commands.
@@ -155,7 +171,8 @@ pub fn resolve_from_name(db: &HcomDb, name: &str) -> Result<SenderIdentity, Hcom
         "resolve_from_name.not_found",
         &format!("name={}", resolved_name),
     );
-    Err(HcomError::NotFound(instance_not_found_error(
+    Err(HcomError::NotFound(instance_not_found_error_for(
+        db,
         &resolved_name,
     )))
 }
@@ -328,7 +345,9 @@ fn resolve_identity_with_expectation(
                                 "resolve.process_instance_missing",
                                 &format!("process_id={}, bound_name={}", pid, inst_name),
                             );
-                            return Err(HcomError::NotFound(instance_not_found_error(&inst_name)));
+                            return Err(HcomError::NotFound(instance_not_found_error_for(
+                                db, &inst_name,
+                            )));
                         }
                     }
                 }
