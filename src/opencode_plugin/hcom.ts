@@ -6,6 +6,45 @@ import { homedir } from "os"
 const HCOM_DIR = process.env.HCOM_DIR || `${homedir()}/.hcom`
 const LOG_PATH = `${HCOM_DIR}/.tmp/logs/hcom.log`
 
+type PromptModel = {
+  providerID: string
+  modelID: string
+}
+
+// Best-effort fallback for non-hcom/manual plugin runs.
+// Normal hcom launches seed launch agent/model through the `opencode-start`
+// response payload, since the plugin process does not inherit the outer
+// `hcom opencode --agent/--model` argv in PTY-launched OpenCode.
+function parseCliArgValue(...flags: string[]): string | null {
+  for (let i = 0; i < process.argv.length; i++) {
+    const token = process.argv[i]
+    for (const flag of flags) {
+      if (token === flag) return process.argv[i + 1] ?? null
+      if (token.startsWith(`${flag}=`)) return token.slice(flag.length + 1)
+    }
+  }
+  return null
+}
+
+function parseCliModelArg() {
+  const raw = parseCliArgValue("--model", "-m")
+  if (!raw) return null
+  const slash = raw.indexOf("/")
+  if (slash <= 0 || slash === raw.length - 1) return null
+  return {
+    providerID: raw.slice(0, slash),
+    modelID: raw.slice(slash + 1),
+  }
+}
+
+function normalizePromptModel(model: unknown) {
+  if (!model || typeof model !== "object") return null
+  const providerID = (model as Record<string, unknown>).providerID
+  const modelID = (model as Record<string, unknown>).modelID
+  if (typeof providerID !== "string" || typeof modelID !== "string") return null
+  return { providerID, modelID }
+}
+
 function log(
   level: "DEBUG" | "INFO" | "WARN" | "ERROR",
   event: string,
@@ -31,11 +70,16 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
   let bootstrapText: string | null = null     // BOOT-01: cached from opencode-start
   let bindingPromise: Promise<void> | null = null  // Prevents duplicate binding
   let reconcileTimer: ReturnType<typeof setInterval> | null = null  // Periodic status sync + delivery fallback
+  let reconcileInFlight = false                 // Prevents concurrent reconcile calls from overlapping interval ticks
   let notifyServer: ReturnType<typeof Bun.listen> | null = null  // TCP notify server for instant message wake
   let lastReportedStatus: string | null = null  // Skip redundant status updates
   let pendingAckId: number | null = null        // Deferred ack: set by deliverPendingToIdle, acked by transform
   let deliveryInFlight = false                  // Delivery guard flag: rejects concurrent callers (not a queuing mutex)
   let permissionPending = false                  // Exact permission gate from OpenCode events
+  let launchedAgent: string | null = parseCliArgValue("--agent")
+  let launchedModel: PromptModel | null = parseCliModelArg()
+  let currentAgent: string | null = launchedAgent
+  let currentModel: PromptModel | null = launchedModel
 
   // SAFE-02: Lazy PATH detection on first hook callback
   function checkHcom(): boolean {
@@ -49,13 +93,17 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
     return hcomAvailable
   }
 
-  function findLastUserMessage(
-    messages: Array<{ info: { id: string; sessionID: string; role: string }; parts: any[] }>
-  ) {
-    for (let i = messages.length - 1; i >= 0; i--) {
-      if (messages[i].info.role === "user") return messages[i]
-    }
-    return null
+  function isBoundSession(candidateSessionId?: string | null): boolean {
+    return !candidateSessionId || !sessionId || candidateSessionId === sessionId
+  }
+
+  function ignoreForeignSession(event: string, candidateSessionId?: string | null): boolean {
+    if (isBoundSession(candidateSessionId)) return false
+    log("DEBUG", event, instanceName, {
+      session_id: candidateSessionId,
+      bound_session_id: sessionId,
+    })
+    return true
   }
 
   function formatMessagesForInjection(messages: any[], recipientName: string): string {
@@ -91,6 +139,9 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
       return false
     }
     if (!instanceName) return false
+    if (ignoreForeignSession("plugin.delivery_ignored_foreign_session", sid)) {
+      return false
+    }
     if (deliveryInFlight) {
       log("DEBUG", "plugin.delivery_skipped", instanceName, { reason: "delivery_in_flight" })
       return false
@@ -124,11 +175,22 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
       // the loop is actually processing the message. This keeps messages
       // unread until delivery is confirmed.
       pendingAckId = maxId
+      log("DEBUG", "plugin.delivery_payload", instanceName, {
+        session_id: sid,
+        current_agent: currentAgent,
+        current_model: currentModel?.modelID ?? null,
+      })
       try {
+        // Runtime contract note: keep this cast until the plugin's bundled client
+        // typings are aligned across shipped OpenCode builds.
         const promptAsyncResult = client.session.promptAsync({
           path: { id: sid },
-          body: { parts: [{ type: "text", text: formatted }] },
-        } as any)
+          body: {
+            agent: currentAgent ?? undefined,
+            model: currentModel ?? undefined,
+            parts: [{ type: "text", text: formatted }],
+          },
+        } as any) // SDK types don't expose agent/model on the async variant; body shape matches the sync prompt endpoint
         if (promptAsyncResult && typeof (promptAsyncResult as Promise<unknown>).then === "function") {
           void (promptAsyncResult as Promise<unknown>).catch((e) => {
             if (pendingAckId === maxId) pendingAckId = null
@@ -163,8 +225,10 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
   // daemon down, etc. other made up scenario etc.). Does NOT deliver messages — that's handled by
   // TCP notify (on message arrival) and session.status events (on idle).
   async function reconcile(): Promise<void> {
+    if (reconcileInFlight) return
     if (permissionPending) return
     if (!instanceName || !sessionId) return
+    reconcileInFlight = true
     try {
       const statusResult = await client.session.status()
       if (!statusResult.data) return
@@ -178,6 +242,8 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
       }
     } catch (e) {
       log("ERROR", "plugin.reconcile_error", instanceName, { error: String(e) })
+    } finally {
+      reconcileInFlight = false
     }
   }
 
@@ -242,10 +308,21 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
           stopNotifyServer()
           return
         }
+        const boundModel = normalizePromptModel(json.model)
+        if (typeof json.agent === "string") launchedAgent = json.agent
+        if (boundModel) launchedModel = boundModel
         instanceName = json.name
         sessionId = json.session_id
         bootstrapText = json.bootstrap || null
-        log("INFO", "plugin.bound", instanceName, { session_id: sessionId, notify_port: notifyPort, bootstrap_len: bootstrapText?.length ?? 0 })
+        currentAgent = launchedAgent
+        currentModel = launchedModel
+        log("INFO", "plugin.bound", instanceName, {
+          session_id: sessionId,
+          notify_port: notifyPort,
+          bootstrap_len: bootstrapText?.length ?? 0,
+          launched_agent: launchedAgent,
+          launched_model: launchedModel?.modelID ?? null,
+        })
       } catch (e) {
         log("ERROR", "plugin.bind_error", null, { error: String(e) })
         stopNotifyServer()
@@ -264,6 +341,9 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
         if (eventSessionId && !sessionId) {
           sessionId = eventSessionId as string
         }
+        if (instanceName && ignoreForeignSession("plugin.event_ignored_foreign_session", eventSessionId)) {
+          return
+        }
         switch (event.type) {
           case "session.created": {
             const createdSessionId = event.properties.info.id
@@ -281,7 +361,7 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
             }
             if (instanceName) {
               lastReportedStatus = "blocked"
-              await $.nothrow()`hcom opencode-status --name ${instanceName} --status blocked --context ${"approval"} --detail ${event.properties.permission}`.quiet()
+              await $.nothrow()`hcom opencode-status --name ${instanceName} --status blocked --context ${"approval"} --detail ${String(event.properties.permission ?? "")}`.quiet()
               log("INFO", "plugin.permission_asked", instanceName, { permission: event.properties.permission, request_id: event.properties.id })
             }
             break
@@ -348,11 +428,13 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
             pendingAckId = null
             deliveryInFlight = false
             permissionPending = false
+            currentAgent = launchedAgent
+            currentModel = launchedModel
             break
           case "file.edited": {
             const filePath = event.properties.file
             if (instanceName) {
-              await $.nothrow()`hcom opencode-status --name ${instanceName} --status active --context ${"tool:write"} --detail ${filePath}`.quiet()
+              await $.nothrow()`hcom opencode-status --name ${instanceName} --status active --context ${"tool:write"} --detail ${String(filePath ?? "")}`.quiet()
             }
             break
           }
@@ -372,6 +454,13 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
         if (input.sessionID && !instanceName) {
           await bindIdentity(input.sessionID)
         }
+        if (isBoundSession(input.sessionID)) {
+          if (input.agent) currentAgent = input.agent
+          const resolvedModel = normalizePromptModel(input.model)
+          if (resolvedModel) currentModel = resolvedModel
+        } else {
+          ignoreForeignSession("plugin.chat_message_ignored_foreign_session", input.sessionID)
+        }
         log("DEBUG", "plugin.chat_message", instanceName, {
           session_id: input.sessionID,
           agent: input.agent,
@@ -389,11 +478,13 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
         if (!instanceName && sessionId) await bindIdentity(sessionId)
         if (!instanceName || !sessionId) return
 
-        // Inject bootstrap on first user message (ephemeral — clone discarded after each turn)
-        const msgCount = output.messages?.length ?? 0
-        const userMsgCount = output.messages?.filter((m: any) => m.info.role === "user").length ?? 0
+        // OpenCode transform mutations are prompt-local, not persisted to stored
+        // session history, so keep injecting the original bootstrap payload.
+        const messages = output.messages ?? []
+        const msgCount = messages.length
+        const userMsgCount = messages.filter((m: any) => m.info.role === "user").length
         if (bootstrapText) {
-          const firstUserMsg = output.messages.find((m: any) => m.info.role === "user")
+          const firstUserMsg = messages.find((m: any) => m.info.role === "user")
           if (firstUserMsg) {
             firstUserMsg.parts.push({
               id: crypto.randomUUID(),
@@ -408,7 +499,7 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
             log("WARN", "plugin.transform_no_user_msg", instanceName, { msg_count: msgCount })
           }
         } else {
-          log("WARN", "plugin.transform_no_bootstrap", instanceName, { msg_count: msgCount, user_msgs: userMsgCount })
+          log("DEBUG", "plugin.transform_no_bootstrap", instanceName, { msg_count: msgCount, user_msgs: userMsgCount })
         }
 
         // Deferred ack: deliverPendingToIdle called promptAsync but didn't ack.
