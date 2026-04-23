@@ -422,43 +422,48 @@ pub(crate) fn resolve_effective_dev_root(db_path: &Path) -> Option<(PathBuf, &'s
 }
 
 fn read_dev_root_from_kv(db_path: &Path) -> Option<PathBuf> {
-    let conn =
-        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .map_err(|e| {
+    // A missing db file or unset `dev_root` key are normal states (fresh HCOM_DIR,
+    // user never ran `hcom config dev_root`). Only warn on unexpected failures
+    // like permission denied or corruption.
+    let conn = match rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            if db_path.exists() {
                 log_warn(
                     "router",
                     "dev_root_kv_open_failed",
                     &format!("failed to open db at {}: {e}", db_path.display()),
                 );
-                e
-            })
-            .ok()?;
+            }
+            return None;
+        }
+    };
 
     conn.busy_timeout(std::time::Duration::from_millis(200))
         .ok();
 
-    let value = conn
-        .query_row(
-            "SELECT value FROM kv WHERE key = ?",
-            rusqlite::params![DEV_ROOT_KV_KEY],
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .map_err(|e| {
+    let value = match conn.query_row(
+        "SELECT value FROM kv WHERE key = ?",
+        rusqlite::params![DEV_ROOT_KV_KEY],
+        |row| row.get::<_, Option<String>>(0),
+    ) {
+        Ok(v) => v,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return None,
+        Err(e) => {
             log_warn(
                 "router",
                 "dev_root_kv_read_failed",
                 &format!("failed to read dev_root from kv: {e}"),
             );
-            e
-        })
-        .ok()
-        .flatten()?;
-
-    if value.is_empty() {
-        None
-    } else {
-        Some(PathBuf::from(value))
+            return None;
+        }
     }
+    .filter(|s| !s.is_empty())?;
+
+    Some(PathBuf::from(value))
 }
 
 /// Check if two paths refer to the same file (follows symlinks).

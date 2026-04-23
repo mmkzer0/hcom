@@ -32,44 +32,23 @@ fn is_in_path(name: &str) -> bool {
         .any(|dir| Path::new(dir).join(name).exists())
 }
 
-/// Check Claude hook installation.
+// Hook-installation checks delegate to the canonical `verify_*` functions in
+// `hooks::*` so `hcom status` and `hcom hooks status` never disagree.
+
 fn check_claude_hooks() -> bool {
-    let settings_path = dirs::home_dir()
-        .map(|h| h.join(".claude/settings.json"))
-        .unwrap_or_default();
-    if let Ok(content) = std::fs::read_to_string(&settings_path) {
-        content.contains("hcom") || content.contains("hook-comms")
-    } else {
-        false
-    }
+    crate::hooks::claude::verify_claude_hooks_installed(None, false)
 }
 
-/// Check Gemini hook installation.
 fn check_gemini_hooks() -> bool {
-    let settings_path = dirs::home_dir()
-        .map(|h| h.join(".gemini/settings.json"))
-        .unwrap_or_default();
-    if let Ok(content) = std::fs::read_to_string(&settings_path) {
-        content.contains("hcom") || content.contains("hook-comms")
-    } else {
-        false
-    }
+    crate::hooks::gemini::verify_gemini_hooks_installed(false)
 }
 
-/// Check Codex hook installation (native hooks.json + feature flag + rules file).
 fn check_codex_hooks() -> bool {
-    crate::hooks::codex::verify_codex_hooks_installed(true)
+    crate::hooks::codex::verify_codex_hooks_installed(false)
 }
 
-/// Check OpenCode plugin installation.
 fn check_opencode_hooks() -> bool {
-    let plugin_paths = [
-        dirs::home_dir().map(|h| h.join(".config/opencode/plugins/hcom.ts")),
-        dirs::config_dir().map(|h| h.join("opencode/plugins/hcom.ts")),
-    ];
-    plugin_paths
-        .iter()
-        .any(|p| p.as_ref().is_some_and(|p| p.exists()))
+    crate::hooks::opencode::verify_opencode_plugin_installed()
 }
 
 // ── Status Collection ────────────────────────────────────────────────────
