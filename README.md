@@ -37,14 +37,22 @@ uv tool install hcom  # or: pip install hcom
 
 ## Quickstart
 
+Terminal 1:
+
 ```bash
-hcom claude  # gemini / codex / opencode
+hcom claude  # codex / gemini / opencode
+```
+
+Terminal 2:
+
+```bash
+hcom codex
 ```
 
 Prompt:
 
-- `send a message to codex`
-- `review what claude did and send fixes`
+- `ask the other agent their favorite cake`
+- `review what claude did and send it fixes`
 - `spawn 3x gemini, split work, collect results`
 - `fork yourself to investigate the bug and report back`
 
@@ -80,7 +88,7 @@ For **Claude Code**, **Gemini CLI**, **Codex**, and **OpenCode**, messages arriv
 
 Collision detection is on by default: if two agents edit the same file within 30 seconds, both get notified.
 
-Hooks go into tool config dirs under `~/` (or `HCOM_DIR`) on first run. If you aren't using hcom, the hooks do nothing.
+Hooks go into config dirs under `~/` (or `HCOM_DIR`) on first run. If you aren't using hcom, the hooks do nothing.
 
 ---
 
@@ -270,11 +278,11 @@ hcom update                         # update hcom version
 Config lives in `~/.hcom/config.toml`. Precedence: defaults < `config.toml` < env vars.
 
 ```bash
-hcom config                       # show all values with sources
-hcom config <key>                 # get
-hcom config <key> <value>         # set
-hcom config <key> --info          # detailed help for a key
-hcom config -i <name|self> ...    # per-agent override at runtime
+hcom config                           # show all values with sources
+hcom config <key>                     # get
+hcom config <key> <value>             # set
+hcom config <key> --info              # detailed help for a key
+hcom config -i <name> <key> <value>   # per-agent override at runtime
 ```
 
 ### Keys
