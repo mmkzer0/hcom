@@ -38,7 +38,13 @@ use std::time::{Duration, Instant};
 static TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn serial_lock() -> std::sync::MutexGuard<'static, ()> {
-    TEST_SERIAL.get_or_init(|| Mutex::new(())).lock().unwrap()
+    // Recover from poison so a panic in one test (e.g. gemini Phase 3 race)
+    // does not cascade-fail the next test (codex) with PoisonError. Each test
+    // sets up its own fresh agent, so the guarded state is just "one PTY at a time".
+    TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
 }
 
 /// Write to both stdout and the log file.
@@ -467,7 +473,8 @@ fn run_pty_test(tool: &str) {
 
     let model_flag = match tool {
         "claude" => " --model haiku",
-        "codex" => " --model gpt-5.1-codex-mini",
+        "codex" => " --model gpt-5.4-mini",
+        "gemini" => " --model gemini-2.5-flash-lite",
         _ => "",
     };
     let out = hcom(&format!("--go 1 {tool}{model_flag}"));
@@ -605,6 +612,28 @@ fn run_pty_test(tool: &str) {
             Some(())
         },
         "screen settles after delivery",
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
+
+    // Wait for the agent to actually return to `listening`. The screen check
+    // above only confirms the input box is empty/ready; for gemini the input
+    // box renders the placeholder while the agent is still mid-turn (BeforeAgent
+    // → tool loop → AfterTool → AfterAgent), so screen-settle does NOT mean
+    // "agent idle". Without this, Phase 3 can race a still-running Phase 2 turn
+    // — AfterTool fires inside the gate-block window and delivers the queued
+    // message via additionalContext (a legitimate hook path, but it defeats
+    // the test's "no delivery while gate blocks PTY inject" premise).
+    poll_until(
+        || {
+            let evs = get_events(&base_name, 30, false);
+            evs.into_iter().find(|ev| {
+                ev["id"].as_i64().unwrap_or(0) > new_event
+                    && ev["type"].as_str() == Some("status")
+                    && ev["data"]["status"].as_str() == Some("listening")
+            })
+        },
+        "agent returns to listening after Phase 2 turn",
         Duration::from_secs(60),
         Duration::from_secs(1),
     );
