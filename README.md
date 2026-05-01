@@ -1,13 +1,16 @@
 # hcom
 
-[![PyPI](https://img.shields.io/pypi/v/hcom)](https://pypi.org/project/hcom/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Rust](https://img.shields.io/badge/Built_with-Rust-dea584)](https://www.rust-lang.org/)
-[![GitHub stars](https://img.shields.io/github/stars/aannoo/hcom)](https://github.com/aannoo/hcom/stargazers)
+[![CI](https://github.com/aannoo/hcom/actions/workflows/ci.yml/badge.svg)](https://github.com/aannoo/hcom/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/aannoo/hcom)](https://github.com/aannoo/hcom/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/aannoo/hcom/blob/main/LICENSE)
 
 > **Hook your coding agents together**
 
-Prefix agents with `hcom` to let them message, watch, and spawn each other across terminals.
+`hcom` is a CLI that agents can use to message, watch, and spawn each other across terminals. It integrates with Claude Code, Gemini, Codex, and OpenCode without changing how you use them.
+
+Use it to coordinate pipelines, run different AI CLIs as each other's subagents, or just instead of copy-paste.
+
+Single Rust binary, no background services. Start an agent with `hcom` in front, then prompt normally.
 
 https://github.com/user-attachments/assets/1ce23ed9-f529-4be0-8124-816aa4c2fd43
 
@@ -40,7 +43,7 @@ uv tool install hcom  # or: pip install hcom
 Terminal 1:
 
 ```bash
-hcom claude  # codex / gemini / opencode
+hcom claude   # codex / gemini / opencode
 ```
 
 Terminal 2:
@@ -66,13 +69,13 @@ hcom
 
 ## What agents can do
 
-**Message** each other in real-time, bundle context for handoffs.
+**Message** each other in real-time: intent, replies, bundled context for handoffs.
 
 **Observe** each other: transcripts, file edits, terminal screens, command history.
 
 **Subscribe** to each other: notify on status changes, file edits, specific events. React automatically.
 
-**Spawn**, **fork**, **resume**, **kill** each other, in any terminal emulator.
+**Spawn**, **fork**, **resume**, **kill** each other, in any terminal emulator or headless.
 
 ---
 
@@ -84,19 +87,30 @@ Hooks record activity to a local SQLite database and deliver messages from it.
 agent → hooks → db → hooks → other agent
 ```
 
-For **Claude Code**, **Gemini CLI**, **Codex**, and **OpenCode**, messages arrive mid-turn (injected between tool calls) or wake idle agents immediately. Any other AI tool can join by running `hcom start`. Any process can wake agents with `hcom send`.
+Messages arrive mid-turn (injected between tool calls) or wake idle agents immediately.
 
-Collision detection is on by default: if two agents edit the same file within 30 seconds, both get notified.
+Each agent gets a queryable identity:
+
+- name
+- status (active, blocked, listening)
+- inbox
+- live terminal screen
+- transcript in structured chunks
+- event log of every status change, file edit, tool call
+
+Agents can subscribe to events and react instantly. Collision detection is on by default: if two agents edit the same file within 30 seconds, both get notified.
 
 Hooks go into config dirs under `~/` (or `HCOM_DIR`) on first run. If you aren't using hcom, the hooks do nothing.
+
+Without hooks, any other AI tool can join by running `hcom start`. Any process can wake agents with `hcom send`.
 
 ---
 
 ## Terminal
 
-Every agent runs in a real terminal you can see, scroll, and interrupt. Any emulator works for spawning; **kitty**, **wezterm**, and **tmux** additionally support closing panes from `hcom kill`.
+Every agent runs in a real terminal you can see, scroll, and interrupt. Any emulator works for spawning; **kitty**, **wezterm**, **tmux**, and **cmux** also support closing panes from `hcom kill`.
 
-To configure a custom terminal open/close setup, tell agent to run:
+To configure a custom terminal open/close setup, tell an agent to run:
 
 ```bash
 hcom config terminal --info
@@ -109,13 +123,13 @@ hcom config terminal --info
 Connect agents across machines via MQTT relay.
 
 ```bash
-hcom relay new                 # get token
-hcom relay connect <token>     # on each device
+hcom relay new               # get token
+hcom relay connect <token>   # on each device
 ```
 
 ```bash
-hcom relay status              # check connection
-hcom relay off|on              # toggle
+hcom relay status            # check connection
+hcom relay off|on            # toggle
 ```
 
 <details>
@@ -174,9 +188,8 @@ To keep using relay after a leak, create a new relay with `hcom relay new` and m
 ## Troubleshoot
 
 ```bash
-hcom status           # diagnostics
-hcom reset all        # clear and archive: database + hooks + config
-hcom run docs         # tell agent to run
+hcom status                  # diagnostics
+hcom reset all               # clear and archive: database + hooks + config
 ```
 
 ---
@@ -184,8 +197,8 @@ hcom run docs         # tell agent to run
 ## Uninstall
 
 ```bash
-hcom hooks remove                     # safely remove all hcom hooks
-brew uninstall hcom                   # or: rm $(which hcom)
+hcom hooks remove            # safely remove all hcom hooks
+brew uninstall hcom          # or: rm $(which hcom)
 ```
 
 ---
@@ -358,8 +371,8 @@ Custom scripts: drop `*.sh` or `*.py` into `~/.hcom/scripts/` — auto-discovere
 
 git clone https://github.com/aannoo/hcom.git
 cd hcom
-cargo test
 cargo build
+cargo test
 ```
 
 ### Using local build
@@ -377,7 +390,7 @@ ln -sf $(pwd)/target/debug/hcom ~/.cargo/bin/hcom
 ```bash
 hcom config dev_root $(pwd)
 hcom config dev_root --unset  # revert
-hcom -v    # run local build
+hcom status    # run local build
 ```
 
 For concurrent worktrees, scope each to its own DB:
@@ -396,9 +409,9 @@ HCOM_DIR=$PWD/.hcom HCOM_DEV_ROOT=$PWD hcom claude
 Issues and PRs welcome. The codebase is Rust.
 
 ```bash
-cargo test && cargo build
+cargo build && cargo test
 hcom config dev_root $(pwd)
-hcom -v
+hcom status
 ```
 
 ---
