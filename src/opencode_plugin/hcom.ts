@@ -456,7 +456,16 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
         if (input.sessionID && !instanceName && !bindingPromise) {
           await bindIdentity(input.sessionID)
         }
-        if (isBoundSession(input.sessionID)) {
+        // Guard: if bindIdentity was called but produced no binding (daemon absent,
+        // missing HCOM_PROCESS_ID, etc.), both instanceName and sessionId remain null.
+        // isBoundSession(null) short-circuits to true on double-null, which would
+        // silently mutate agent/model state. Emit WARN and skip instead.
+        if (!instanceName && !sessionId) {
+          log("WARN", "plugin.chat_message_unbound", null, {
+            session_id: input.sessionID,
+            reason: "no binding after bindIdentity attempt — hcom absent or daemon error",
+          })
+        } else if (isBoundSession(input.sessionID)) {
           if (input.agent) currentAgent = input.agent
           const resolvedModel = normalizePromptModel(input.model)
           if (resolvedModel) currentModel = resolvedModel
