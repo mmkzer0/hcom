@@ -304,6 +304,20 @@ fn do_spawn() -> bool {
         return false;
     }
 
+    // Pre-warm device_id in the parent so the spawned worker reads the same
+    // UUID we'd report from this process. Without this, the worker and any
+    // concurrent CLI (hcom relay status, etc.) can race read_device_uuid on
+    // a fresh HCOM_DIR and end up with different UUIDs — causing the worker's
+    // published short_id to disagree with what `relay status` displays.
+    if super::read_device_uuid().is_none() {
+        log::log_warn(
+            "relay",
+            "relay_worker.device_id_unwritable",
+            "could not create device_id file before spawn",
+        );
+        return false;
+    }
+
     let binary = match std::env::current_exe() {
         Ok(b) => b,
         Err(_) => return false,

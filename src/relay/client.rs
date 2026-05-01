@@ -134,7 +134,8 @@ impl MqttRelay {
         let psk = load_psk(config)?;
 
         let relay_id = config.relay_id.clone();
-        let device_uuid = read_device_uuid();
+        let device_uuid = read_device_uuid()
+            .ok_or_else(|| "failed to create device_id file".to_string())?;
         let client_id = format!("hcom-{}", super::device_id_prefix(&device_uuid));
 
         let mut mqttoptions = MqttOptions::new(&client_id, &host, port);
@@ -857,7 +858,10 @@ pub fn clear_retained_state(config: &HcomConfig) -> bool {
     }
     let relay_id = &config.relay_id;
 
-    let device_uuid = read_device_uuid();
+    let device_uuid = match read_device_uuid() {
+        Some(uuid) => uuid,
+        None => return false,
+    };
     let topic = state_topic(relay_id, &device_uuid);
     let psk = match load_psk(config) {
         Ok(psk) => psk,

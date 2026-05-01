@@ -144,22 +144,66 @@ pub fn get_broker_from_config(config: &HcomConfig) -> Option<(String, u16, bool)
 }
 
 /// Get or create persistent device UUID
-/// Reads from ~/.hcom/.tmp/device_id; creates with a new UUID if missing.
-pub fn read_device_uuid() -> String {
+/// Reads from ~/.hcom/.tmp/device_id; creates with a new UUID if missing or empty.
+///
+/// Returns None only on genuine I/O failure (cannot create parent dir, cannot
+/// acquire lock, cannot persist UUID). Concurrent callers are serialized via
+/// flock on a sibling lock file, so the loser observes the winner's persisted
+/// UUID rather than racing to generate a divergent one. An existing empty file
+/// is treated as missing and refilled under lock — recovers from prior aborted
+/// writes that left a 0-byte file.
+pub fn read_device_uuid() -> Option<String> {
     let path = crate::paths::hcom_dir().join(".tmp").join("device_id");
-    if let Ok(content) = std::fs::read_to_string(&path) {
-        let trimmed = content.trim().to_string();
-        if !trimmed.is_empty() {
-            return trimmed;
-        }
+    read_or_create_device_uuid_at(&path)
+}
+
+/// Path-parameterized core of `read_device_uuid`. Split out so tests can drive
+/// it against a tempdir path without touching the global Config / HCOM_DIR env.
+fn read_or_create_device_uuid_at(path: &std::path::Path) -> Option<String> {
+    // Fast path: file already populated.
+    if let Some(uuid) = read_nonempty(path) {
+        return Some(uuid);
     }
-    // Create new UUID
-    let device_id = uuid::Uuid::new_v4().to_string();
+
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent).ok()?;
     }
-    crate::paths::atomic_write(&path, &device_id);
-    device_id
+
+    // Serialize creation across processes via flock on a sibling lock file.
+    // Mirrors the pattern in instance_names::generate_unique_name.
+    let lock_path = path.with_file_name("device_id.lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .ok()?;
+
+    use nix::fcntl::{Flock, FlockArg};
+    let _flock = Flock::lock(lock_file, FlockArg::LockExclusive).ok()?;
+
+    // Re-check under lock — a concurrent caller may have written by now.
+    if let Some(uuid) = read_nonempty(path) {
+        return Some(uuid);
+    }
+
+    // We hold the lock; the file is missing or empty. Generate and persist.
+    let device_id = uuid::Uuid::new_v4().to_string();
+    if !crate::paths::atomic_write(path, &device_id) {
+        return None;
+    }
+    Some(device_id)
+}
+
+/// Read a file and return its trimmed content if non-empty.
+fn read_nonempty(path: &std::path::Path) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let trimmed = content.trim().to_string();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
 }
 
 /// Get device short ID — FNV-1a hash to CVCV word, uppercased.
@@ -739,6 +783,84 @@ mod tests {
 
         config.relay_enabled = false;
         assert!(!is_relay_enabled(&config));
+    }
+
+    #[test]
+    fn test_read_device_uuid_creates_when_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(".tmp").join("device_id");
+        let uuid = read_or_create_device_uuid_at(&path).expect("should create");
+        assert!(!uuid.is_empty());
+        // Subsequent call must return the SAME persisted UUID.
+        let again = read_or_create_device_uuid_at(&path).expect("should read");
+        assert_eq!(uuid, again);
+    }
+
+    #[test]
+    fn test_read_device_uuid_repairs_empty_file() {
+        // Regression: prior implementation used create_new which refused to
+        // replace an existing-but-empty file, so a 0-byte device_id (left by
+        // an aborted write) caused permanent None.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".tmp");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("device_id");
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+
+        let uuid = read_or_create_device_uuid_at(&path).expect("should repair");
+        assert!(!uuid.is_empty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), uuid);
+    }
+
+    #[test]
+    fn test_read_device_uuid_repairs_whitespace_only_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".tmp");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("device_id");
+        std::fs::write(&path, "   \n\t  ").unwrap();
+
+        let uuid = read_or_create_device_uuid_at(&path).expect("should repair");
+        assert!(!uuid.is_empty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), uuid);
+    }
+
+    #[test]
+    fn test_read_device_uuid_concurrent_first_callers_agree() {
+        // Regression: concurrent first callers used to each generate their own
+        // UUID, return their own in-memory copy, and disagree on disk. With
+        // flock + read-under-lock, all callers must observe the SAME UUID.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(".tmp").join("device_id");
+
+        let n = 8;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(n));
+        let path_arc = std::sync::Arc::new(path.clone());
+
+        let handles: Vec<_> = (0..n)
+            .map(|_| {
+                let b = std::sync::Arc::clone(&barrier);
+                let p = std::sync::Arc::clone(&path_arc);
+                std::thread::spawn(move || {
+                    b.wait();
+                    read_or_create_device_uuid_at(&p)
+                })
+            })
+            .collect();
+
+        let results: Vec<Option<String>> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        let first = results[0].as_ref().expect("at least one must succeed");
+        for (i, r) in results.iter().enumerate() {
+            let r = r.as_ref().unwrap_or_else(|| panic!("thread {i} returned None"));
+            assert_eq!(
+                r, first,
+                "thread {i} got divergent UUID — race not serialized"
+            );
+        }
+        // And the persisted file matches.
+        assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), first);
     }
 
     // ── RelayHealth derivation matrix ────────────────────────────────

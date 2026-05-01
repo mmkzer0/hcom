@@ -121,8 +121,12 @@ fn format_time(timestamp: f64) -> String {
 
 /// Get device short ID via FNV-1a hash
 /// Auto-creates device_id file if missing (via read_device_uuid).
+/// Returns "?" when the device_id file cannot be created or read — display only.
 fn get_device_short_id() -> String {
-    crate::relay::device_short_id(&crate::relay::read_device_uuid())
+    match crate::relay::read_device_uuid() {
+        Some(uuid) => crate::relay::device_short_id(&uuid),
+        None => "?".to_string(),
+    }
 }
 
 /// Show relay status.
@@ -241,7 +245,7 @@ fn relay_status(db: &HcomDb) -> i32 {
         println!("Last push: never");
     }
 
-    let own_device = crate::relay::read_device_uuid();
+    let own_device = crate::relay::read_device_uuid().unwrap_or_default();
     let now = crate::shared::time::now_epoch_f64();
 
     let mut device_to_short = std::collections::HashMap::new();
@@ -389,7 +393,7 @@ fn ensure_relay_worker_running_for_cli() -> bool {
 }
 
 fn known_remote_device_shorts(db: &HcomDb) -> Vec<String> {
-    let own_device = crate::relay::read_device_uuid();
+    let own_device = crate::relay::read_device_uuid().unwrap_or_default();
     let mut shorts = Vec::new();
     if let Ok(entries) = db.kv_prefix("relay_short_") {
         for (key, device_id) in entries {
@@ -543,7 +547,10 @@ fn relay_new(db: &HcomDb, argv: &[String]) -> i32 {
 
     // Ensure device_id file exists before spawning the daemon worker,
     // so both CLI and daemon use the same UUID (avoids TOCTOU race).
-    relay::read_device_uuid();
+    if relay::read_device_uuid().is_none() {
+        eprintln!("Error: failed to create device_id file");
+        return 1;
+    }
 
     let config = config::load_config_snapshot().core;
 
@@ -646,7 +653,10 @@ fn relay_connect(db: &HcomDb, argv: &[String]) -> i32 {
 
     // Ensure device_id file exists before spawning the daemon worker,
     // so both CLI and daemon use the same UUID (avoids TOCTOU race).
-    relay::read_device_uuid();
+    if relay::read_device_uuid().is_none() {
+        eprintln!("Error: failed to create device_id file");
+        return 1;
+    }
 
     let token_str = remaining.first().filter(|s| !s.starts_with("-")).cloned();
 

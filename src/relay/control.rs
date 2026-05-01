@@ -44,7 +44,7 @@ fn build_control_payload(
         }
     };
 
-    let device_id = read_device_uuid();
+    let device_id = read_device_uuid()?;
     let short_id = device_short_id(&device_id);
     let now = crate::shared::time::now_epoch_f64();
     let mut control_data = json!({
