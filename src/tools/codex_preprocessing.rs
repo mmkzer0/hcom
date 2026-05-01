@@ -2,14 +2,19 @@
 
 use crate::paths;
 
-use super::codex_args::resolve_codex_args;
+use super::codex_args::{merge_codex_args, resolve_codex_args};
 
 /// Sandbox modes aligned with Codex TUI presets.
 ///
-/// - `workspace`: Default — --full-auto (workspace-write + on-request approvals)
+/// - `workspace`: Default — --sandbox workspace-write (interactive: on-request approvals)
 /// - `untrusted`: Workspace writes, approval before untrusted commands
 /// - `danger-full-access`: Full Access — --dangerously-bypass-approvals-and-sandbox
 /// - `none`: Raw codex, user's own settings (hcom may not work)
+///
+/// Codex 0.128.0 removed `--full-auto` from the TUI (it was sugar for
+/// workspace-write + on-failure approvals). The current shape — --sandbox
+/// workspace-write with default on-request approvals — matches the prior
+/// behavior closely enough for the TUI flow.
 pub fn get_sandbox_flags(mode: &str) -> Vec<String> {
     // Seatbelt blocks Unix sockets by default, breaking tmux/kitty terminal launches.
     // network_access=true adds (allow system-socket) to the seatbelt profile.
@@ -20,11 +25,14 @@ pub fn get_sandbox_flags(mode: &str) -> Vec<String> {
 
     match mode {
         "workspace" => {
-            let mut flags = vec!["--full-auto".to_string()];
+            let mut flags = vec!["--sandbox".to_string(), "workspace-write".to_string()];
             flags.extend(net);
             flags
         }
         "untrusted" => {
+            // Read-only-equivalent UX for hcom: codex's actual read-only sandbox
+            // can't be used (hcom needs DB writes), so we keep workspace-write FS
+            // and gate every non-safe command on user approval via -a untrusted.
             let mut flags = vec![
                 "--sandbox".to_string(),
                 "workspace-write".to_string(),
@@ -40,7 +48,7 @@ pub fn get_sandbox_flags(mode: &str) -> Vec<String> {
         "none" => vec![],
         // Default to workspace
         _ => {
-            let mut flags = vec!["--full-auto".to_string()];
+            let mut flags = vec!["--sandbox".to_string(), "workspace-write".to_string()];
             flags.extend(net);
             flags
         }
@@ -243,12 +251,15 @@ pub fn preprocess_codex_args(
         codex_args.to_vec()
     };
 
-    // 2. Inject sandbox flags based on mode
+    // 2. Inject sandbox flags based on mode. Treat hcom's profile as the
+    // lower-precedence side of the normal Codex arg merge so a user-provided
+    // sandbox/approval flag overrides the whole sandbox group without
+    // dropping repeatable hcom config such as the network seatbelt tweak.
     let sandbox_flags = get_sandbox_flags(sandbox_mode);
     let mut args: Vec<String> = if !sandbox_flags.is_empty() {
-        let mut a = sandbox_flags;
-        a.extend(codex_args.iter().cloned());
-        a
+        let sandbox_spec = resolve_codex_args(Some(&sandbox_flags), None);
+        let cli_spec = resolve_codex_args(Some(&codex_args), None);
+        merge_codex_args(&sandbox_spec, &cli_spec).rebuild_tokens(true, true)
     } else {
         codex_args
     };
@@ -285,7 +296,8 @@ mod tests {
     #[test]
     fn test_sandbox_flags_workspace() {
         let flags = get_sandbox_flags("workspace");
-        assert!(flags.contains(&"--full-auto".to_string()));
+        assert!(flags.contains(&"--sandbox".to_string()));
+        assert!(flags.contains(&"workspace-write".to_string()));
         assert!(flags.contains(&"sandbox_workspace_write.network_access=true".to_string()));
     }
 
@@ -316,14 +328,16 @@ mod tests {
     #[test]
     fn test_sandbox_flags_unknown_defaults_to_workspace() {
         let flags = get_sandbox_flags("bogus");
-        assert!(flags.contains(&"--full-auto".to_string()));
+        assert!(flags.contains(&"--sandbox".to_string()));
+        assert!(flags.contains(&"workspace-write".to_string()));
     }
 
     #[test]
     #[serial]
     fn test_ensure_hcom_writable_adds_dir() {
         init_config();
-        // With --full-auto, sandbox is active → should add --add-dir
+        // --full-auto is still recognized as a sandbox-active marker for
+        // back-compat with user-provided args, even though hcom no longer emits it.
         let tokens = s(&["--full-auto"]);
         let result = ensure_hcom_writable(&tokens);
         assert_eq!(result[0], "--add-dir");
@@ -453,16 +467,42 @@ mod tests {
         init_config();
         let args = s(&["-m", "o3"]);
         let result = preprocess_codex_args(&args, "BOOTSTRAP", "workspace");
-        assert!(result.contains(&"--full-auto".to_string()));
+        assert!(result.contains(&"--sandbox".to_string()));
+        assert!(result.contains(&"workspace-write".to_string()));
         assert!(result.contains(&"--add-dir".to_string()));
         assert!(result.iter().any(|t| t.contains("developer_instructions=")));
+    }
+
+    #[test]
+    #[serial]
+    fn test_preprocess_user_sandbox_overrides_hcom_default() {
+        init_config();
+        let args = s(&["--sandbox", "danger-full-access", "-m", "o3"]);
+        let result = preprocess_codex_args(&args, "BOOTSTRAP", "workspace");
+        assert_eq!(result.iter().filter(|t| *t == "--sandbox").count(), 1);
+        assert!(result.contains(&"danger-full-access".to_string()));
+        assert!(!result.contains(&"workspace-write".to_string()));
+        assert!(result.contains(&"--add-dir".to_string()));
+        assert!(result.contains(&"sandbox_workspace_write.network_access=true".to_string()));
+    }
+
+    #[test]
+    #[serial]
+    fn test_preprocess_user_approval_overrides_hcom_approval_default() {
+        init_config();
+        let args = s(&["-a", "on-request", "-m", "o3"]);
+        let result = preprocess_codex_args(&args, "BOOTSTRAP", "untrusted");
+        assert_eq!(result.iter().filter(|t| *t == "-a").count(), 1);
+        assert!(result.contains(&"on-request".to_string()));
+        assert!(!result.contains(&"untrusted".to_string()));
+        assert!(result.contains(&"sandbox_workspace_write.network_access=true".to_string()));
     }
 
     #[test]
     fn test_preprocess_codex_args_none_mode() {
         let args = s(&["-m", "o3"]);
         let result = preprocess_codex_args(&args, "BOOTSTRAP", "none");
-        assert!(!result.contains(&"--full-auto".to_string()));
+        assert!(!result.contains(&"--sandbox".to_string()));
         assert!(!result.contains(&"--add-dir".to_string()));
         assert!(result.iter().any(|t| t.contains("developer_instructions=")));
     }
