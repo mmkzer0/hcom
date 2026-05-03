@@ -13,7 +13,9 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use crate::core::filters::{EventFilterArgs, build_sql_from_flags, resolve_filter_names};
+use crate::core::filters::{
+    EventFilterArgs, FILE_WRITE_CONTEXTS, build_sql_from_flags, resolve_filter_names,
+};
 use crate::core::launch_status::wait_for_launch;
 use crate::db::HcomDb;
 use crate::shared::CommandContext;
@@ -342,6 +344,14 @@ fn resolve_caller_kind(db: &HcomDb, caller: &str) -> &'static str {
     if exists { "instance" } else { "external" }
 }
 
+fn collision_self_relevance_sql(caller: &str) -> String {
+    let caller_escaped = caller.replace('\'', "''");
+    format!(
+        "(events_v.instance = '{caller_escaped}' OR EXISTS (SELECT 1 FROM events_v e2 WHERE e2.type = 'status' AND e2.status_context IN {ctx} AND e2.status_detail = events_v.status_detail AND e2.instance = '{caller_escaped}' AND ABS(strftime('%s', events_v.timestamp) - strftime('%s', e2.timestamp)) < 30))",
+        ctx = FILE_WRITE_CONTEXTS
+    )
+}
+
 /// Outcome of a subscription insert attempt.
 pub(crate) enum SubCreateOutcome {
     Created { id: String, final_sql: String },
@@ -379,10 +389,7 @@ pub(crate) fn build_and_insert_filter_subscription(
 
     // Collision self-relevance filtering
     if filters.contains_key("collision") {
-        let caller_escaped = caller.replace('\'', "''");
-        let self_relevance = format!(
-            "(events_v.instance = '{caller_escaped}' OR EXISTS (SELECT 1 FROM events_v e2 WHERE e2.type = 'status' AND e2.status_context IN ('tool:Write', 'tool:Edit', 'tool:write_file', 'tool:edit_file') AND e2.status_detail = events_v.status_detail AND e2.instance = '{caller_escaped}' AND ABS(strftime('%s', events_v.timestamp) - strftime('%s', e2.timestamp)) < 20))"
-        );
+        let self_relevance = collision_self_relevance_sql(caller);
         sql = format!("({sql}) AND {self_relevance}");
     }
 
@@ -1548,6 +1555,15 @@ mod tests {
         assert_eq!(h1.len(), 64); // full SHA-256 hex
         // Verify known SHA-256 hash
         assert_eq!(&h1[..8], "9dfe6f15");
+    }
+
+    #[test]
+    fn test_collision_self_relevance_matches_filter_constants() {
+        let sql = collision_self_relevance_sql("luna");
+        assert!(sql.contains(FILE_WRITE_CONTEXTS));
+        assert!(sql.contains("< 30"));
+        assert!(!sql.contains("tool:edit_file"));
+        assert!(!sql.contains("< 20"));
     }
 
     #[test]

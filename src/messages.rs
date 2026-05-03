@@ -662,18 +662,8 @@ fn get_tip_text(tip_key: &str) -> Option<&'static str> {
     crate::core::tips::get_tip(tip_key)
 }
 
-fn build_thread_membership_sub_id(thread: &str, member: &str) -> String {
-    use sha2::{Digest, Sha256};
-
-    let mut hasher = Sha256::new();
-    hasher.update(format!("thread-member:{thread}:{member}").as_bytes());
-    let hash = hasher.finalize();
-    let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
-    format!("sub-{}", &hex[..8])
-}
-
 fn get_thread_tip_text(instance_name: &str, thread: &str) -> String {
-    let sub_id = build_thread_membership_sub_id(thread, instance_name);
+    let sub_id = crate::shared::thread_membership_sub_id(thread, instance_name);
     format!(
         "[tip] You joined thread {thread}. To leave: hcom events unsub {sub_id} (find your sub-id with: hcom events sub list)"
     )
@@ -693,39 +683,6 @@ pub fn unescape_bash(text: &str) -> String {
         .replace("\\`", "`")
         .replace("\\\"", "\"")
         .replace("\\'", "'")
-}
-
-/// Create request-watch subscription data for a single recipient.
-///
-/// Returns (sub_key, sub_value_json) for KV store.
-pub fn build_request_watch_sub(
-    sender: &str,
-    request_event_id: i64,
-    recipient: &str,
-    last_event_id: i64,
-    now_ts: f64,
-) -> (String, String) {
-    let sub_id = format!("reqwatch-{}-{}", request_event_id, recipient);
-    let sub_key = format!("events_sub:{}", sub_id);
-
-    let sql = "(type='status' AND instance=? AND status_val='listening') OR (type='life' AND instance=? AND life_action='stopped')";
-
-    let sub_value = serde_json::json!({
-        "id": sub_id,
-        "caller": sender,
-        "sql": sql,
-        "params": [recipient, recipient],
-        "filters": {
-            "request_watch": true,
-            "request_id": request_event_id,
-            "target": recipient,
-        },
-        "created": now_ts,
-        "last_id": last_event_id,
-        "once": true,
-    });
-
-    (sub_key, sub_value.to_string())
 }
 
 /// Check if instance data represents an external sender.
@@ -1299,21 +1256,6 @@ mod tests {
     fn test_unescape_bash_preserves_backslash() {
         // Double backslashes are NOT unescaped
         assert_eq!(unescape_bash("path\\\\to\\\\file"), "path\\\\to\\\\file");
-    }
-
-    // ---- build_request_watch_sub ----
-
-    #[test]
-    fn test_build_request_watch_sub() {
-        let (key, value) = build_request_watch_sub("luna", 42, "nova", 100, 1000.0);
-        assert_eq!(key, "events_sub:reqwatch-42-nova");
-        let parsed: Value = serde_json::from_str(&value).unwrap();
-        assert_eq!(parsed["id"], "reqwatch-42-nova");
-        assert_eq!(parsed["caller"], "luna");
-        assert_eq!(parsed["once"], true);
-        assert_eq!(parsed["filters"]["request_watch"], true);
-        assert_eq!(parsed["filters"]["request_id"], 42);
-        assert_eq!(parsed["filters"]["target"], "nova");
     }
 
     // ---- build_message_preview ----

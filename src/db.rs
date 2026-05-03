@@ -32,21 +32,9 @@ const MIGRATIONS: &[(i32, &str)] = &[(
      WHERE launch_context != '' AND json_valid(launch_context) AND json_extract(launch_context, '$.terminal_preset') IS NOT NULL;",
 )];
 
-use crate::shared::constants::{MENTION_PATTERN, ST_LISTENING};
+use crate::core::filters::FILE_WRITE_CONTEXTS;
+use crate::shared::constants::{MENTION_PATTERN, ST_LISTENING, thread_membership_sub_id};
 use crate::shared::time::{now_epoch_f64, now_epoch_i64};
-
-/// File-write tool contexts for collision detection
-const FILE_WRITE_CONTEXTS: &str = "('tool:Write', 'tool:Edit', 'tool:write_file', 'tool:replace', 'tool:apply_patch', 'tool:write', 'tool:edit')";
-
-fn thread_membership_sub_id(thread: &str, member: &str) -> String {
-    use sha2::{Digest, Sha256};
-
-    let mut hasher = Sha256::new();
-    hasher.update(format!("thread-member:{thread}:{member}").as_bytes());
-    let hash = hasher.finalize();
-    let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
-    format!("sub-{}", &hex[..8])
-}
 
 fn subscription_is_delivery_only(sub: &serde_json::Value) -> bool {
     match sub.get("delivery_only") {

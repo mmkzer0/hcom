@@ -9,11 +9,19 @@ use std::time::SystemTime;
 use serde_json::{Value, json};
 
 use crate::core::bundles;
+use crate::core::filters::FILE_WRITE_CONTEXTS;
 use crate::db::HcomDb;
 use crate::shared::{CommandContext, SenderKind};
 
 // Re-use transcript parsing for bundle prepare/cat (C5 fix)
 use super::transcript::{TranscriptQuery, format_exchanges_pub, get_exchanges_pub};
+
+fn file_operations_query() -> String {
+    format!(
+        "SELECT id, timestamp, instance, data FROM events WHERE type = 'status' AND instance = ?1 AND (status_context IN {ctx} OR status_context LIKE 'tool:%' AND status_detail LIKE '/%') ORDER BY id DESC LIMIT ?2",
+        ctx = FILE_WRITE_CONTEXTS
+    )
+}
 
 fn lookup_bundle_transcript_source(
     db: &HcomDb,
@@ -809,10 +817,10 @@ fn cmd_bundle_prepare(db: &HcomDb, args: &BundlePrepareArgs, ctx: Option<&Comman
 
     // Events by category (parameterized queries to prevent SQL injection)
     let delivered_to_pattern = format!("%\"{}\"%", agent);
-    let categories: Vec<(&str, &str, Vec<Box<dyn rusqlite::ToSql>>)> = vec![
+    let categories: Vec<(&str, String, Vec<Box<dyn rusqlite::ToSql>>)> = vec![
         (
             "Messages to",
-            "SELECT id, timestamp, instance, data FROM events WHERE type = 'message' AND json_extract(data, '$.delivered_to') LIKE ?1 ORDER BY id DESC LIMIT ?2",
+            "SELECT id, timestamp, instance, data FROM events WHERE type = 'message' AND json_extract(data, '$.delivered_to') LIKE ?1 ORDER BY id DESC LIMIT ?2".to_string(),
             vec![
                 Box::new(delivered_to_pattern.clone()) as Box<dyn rusqlite::ToSql>,
                 Box::new(last_events as i64),
@@ -820,7 +828,7 @@ fn cmd_bundle_prepare(db: &HcomDb, args: &BundlePrepareArgs, ctx: Option<&Comman
         ),
         (
             "Messages from",
-            "SELECT id, timestamp, instance, data FROM events WHERE type = 'message' AND json_extract(data, '$.from') = ?1 ORDER BY id DESC LIMIT ?2",
+            "SELECT id, timestamp, instance, data FROM events WHERE type = 'message' AND json_extract(data, '$.from') = ?1 ORDER BY id DESC LIMIT ?2".to_string(),
             vec![
                 Box::new(agent.to_string()) as Box<dyn rusqlite::ToSql>,
                 Box::new(last_events as i64),
@@ -828,7 +836,7 @@ fn cmd_bundle_prepare(db: &HcomDb, args: &BundlePrepareArgs, ctx: Option<&Comman
         ),
         (
             "File operations",
-            "SELECT id, timestamp, instance, data FROM events WHERE type = 'status' AND instance = ?1 AND (status_context IN ('tool:Write', 'tool:Edit', 'tool:write_file', 'tool:edit_file') OR status_context LIKE 'tool:%' AND status_detail LIKE '/%') ORDER BY id DESC LIMIT ?2",
+            file_operations_query(),
             vec![
                 Box::new(agent.to_string()) as Box<dyn rusqlite::ToSql>,
                 Box::new(last_events as i64),
@@ -836,7 +844,7 @@ fn cmd_bundle_prepare(db: &HcomDb, args: &BundlePrepareArgs, ctx: Option<&Comman
         ),
         (
             "Lifecycle",
-            "SELECT id, timestamp, instance, data FROM events WHERE type = 'life' AND (instance = ?1 OR json_extract(data, '$.by') = ?1) ORDER BY id DESC LIMIT ?2",
+            "SELECT id, timestamp, instance, data FROM events WHERE type = 'life' AND (instance = ?1 OR json_extract(data, '$.by') = ?1) ORDER BY id DESC LIMIT ?2".to_string(),
             vec![
                 Box::new(agent.to_string()) as Box<dyn rusqlite::ToSql>,
                 Box::new(last_events as i64),
@@ -1203,10 +1211,10 @@ fn create_and_log_bundle(
 #[allow(clippy::type_complexity)]
 fn query_bundle_event_categories(db: &HcomDb, agent: &str, last_events: usize) -> Value {
     let delivered_to_pattern = format!("%\"{}\"%", agent);
-    let categories: Vec<(&str, &str, Vec<Box<dyn rusqlite::ToSql>>)> = vec![
+    let categories: Vec<(&str, String, Vec<Box<dyn rusqlite::ToSql>>)> = vec![
         (
             "messages_to",
-            "SELECT id, timestamp, instance, data FROM events WHERE type = 'message' AND json_extract(data, '$.delivered_to') LIKE ?1 ORDER BY id DESC LIMIT ?2",
+            "SELECT id, timestamp, instance, data FROM events WHERE type = 'message' AND json_extract(data, '$.delivered_to') LIKE ?1 ORDER BY id DESC LIMIT ?2".to_string(),
             vec![
                 Box::new(delivered_to_pattern.clone()) as Box<dyn rusqlite::ToSql>,
                 Box::new(last_events as i64),
@@ -1214,7 +1222,7 @@ fn query_bundle_event_categories(db: &HcomDb, agent: &str, last_events: usize) -
         ),
         (
             "messages_from",
-            "SELECT id, timestamp, instance, data FROM events WHERE type = 'message' AND json_extract(data, '$.from') = ?1 ORDER BY id DESC LIMIT ?2",
+            "SELECT id, timestamp, instance, data FROM events WHERE type = 'message' AND json_extract(data, '$.from') = ?1 ORDER BY id DESC LIMIT ?2".to_string(),
             vec![
                 Box::new(agent.to_string()) as Box<dyn rusqlite::ToSql>,
                 Box::new(last_events as i64),
@@ -1222,7 +1230,7 @@ fn query_bundle_event_categories(db: &HcomDb, agent: &str, last_events: usize) -
         ),
         (
             "file_operations",
-            "SELECT id, timestamp, instance, data FROM events WHERE type = 'status' AND instance = ?1 AND (status_context IN ('tool:Write', 'tool:Edit', 'tool:write_file', 'tool:edit_file') OR status_context LIKE 'tool:%' AND status_detail LIKE '/%') ORDER BY id DESC LIMIT ?2",
+            file_operations_query(),
             vec![
                 Box::new(agent.to_string()) as Box<dyn rusqlite::ToSql>,
                 Box::new(last_events as i64),
@@ -1230,7 +1238,7 @@ fn query_bundle_event_categories(db: &HcomDb, agent: &str, last_events: usize) -
         ),
         (
             "lifecycle",
-            "SELECT id, timestamp, instance, data FROM events WHERE type = 'life' AND (instance = ?1 OR json_extract(data, '$.by') = ?1) ORDER BY id DESC LIMIT ?2",
+            "SELECT id, timestamp, instance, data FROM events WHERE type = 'life' AND (instance = ?1 OR json_extract(data, '$.by') = ?1) ORDER BY id DESC LIMIT ?2".to_string(),
             vec![
                 Box::new(agent.to_string()) as Box<dyn rusqlite::ToSql>,
                 Box::new(5i64),
