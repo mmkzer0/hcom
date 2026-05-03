@@ -12,57 +12,11 @@ use clap::Parser;
 use crate::db::DEV_ROOT_KV_KEY;
 use crate::log::{log_error, log_info, log_warn};
 use crate::shared::{HcomError, dev_root_binary};
-
-// ── Hook name registries ──────────────
-
-/// Claude Code hooks (read payload from stdin)
-const CLAUDE_HOOKS: &[&str] = &[
-    "poll",
-    "notify",
-    "permission-request",
-    "pre",
-    "post",
-    "sessionstart",
-    "userpromptsubmit",
-    "sessionend",
-    "subagent-start",
-    "subagent-stop",
-];
-
-/// Gemini CLI hooks (read payload from stdin)
-const GEMINI_HOOKS: &[&str] = &[
-    "gemini-sessionstart",
-    "gemini-beforeagent",
-    "gemini-afteragent",
-    "gemini-beforetool",
-    "gemini-aftertool",
-    "gemini-notification",
-    "gemini-sessionend",
-];
-
-/// Codex hooks (read payload from stdin)
-const CODEX_HOOKS: &[&str] = &[
-    "codex-sessionstart",
-    "codex-userpromptsubmit",
-    "codex-pretooluse",
-    "codex-posttooluse",
-    "codex-stop",
-];
-
-/// OpenCode hooks (read payload from argv)
-const OPENCODE_HOOKS: &[&str] = &[
-    "opencode-start",
-    "opencode-status",
-    "opencode-read",
-    "opencode-stop",
-];
+use crate::tool::Tool;
 
 /// All known hook names (for fast lookup)
 fn is_hook(name: &str) -> bool {
-    CLAUDE_HOOKS.contains(&name)
-        || GEMINI_HOOKS.contains(&name)
-        || CODEX_HOOKS.contains(&name)
-        || OPENCODE_HOOKS.contains(&name)
+    Tool::is_hook_name(name)
 }
 
 // ── Known CLI commands ──────────────────────────────────────────────────
@@ -121,6 +75,25 @@ fn maybe_external_send_name_hint(
     Some(format!(
         "{err}\nHint: If '{name}' is an external sender (cron/script/manual alert), use:\n  {hcom_cmd} send --from {name} ..."
     ))
+}
+
+fn dispatch_hook_for_tool(tool: Tool, hook: &str, args: &[String]) -> (i32, String) {
+    match tool {
+        Tool::Claude => (
+            crate::hooks::claude::dispatch_claude_hook(hook),
+            String::new(),
+        ),
+        Tool::Gemini => (
+            crate::hooks::gemini::dispatch_gemini_hook(hook),
+            String::new(),
+        ),
+        Tool::Codex => (
+            crate::hooks::codex::dispatch_codex_hook_native(hook),
+            String::new(),
+        ),
+        Tool::OpenCode => crate::hooks::opencode::dispatch_opencode_hook(hook, args),
+        Tool::Adhoc => unreachable!("adhoc has no hooks"),
+    }
 }
 
 // ── Dispatch types ──────────────────────────────────────────────────────
@@ -540,33 +513,19 @@ pub fn dispatch() -> anyhow::Result<()> {
                 std::process::exit(exit_code);
             }
         }
-        Action::Hook { ref hook, .. } if CODEX_HOOKS.contains(&hook.as_str()) => {
-            // Codex native hooks — handled natively in Rust.
-            let exit_code = crate::hooks::codex::dispatch_codex_hook_native(hook);
-            if exit_code != 0 {
-                std::process::exit(exit_code);
-            }
-        }
-        Action::Hook { ref hook, ref args } if OPENCODE_HOOKS.contains(&hook.as_str()) => {
-            // OpenCode hooks handled natively in Rust.
-            let (exit_code, output) = crate::hooks::opencode::dispatch_opencode_hook(hook, args);
+        Action::Hook { ref hook, ref args } => {
+            let Some(tool) = Tool::from_hook_name(hook) else {
+                // Defensive: unreachable while resolve_action's is_hook() and
+                // from_hook_name() share Tool's hook registry.
+                log_error("router", "hook.unknown", &format!("hook={hook}"));
+                eprintln!("Error: Unknown hook '{}'", hook);
+                std::process::exit(1);
+            };
+
+            let (exit_code, output) = dispatch_hook_for_tool(tool, hook, args);
             if !output.is_empty() {
                 print!("{}", output);
             }
-            if exit_code != 0 {
-                std::process::exit(exit_code);
-            }
-        }
-        Action::Hook { ref hook, .. } if GEMINI_HOOKS.contains(&hook.as_str()) => {
-            // Gemini hooks handled natively in Rust.
-            let exit_code = crate::hooks::gemini::dispatch_gemini_hook(hook);
-            if exit_code != 0 {
-                std::process::exit(exit_code);
-            }
-        }
-        Action::Hook { ref hook, .. } if CLAUDE_HOOKS.contains(&hook.as_str()) => {
-            // Claude hooks handled natively in Rust.
-            let exit_code = crate::hooks::claude::dispatch_claude_hook(hook);
             if exit_code != 0 {
                 std::process::exit(exit_code);
             }
@@ -635,8 +594,8 @@ pub fn dispatch() -> anyhow::Result<()> {
                 std::process::exit(exit_code);
             }
         }
-        Action::Hook { ref hook, .. } | Action::Command { cmd: ref hook, .. } => {
-            eprintln!("Error: Unknown command '{}'", hook);
+        Action::Command { ref cmd, .. } => {
+            eprintln!("Error: Unknown command '{}'", cmd);
             eprintln!("Run 'hcom --help' for usage.");
             std::process::exit(1);
         }
@@ -1030,7 +989,7 @@ mod tests {
 
     #[test]
     fn claude_hooks_detected() {
-        for hook_name in CLAUDE_HOOKS {
+        for hook_name in Tool::Claude.hooks() {
             let action = resolve_action(&sv(&[hook_name]));
             match &action {
                 Action::Hook { hook, .. } => assert_eq!(hook, hook_name),
@@ -1041,7 +1000,7 @@ mod tests {
 
     #[test]
     fn gemini_hooks_detected() {
-        for hook_name in GEMINI_HOOKS {
+        for hook_name in Tool::Gemini.hooks() {
             let action = resolve_action(&sv(&[hook_name]));
             match &action {
                 Action::Hook { hook, .. } => assert_eq!(hook, hook_name),
@@ -1063,7 +1022,7 @@ mod tests {
 
     #[test]
     fn opencode_hooks_detected() {
-        for hook_name in OPENCODE_HOOKS {
+        for hook_name in Tool::OpenCode.hooks() {
             let action = resolve_action(&sv(&[hook_name]));
             match &action {
                 Action::Hook { hook, .. } => assert_eq!(hook, hook_name),
@@ -1337,6 +1296,19 @@ mod tests {
         assert!(is_hook("opencode-start"));
         assert!(!is_hook("send"));
         assert!(!is_hook("unknown"));
+    }
+
+    #[test]
+    fn hooks_do_not_collide_with_commands_or_launch_tools() {
+        for tool in [Tool::Claude, Tool::Gemini, Tool::Codex, Tool::OpenCode] {
+            for hook in tool.hooks() {
+                assert!(!COMMANDS.contains(hook), "{hook} collides with command");
+                assert!(
+                    !LAUNCH_TOOLS.contains(hook),
+                    "{hook} collides with launch tool"
+                );
+            }
+        }
     }
 
     #[test]

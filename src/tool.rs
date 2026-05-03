@@ -5,6 +5,44 @@
 
 use std::str::FromStr;
 
+const CLAUDE_HOOKS: &[&str] = &[
+    "poll",
+    "notify",
+    "permission-request",
+    "pre",
+    "post",
+    "sessionstart",
+    "userpromptsubmit",
+    "sessionend",
+    "subagent-start",
+    "subagent-stop",
+];
+
+const GEMINI_HOOKS: &[&str] = &[
+    "gemini-sessionstart",
+    "gemini-beforeagent",
+    "gemini-afteragent",
+    "gemini-beforetool",
+    "gemini-aftertool",
+    "gemini-notification",
+    "gemini-sessionend",
+];
+
+const CODEX_HOOKS: &[&str] = &[
+    "codex-sessionstart",
+    "codex-userpromptsubmit",
+    "codex-pretooluse",
+    "codex-posttooluse",
+    "codex-stop",
+];
+
+const OPENCODE_HOOKS: &[&str] = &[
+    "opencode-start",
+    "opencode-status",
+    "opencode-read",
+    "opencode-stop",
+];
+
 /// Supported AI coding tools
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
@@ -47,6 +85,34 @@ impl Tool {
             Tool::Adhoc => "adhoc",
         }
     }
+
+    /// Hook command names owned by this tool.
+    pub fn hooks(&self) -> &'static [&'static str] {
+        match self {
+            Tool::Claude => CLAUDE_HOOKS,
+            Tool::Gemini => GEMINI_HOOKS,
+            Tool::Codex => CODEX_HOOKS,
+            Tool::OpenCode => OPENCODE_HOOKS,
+            Tool::Adhoc => &[],
+        }
+    }
+
+    /// Return true if this tool owns the hook command name.
+    pub fn owns_hook(&self, name: &str) -> bool {
+        self.hooks().contains(&name)
+    }
+
+    /// Resolve the tool that owns a hook command name.
+    pub fn from_hook_name(name: &str) -> Option<Self> {
+        [Tool::Claude, Tool::Gemini, Tool::Codex, Tool::OpenCode]
+            .into_iter()
+            .find(|tool| tool.owns_hook(name))
+    }
+
+    /// Return true if any supported tool owns the hook command name.
+    pub fn is_hook_name(name: &str) -> bool {
+        Self::from_hook_name(name).is_some()
+    }
 }
 
 impl FromStr for Tool {
@@ -67,5 +133,32 @@ impl FromStr for Tool {
 impl std::fmt::Display for Tool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.as_str())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn adhoc_has_no_hooks() {
+        assert!(Tool::Adhoc.hooks().is_empty());
+        assert_ne!(Tool::from_hook_name("poll"), Some(Tool::Adhoc));
+    }
+
+    #[test]
+    fn hook_names_are_disjoint() {
+        let mut owners = HashMap::new();
+        for tool in [Tool::Claude, Tool::Gemini, Tool::Codex, Tool::OpenCode] {
+            for hook in tool.hooks() {
+                assert_eq!(
+                    owners.insert(*hook, tool),
+                    None,
+                    "{hook} has multiple owners"
+                );
+                assert_eq!(Tool::from_hook_name(hook), Some(tool));
+            }
+        }
     }
 }

@@ -313,18 +313,14 @@ impl ToolConfig {
         }
     }
 
-    /// Get config by tool name
-    pub fn for_tool(tool: &str) -> Self {
-        use crate::tool::Tool;
-        use std::str::FromStr;
-
-        match Tool::from_str(tool) {
-            Ok(Tool::Claude) => Self::claude(),
-            Ok(Tool::Gemini) => Self::gemini(),
-            Ok(Tool::Codex) => Self::codex(),
-            Ok(Tool::OpenCode) => Self::opencode(),
-            Ok(Tool::Adhoc) => Self::claude(),
-            Err(_) => Self::claude(), // Default to Claude config for unknown tools
+    /// Get config by tool.
+    pub fn for_tool(tool: crate::tool::Tool) -> Self {
+        match tool {
+            crate::tool::Tool::Claude => Self::claude(),
+            crate::tool::Tool::Gemini => Self::gemini(),
+            crate::tool::Tool::Codex => Self::codex(),
+            crate::tool::Tool::OpenCode => Self::opencode(),
+            crate::tool::Tool::Adhoc => Self::claude(),
         }
     }
 }
@@ -1582,8 +1578,8 @@ mod tests {
     // ---- ToolConfig ----
 
     #[test]
-    fn tool_config_for_tool_defaults_to_claude() {
-        let config = ToolConfig::for_tool("nonexistent");
+    fn tool_config_for_adhoc_defaults_to_claude() {
+        let config = ToolConfig::for_tool(crate::tool::Tool::Adhoc);
         assert!(config.require_prompt_empty);
         assert!(!config.require_ready_prompt);
     }

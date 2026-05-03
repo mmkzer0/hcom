@@ -1378,7 +1378,8 @@ impl Proxy {
             };
 
             // Get tool config
-            let config = ToolConfig::for_tool(&tool);
+            let tool_kind = Tool::from_str(&tool).unwrap_or(Tool::Claude);
+            let config = ToolConfig::for_tool(tool_kind);
 
             // Run delivery loop (pass shared state for main loop's OSC override)
             run_delivery_loop(
