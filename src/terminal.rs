@@ -132,6 +132,7 @@ pub fn detect_terminal_from_env() -> Option<String> {
             "ghostty" => return Some("ghostty".to_string()),
             "iTerm.app" => return Some("iterm".to_string()),
             "Apple_Terminal" => return Some("terminal.app".to_string()),
+            "WarpTerminal" => return Some("warp".to_string()),
             _ => {}
         }
     }
@@ -1000,7 +1001,7 @@ fn get_linux_terminal_argv() -> Option<Vec<String>> {
     if platform::is_wsl() && which_bin("cmd.exe").is_some() {
         if which_bin("wt.exe").is_some() {
             return Some(
-                ["cmd.exe", "/c", "start", "wt.exe", "bash", "{script}"]
+                ["cmd.exe", "/c", "start", "wt.exe", "--", "bash", "{script}"]
                     .iter()
                     .map(|s| s.to_string())
                     .collect(),

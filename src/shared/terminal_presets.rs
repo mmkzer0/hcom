@@ -254,7 +254,7 @@ pub static TERMINAL_PRESETS: LazyLock<Vec<(&'static str, TerminalPreset)>> = Laz
             p(
                 Some("wt"),
                 None,
-                "wt bash {script}",
+                "wt -- bash {script}",
                 None,
                 None,
                 &["Windows"],
