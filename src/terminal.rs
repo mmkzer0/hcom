@@ -1803,6 +1803,37 @@ mod tests {
     use serial_test::serial;
     use std::os::unix::process::ExitStatusExt;
 
+    struct EnvGuard(Vec<(&'static str, Option<String>)>);
+
+    impl EnvGuard {
+        fn clear(vars: &'static [&'static str]) -> Self {
+            let saved = vars
+                .iter()
+                .map(|&var| (var, std::env::var(var).ok()))
+                .collect::<Vec<_>>();
+            for &var in vars {
+                unsafe {
+                    std::env::remove_var(var);
+                }
+            }
+            Self(saved)
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (var, value) in &self.0 {
+                unsafe {
+                    if let Some(value) = value {
+                        std::env::set_var(var, value);
+                    } else {
+                        std::env::remove_var(var);
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_shell_quote_empty() {
         assert_eq!(shell_quote(""), "''");
@@ -2060,8 +2091,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_normalize_terminal_mode_for_launch_resolves_socket_for_auto_detected_kitty() {
-        let saved_window = std::env::var("KITTY_WINDOW_ID").ok();
-        let saved_listen = std::env::var("KITTY_LISTEN_ON").ok();
+        let _env = EnvGuard::clear(TERMINAL_CONTEXT_VARS);
         unsafe {
             std::env::set_var("KITTY_WINDOW_ID", "window-1");
             std::env::set_var("KITTY_LISTEN_ON", "unix:/tmp/kitty-test");
@@ -2071,26 +2101,12 @@ mod tests {
 
         assert_eq!(mode, "kitty-split");
         assert_eq!(socket, "unix:/tmp/kitty-test");
-
-        unsafe {
-            if let Some(value) = saved_window {
-                std::env::set_var("KITTY_WINDOW_ID", value);
-            } else {
-                std::env::remove_var("KITTY_WINDOW_ID");
-            }
-            if let Some(value) = saved_listen {
-                std::env::set_var("KITTY_LISTEN_ON", value);
-            } else {
-                std::env::remove_var("KITTY_LISTEN_ON");
-            }
-        }
     }
 
     #[test]
     #[serial]
     fn test_resolve_terminal_mode_for_tips_uses_normalized_auto_detected_mode() {
-        let saved_window = std::env::var("KITTY_WINDOW_ID").ok();
-        let saved_listen = std::env::var("KITTY_LISTEN_ON").ok();
+        let _env = EnvGuard::clear(TERMINAL_CONTEXT_VARS);
         unsafe {
             std::env::set_var("KITTY_WINDOW_ID", "window-1");
             std::env::set_var("KITTY_LISTEN_ON", "unix:/tmp/kitty-test");
@@ -2100,19 +2116,6 @@ mod tests {
 
         assert_eq!(mode, "kitty-split");
         assert!(auto);
-
-        unsafe {
-            if let Some(value) = saved_window {
-                std::env::set_var("KITTY_WINDOW_ID", value);
-            } else {
-                std::env::remove_var("KITTY_WINDOW_ID");
-            }
-            if let Some(value) = saved_listen {
-                std::env::set_var("KITTY_LISTEN_ON", value);
-            } else {
-                std::env::remove_var("KITTY_LISTEN_ON");
-            }
-        }
     }
 
     #[test]

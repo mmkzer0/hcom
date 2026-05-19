@@ -224,7 +224,11 @@ fn relay_status(db: &HcomDb) -> i32 {
     let queued: i64 = db
         .conn()
         .query_row(
-            "SELECT COUNT(*) FROM events WHERE id > ?1 AND instance NOT LIKE '%:%'",
+            "SELECT COUNT(*) FROM events
+             WHERE id > ?1
+             AND instance NOT LIKE '%:%'
+             AND instance != '_device'
+             AND json_extract(data, '$._relay') IS NULL",
             rusqlite::params![last_push_id],
             |r| r.get(0),
         )

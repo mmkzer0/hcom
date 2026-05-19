@@ -84,7 +84,7 @@ fn frame_marker(tool: &str) -> Option<&'static str> {
     match tool {
         "claude" => Some("─"),
         "codex" => None,
-        "gemini" => Some("▀"),
+        "gemini" => None,
         _ => None,
     }
 }
@@ -332,13 +332,13 @@ fn validate_prompt_consistency(screen: &serde_json::Value) {
 }
 
 fn validate_tool_ui_elements(screen: &serde_json::Value, tool: &str) {
-    let screen_text: String = screen["lines"]
+    let lines = screen["lines"]
         .as_array()
         .unwrap()
         .iter()
         .filter_map(|l| l.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
+        .collect::<Vec<_>>();
+    let screen_text = lines.join("\n");
 
     let marker = prompt_marker(tool);
     assert!(
@@ -354,6 +354,39 @@ fn validate_tool_ui_elements(screen: &serde_json::Value, tool: &str) {
         );
         eprintln!("  OK: Frame marker '{frame}' present");
     }
+
+    if tool == "gemini" {
+        validate_gemini_prompt_frame(&lines);
+        eprintln!("  OK: Gemini prompt frame present around prompt line");
+    }
+}
+
+fn is_gemini_border_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    let count = trimmed.chars().count();
+    count >= 10
+        && trimmed
+            .chars()
+            .all(|c| matches!(c, '─' | '▀' | '▄' | '╭' | '╮' | '╰' | '╯'))
+        && trimmed.chars().any(|c| matches!(c, '─' | '▀' | '▄'))
+}
+
+fn validate_gemini_prompt_frame(lines: &[&str]) {
+    let Some(prompt_idx) = lines.iter().rposition(|line| {
+        line.find(" > ")
+            .or_else(|| line.find(" * "))
+            .is_some_and(|pos| pos <= 3)
+    }) else {
+        panic!("Gemini prompt line not found — tool TUI may have changed (breaks screen.rs)");
+    };
+
+    let has_top = prompt_idx > 0 && is_gemini_border_line(lines[prompt_idx - 1]);
+    let has_bottom = prompt_idx + 1 < lines.len() && is_gemini_border_line(lines[prompt_idx + 1]);
+
+    assert!(
+        has_top && has_bottom,
+        "Gemini prompt line was not framed by adjacent border rows — tool TUI may have changed (breaks screen.rs)"
+    );
 }
 
 fn validate_delivery_events(instance: &str, baseline_id: i64, sender: &str, log: &TestLog) {
