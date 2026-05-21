@@ -1832,7 +1832,8 @@ mod tests {
     fn test_resolve_claude_thread_name_prefers_last_custom_title() {
         // A session renamed A → B → C must match for C (the current title),
         // not A or B (obsolete).
-        let cfg = std::env::temp_dir().join("hcom_test_claude_rename_chain");
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let cfg = cfg_dir.path();
         let projects = cfg.join("projects/proj");
         std::fs::create_dir_all(&projects).unwrap();
         std::fs::write(
@@ -1844,7 +1845,7 @@ mod tests {
         )
         .unwrap();
 
-        let (old, mid, cur) = with_claude_config_dir(&cfg, || {
+        let (old, mid, cur) = with_claude_config_dir(cfg, || {
             (
                 resolve_claude_thread_name("A").unwrap(),
                 resolve_claude_thread_name("B").unwrap(),
@@ -1855,7 +1856,6 @@ mod tests {
         assert_eq!(old, None, "obsolete title A must not resolve");
         assert_eq!(mid, None, "obsolete title B must not resolve");
         assert_eq!(cur, Some("s1".to_string()), "current title C must resolve");
-        std::fs::remove_dir_all(&cfg).ok();
     }
 
     #[test]
@@ -1863,7 +1863,8 @@ mod tests {
     fn test_resolve_claude_thread_name_bails_on_within_tool_duplicate() {
         // Two distinct sessions both currently have customTitle="dup" — must
         // bail rather than silently pick by mtime.
-        let cfg = std::env::temp_dir().join("hcom_test_claude_dup_title");
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let cfg = cfg_dir.path();
         let projects = cfg.join("projects/proj");
         std::fs::create_dir_all(&projects).unwrap();
         std::fs::write(
@@ -1879,7 +1880,7 @@ mod tests {
         )
         .unwrap();
 
-        let res = with_claude_config_dir(&cfg, || resolve_claude_thread_name("dup"));
+        let res = with_claude_config_dir(cfg, || resolve_claude_thread_name("dup"));
 
         let err = res.unwrap_err().to_string();
         assert!(err.contains("matches 2 Claude sessions"), "got: {err}");
@@ -1887,7 +1888,6 @@ mod tests {
             err.contains("sess-aaaa") && err.contains("sess-bbbb"),
             "got: {err}"
         );
-        std::fs::remove_dir_all(&cfg).ok();
     }
 
     #[test]
@@ -1964,9 +1964,8 @@ mod tests {
     #[test]
     fn test_extract_cwd_claude() {
         // Claude records cwd in the first (and every) line. Read one line.
-        let dir = std::env::temp_dir().join("hcom_test_cwd_claude");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("test.jsonl");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.jsonl");
         std::fs::write(
             &path,
             r#"{"type":"user","cwd":"/start/dir","message":"hi"}
@@ -1976,16 +1975,14 @@ mod tests {
         .unwrap();
         let result = extract_cwd_from_transcript(path.to_str().unwrap(), "claude");
         assert_eq!(result, Some("/start/dir".to_string()));
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn test_extract_cwd_claude_skips_permission_mode_header() {
         // Real Claude transcripts start with a `permission-mode` line that has
         // no `cwd`; cwd first appears on a later entry. Must scan forward.
-        let dir = std::env::temp_dir().join("hcom_test_cwd_claude_header");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("test.jsonl");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.jsonl");
         std::fs::write(
             &path,
             r#"{"type":"permission-mode","permissionMode":"default","sessionId":"abc"}
@@ -1996,16 +1993,14 @@ mod tests {
         .unwrap();
         let result = extract_cwd_from_transcript(path.to_str().unwrap(), "claude");
         assert_eq!(result, Some("/real/cwd".to_string()));
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn test_extract_cwd_claude_gives_up_after_cap() {
         // If no cwd appears in the first 20 lines, return None rather than
         // reading the full transcript.
-        let dir = std::env::temp_dir().join("hcom_test_cwd_claude_cap");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("test.jsonl");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.jsonl");
         let mut content = String::new();
         for _ in 0..25 {
             content.push_str(r#"{"type":"noise"}"#);
@@ -2016,15 +2011,13 @@ mod tests {
         std::fs::write(&path, content).unwrap();
         let result = extract_cwd_from_transcript(path.to_str().unwrap(), "claude");
         assert_eq!(result, None);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn test_extract_cwd_codex() {
         // Codex records cwd in the session_meta payload on line 1.
-        let dir = std::env::temp_dir().join("hcom_test_cwd_codex");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("test.jsonl");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.jsonl");
         std::fs::write(
             &path,
             r#"{"type":"session_meta","payload":{"cwd":"/start/dir"}}
@@ -2034,7 +2027,6 @@ mod tests {
         .unwrap();
         let result = extract_cwd_from_transcript(path.to_str().unwrap(), "codex");
         assert_eq!(result, Some("/start/dir".to_string()));
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -2044,7 +2036,8 @@ mod tests {
         // stores cwd → short-id in ~/.gemini/projects.json. This test wires up
         // a fake GEMINI_CLI_HOME and confirms the reverse lookup.
         use sha2::{Digest, Sha256};
-        let base = std::env::temp_dir().join("hcom_test_cwd_gemini_ok");
+        let base_dir = tempfile::tempdir().unwrap();
+        let base = base_dir.path();
         let gemini = base.join(".gemini");
         let session_dir = gemini.join("tmp/myproj/chats");
         std::fs::create_dir_all(&session_dir).unwrap();
@@ -2074,7 +2067,7 @@ mod tests {
         // SAFETY: test is single-threaded enough for this module; serial_test
         // isn't in scope here, but other tests don't touch GEMINI_CLI_HOME.
         unsafe {
-            std::env::set_var("GEMINI_CLI_HOME", &base);
+            std::env::set_var("GEMINI_CLI_HOME", base);
         }
         let result = extract_cwd_from_transcript(session_path.to_str().unwrap(), "gemini");
         match prev {
@@ -2083,21 +2076,21 @@ mod tests {
         }
 
         assert_eq!(result, Some(fake_cwd.to_string()));
-        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]
     #[serial_test::serial]
     fn test_extract_cwd_gemini_no_registry_returns_none() {
         // When projects.json is missing, we can't reverse the hash → return None.
-        let base = std::env::temp_dir().join("hcom_test_cwd_gemini_noreg");
+        let base_dir = tempfile::tempdir().unwrap();
+        let base = base_dir.path();
         let gemini = base.join(".gemini/tmp/x/chats");
         std::fs::create_dir_all(&gemini).unwrap();
         let path = gemini.join("test.json");
         std::fs::write(&path, r#"{"projectHash":"deadbeef"}"#).unwrap();
         let prev = std::env::var("GEMINI_CLI_HOME").ok();
         unsafe {
-            std::env::set_var("GEMINI_CLI_HOME", &base);
+            std::env::set_var("GEMINI_CLI_HOME", base);
         }
         let result = extract_cwd_from_transcript(path.to_str().unwrap(), "gemini");
         match prev {
@@ -2105,6 +2098,5 @@ mod tests {
             None => unsafe { std::env::remove_var("GEMINI_CLI_HOME") },
         }
         assert_eq!(result, None);
-        std::fs::remove_dir_all(&base).ok();
     }
 }

@@ -101,6 +101,27 @@ pub fn find_working_broker() -> Option<(String, u16, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpListener;
+
+    /// Stand up a localhost TCP listener whose worker accepts every connection
+    /// and immediately drops it (so the peer sees a clean close). For `use_tls`
+    /// callers this means TLS reads fail fast on EOF instead of waiting 5s for
+    /// a `192.0.2.x`-style read timeout — that's the actual unreachable shape
+    /// we want to exercise, without the TOCTOU of relying on an unclaimed
+    /// ephemeral port.
+    ///
+    /// Returns the bound port. The accepting thread and listener are leaked
+    /// (process-lifetime); fine for unit tests.
+    fn spawn_closing_listener() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            while let Ok((stream, _)) = listener.accept() {
+                drop(stream);
+            }
+        });
+        port
+    }
 
     #[test]
     fn test_test_brokers_parallel_empty() {
@@ -109,16 +130,28 @@ mod tests {
     }
 
     #[test]
-    fn test_ping_broker_unreachable() {
-        // Non-routable address should fail (timeout ~5s)
-        let result = ping_broker("192.0.2.1", 8883, true);
-        assert!(result.is_none());
+    fn test_ping_broker_unreachable_tls() {
+        // TLS handshake against a peer that hangs up immediately: rustls fails
+        // before complete_io returns, ping_broker returns None promptly.
+        let port = spawn_closing_listener();
+        let result = ping_broker("127.0.0.1", port, true);
+        assert!(result.is_none(), "expected None, got {result:?}");
     }
 
     #[test]
     fn test_test_brokers_parallel_unreachable() {
-        let brokers = &[("192.0.2.1", 8883), ("192.0.2.2", 8883)];
-        let results = test_brokers_parallel(brokers);
+        let p1 = spawn_closing_listener();
+        let p2 = spawn_closing_listener();
+        let brokers = &[("127.0.0.1", p1), ("127.0.0.1", p2)];
+        // Pretend these are TLS broker ports so ping_broker drives the full
+        // TLS handshake path against our closing listeners.
+        let results: Vec<BrokerTestResult> = brokers
+            .iter()
+            .map(|(h, p)| {
+                let ping = ping_broker(h, *p, true);
+                (h.to_string(), *p, ping)
+            })
+            .collect();
         assert_eq!(results.len(), 2);
         assert!(results[0].2.is_none());
         assert!(results[1].2.is_none());
