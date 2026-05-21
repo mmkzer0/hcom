@@ -621,10 +621,8 @@ impl LaunchState {
     pub fn adjust_left(&mut self) {
         match self.options_cursor {
             Some(LaunchField::Tool) => self.tool = self.tool.prev(),
-            Some(LaunchField::Count) => {
-                if self.count > 1 {
-                    self.count -= 1;
-                }
+            Some(LaunchField::Count) if self.count > 1 => {
+                self.count -= 1;
             }
             Some(LaunchField::Terminal) => {
                 if self.terminal == 0 {
@@ -640,10 +638,8 @@ impl LaunchState {
     pub fn adjust_right(&mut self) {
         match self.options_cursor {
             Some(LaunchField::Tool) => self.tool = self.tool.next(),
-            Some(LaunchField::Count) => {
-                if self.count < 99 {
-                    self.count += 1;
-                }
+            Some(LaunchField::Count) if self.count < 99 => {
+                self.count += 1;
             }
             Some(LaunchField::Terminal) => {
                 self.terminal = (self.terminal + 1) % self.terminal_presets.len();

@@ -273,14 +273,14 @@ impl App {
             KeyCode::Esc => {
                 self.ui.confirm = None;
             }
-            KeyCode::Char('n') => {
-                // n = "No" shortcut, not applicable to OrphanAction (Kill/Recover)
+            KeyCode::Char('n')
                 if !matches!(
                     self.ui.confirm.as_ref().map(|c| &c.action),
                     Some(ConfirmAction::OrphanAction(_))
-                ) {
-                    self.ui.confirm = None;
-                }
+                ) =>
+            {
+                // n = "No" shortcut, not applicable to OrphanAction (Kill/Recover)
+                self.ui.confirm = None;
             }
             KeyCode::Char('y') => {
                 // y = "Yes" shortcut, not applicable to OrphanAction
@@ -305,25 +305,20 @@ impl App {
 
         match code {
             // MOVEMENT — always work, no conditions
-            KeyCode::Up => {
-                if self.ui.cursor > 0 {
-                    self.ui.cursor -= 1;
-                }
+            KeyCode::Up if self.ui.cursor > 0 => {
+                self.ui.cursor -= 1;
             }
-            KeyCode::Down => {
-                if self.ui.cursor + 1 < self.total_visible_rows() {
-                    self.ui.cursor += 1;
-                }
+            KeyCode::Down if self.ui.cursor + 1 < self.total_visible_rows() => {
+                self.ui.cursor += 1;
             }
-            KeyCode::Left if self.ui.view_mode == ViewMode::Inline => {
-                if self.ui.cursor > 0 {
-                    self.ui.cursor -= 1;
-                }
+            KeyCode::Left if self.ui.view_mode == ViewMode::Inline && self.ui.cursor > 0 => {
+                self.ui.cursor -= 1;
             }
-            KeyCode::Right if self.ui.view_mode == ViewMode::Inline => {
-                if self.ui.cursor + 1 < self.total_visible_rows() {
-                    self.ui.cursor += 1;
-                }
+            KeyCode::Right
+                if self.ui.view_mode == ViewMode::Inline
+                    && self.ui.cursor + 1 < self.total_visible_rows() =>
+            {
+                self.ui.cursor += 1;
             }
             KeyCode::Home => {
                 if self.ui.view_mode == ViewMode::Inline {
@@ -983,17 +978,13 @@ impl App {
                 KeyCode::Down => self.ui.launch.cursor_down(),
                 KeyCode::Left => self.ui.launch.adjust_left(),
                 KeyCode::Right => self.ui.launch.adjust_right(),
-                KeyCode::Enter => {
-                    if !self.ui.launch.is_text_field() {
-                        self.ui.launch.toggle_or_select();
-                    }
+                KeyCode::Enter if !self.ui.launch.is_text_field() => {
+                    self.ui.launch.toggle_or_select();
                 }
                 KeyCode::Char(' ') => self.ui.launch.toggle_or_select(),
-                KeyCode::Char(c) => {
-                    if self.ui.launch.is_text_field() {
-                        self.ui.launch.start_editing();
-                        self.ui.launch.insert_char(c);
-                    }
+                KeyCode::Char(c) if self.ui.launch.is_text_field() => {
+                    self.ui.launch.start_editing();
+                    self.ui.launch.insert_char(c);
                 }
                 _ => {}
             }
@@ -1097,31 +1088,29 @@ impl App {
                     popup.token_input.clear();
                     popup.token_cursor = 0;
                 }
-                KeyCode::Enter => {
-                    if !popup.token_input.is_empty() {
-                        let token = popup.token_input.clone();
-                        let cmd = format!("relay connect {}", token);
-                        if let Err(e) = self.enqueue_rpc(RpcOp::RelayConnect {
-                            token: token.clone(),
-                        }) {
-                            self.ui.command_result = Some(CommandResult {
-                                label: cmd,
-                                output: vec![format!("Error: {}", e)],
-                            });
-                        } else {
-                            self.ui.command_result = Some(CommandResult {
-                                label: cmd,
-                                output: vec!["(running...)".into()],
-                            });
-                        }
-                        self.ui.relay_popup = None;
-                        if self.ui.view_mode == ViewMode::Inline {
-                            self.ui.pending_eject_cmd = true;
-                            self.ui.mode = InputMode::Navigate;
-                        } else {
-                            self.ui.mode = InputMode::CommandOutput;
-                            self.ui.msg_scroll = 0;
-                        }
+                KeyCode::Enter if !popup.token_input.is_empty() => {
+                    let token = popup.token_input.clone();
+                    let cmd = format!("relay connect {}", token);
+                    if let Err(e) = self.enqueue_rpc(RpcOp::RelayConnect {
+                        token: token.clone(),
+                    }) {
+                        self.ui.command_result = Some(CommandResult {
+                            label: cmd,
+                            output: vec![format!("Error: {}", e)],
+                        });
+                    } else {
+                        self.ui.command_result = Some(CommandResult {
+                            label: cmd,
+                            output: vec!["(running...)".into()],
+                        });
+                    }
+                    self.ui.relay_popup = None;
+                    if self.ui.view_mode == ViewMode::Inline {
+                        self.ui.pending_eject_cmd = true;
+                        self.ui.mode = InputMode::Navigate;
+                    } else {
+                        self.ui.mode = InputMode::CommandOutput;
+                        self.ui.msg_scroll = 0;
                     }
                 }
                 KeyCode::Left => cursor_left(&popup.token_input, &mut popup.token_cursor),
@@ -1138,15 +1127,11 @@ impl App {
                 self.ui.relay_popup = None;
                 self.ui.mode = InputMode::Navigate;
             }
-            KeyCode::Up => {
-                if popup.cursor > 0 {
-                    popup.cursor -= 1;
-                }
+            KeyCode::Up if popup.cursor > 0 => {
+                popup.cursor -= 1;
             }
-            KeyCode::Down => {
-                if popup.cursor < RELAY_ACTIONS.len() as u8 {
-                    popup.cursor += 1;
-                }
+            KeyCode::Down if popup.cursor < RELAY_ACTIONS.len() as u8 => {
+                popup.cursor += 1;
             }
             KeyCode::Enter | KeyCode::Char(' ') => match popup.cursor {
                 0 => {
