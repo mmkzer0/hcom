@@ -8,6 +8,7 @@ pub mod common;
 pub mod family;
 pub mod gemini;
 pub mod opencode;
+pub mod antigravity;
 pub mod utils;
 
 use serde_json::Value;
