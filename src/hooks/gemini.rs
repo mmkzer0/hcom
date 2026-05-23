@@ -178,8 +178,8 @@ fn bind_vanilla_instance(db: &HcomDb, payload: &HookPayload) -> Option<String> {
         return None;
     }
 
-    // Only check run_shell_command tool responses
-    if payload.tool_name != "run_shell_command" {
+    // Only check run_shell_command (gemini) or run_command (antigravity) tool responses
+    if payload.tool_name != "run_shell_command" && payload.tool_name != "run_command" {
         return None;
     }
 
@@ -196,7 +196,7 @@ fn bind_vanilla_instance(db: &HcomDb, payload: &HookPayload) -> Option<String> {
         &instance_name,
         payload.session_id.as_deref(),
         payload.transcript_path.as_deref(),
-        "gemini",
+        &payload.tool,
         "gemini-aftertool",
     )
 }
@@ -2938,5 +2938,85 @@ mod tests {
         assert_eq!(out["decision"], "allow");
         assert_eq!(out["hookSpecificOutput"]["hookEventName"], "BeforeTool");
         assert_eq!(out["hookSpecificOutput"]["additionalContext"], "injected context");
+    }
+
+    fn make_test_db() -> (tempfile::TempDir, HcomDb) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = HcomDb::open_raw(&db_path).unwrap();
+        db.init_db().unwrap();
+        (dir, db)
+    }
+
+    fn insert_test_instance(db: &HcomDb, name: &str, tool: &str) {
+        let now = chrono::Utc::now().timestamp() as f64;
+        db.conn().execute(
+            "INSERT INTO instances (name, status, created_at, tool) VALUES (?1, 'active', ?2, ?3)",
+            rusqlite::params![name, now, tool],
+        ).unwrap();
+    }
+
+    #[test]
+    fn test_bind_vanilla_instance_gemini_success() {
+        let (_dir, db) = make_test_db();
+        insert_test_instance(&db, "luna", "gemini");
+
+        let payload = HookPayload {
+            session_id: Some("sess-v1".to_string()),
+            transcript_path: Some("/tmp/t1.jsonl".to_string()),
+            hook_name: "gemini-aftertool".to_string(),
+            tool: "gemini".to_string(),
+            tool_name: "run_shell_command".to_string(),
+            tool_input: serde_json::Value::Null,
+            tool_result: "[hcom:luna] done".to_string(),
+            notification_type: None,
+            raw: serde_json::Value::Null,
+        };
+
+        let result = bind_vanilla_instance(&db, &payload);
+        assert_eq!(result, Some("luna".to_string()));
+
+        // Session binding should be created
+        assert_eq!(
+            db.get_session_binding("sess-v1").unwrap(),
+            Some("luna".to_string())
+        );
+
+        // Instance should have session_id set
+        let inst = db.get_instance_full("luna").unwrap().unwrap();
+        assert_eq!(inst.session_id.as_deref(), Some("sess-v1"));
+        assert_eq!(inst.tool, "gemini");
+    }
+
+    #[test]
+    fn test_bind_vanilla_instance_antigravity_success() {
+        let (_dir, db) = make_test_db();
+        insert_test_instance(&db, "nova", "antigravity");
+
+        let payload = HookPayload {
+            session_id: Some("sess-v2".to_string()),
+            transcript_path: Some("/tmp/t2.jsonl".to_string()),
+            hook_name: "gemini-aftertool".to_string(),
+            tool: "antigravity".to_string(),
+            tool_name: "run_command".to_string(),
+            tool_input: serde_json::Value::Null,
+            tool_result: "[hcom:nova] done".to_string(),
+            notification_type: None,
+            raw: serde_json::Value::Null,
+        };
+
+        let result = bind_vanilla_instance(&db, &payload);
+        assert_eq!(result, Some("nova".to_string()));
+
+        // Session binding should be created
+        assert_eq!(
+            db.get_session_binding("sess-v2").unwrap(),
+            Some("nova".to_string())
+        );
+
+        // Instance should have session_id set
+        let inst = db.get_instance_full("nova").unwrap().unwrap();
+        assert_eq!(inst.session_id.as_deref(), Some("sess-v2"));
+        assert_eq!(inst.tool, "antigravity");
     }
 }
