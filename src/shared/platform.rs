@@ -114,6 +114,8 @@ pub fn is_inside_ai_tool() -> bool {
     let nonempty = |k: &str| env::var(k).ok().filter(|v| !v.is_empty()).is_some();
     // Claude (matches HcomContext: CLAUDECODE=1 || CLAUDE_ENV_FILE non-empty)
     is_eq("CLAUDECODE", "1") || nonempty("CLAUDE_ENV_FILE")
+        // Antigravity
+        || is_set("ANTIGRAVITY_AGENT")
         // Gemini
         || is_eq("GEMINI_CLI", "1")
         // Codex (all 5 markers from HcomContext)
@@ -138,6 +140,8 @@ pub fn detect_current_tool_from_env() -> &'static str {
     let nonempty = |k: &str| env::var(k).ok().filter(|v| !v.is_empty()).is_some();
     if is_eq("CLAUDECODE", "1") || nonempty("CLAUDE_ENV_FILE") {
         "claude"
+    } else if is_set("ANTIGRAVITY_AGENT") {
+        "antigravity"
     } else if is_eq("GEMINI_CLI", "1") {
         "gemini"
     } else if is_set("CODEX_SANDBOX")

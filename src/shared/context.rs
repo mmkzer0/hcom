@@ -45,6 +45,7 @@ pub struct HcomContext {
     pub claude_env_file: Option<String>,
     /// Tool markers for context-based detection.
     pub is_claude: bool,
+    pub is_antigravity: bool,
     pub is_gemini: bool,
     pub is_codex: bool,
     pub is_opencode: bool,
@@ -90,6 +91,7 @@ impl HcomContext {
 
         // Tool markers
         let is_claude = is_eq("CLAUDECODE", "1") || get_nonempty("CLAUDE_ENV_FILE").is_some();
+        let is_antigravity = is_set("ANTIGRAVITY_AGENT");
         let is_gemini = is_eq("GEMINI_CLI", "1");
         let is_codex = is_set("CODEX_SANDBOX")
             || is_set("CODEX_SANDBOX_NETWORK_DISABLED")
@@ -101,6 +103,8 @@ impl HcomContext {
         // Determine tool type
         let tool = if is_claude {
             Tool::Claude
+        } else if is_antigravity {
+            Tool::Antigravity
         } else if is_gemini {
             Tool::Gemini
         } else if is_codex {
@@ -126,6 +130,7 @@ impl HcomContext {
             tool,
             claude_env_file: get_nonempty("CLAUDE_ENV_FILE"),
             is_claude,
+            is_antigravity,
             is_gemini,
             is_codex,
             is_opencode,
@@ -181,7 +186,7 @@ impl HcomContext {
 
     /// Whether running inside any AI tool.
     pub fn is_inside_ai_tool(&self) -> bool {
-        self.is_claude || self.is_launched || self.is_gemini || self.is_codex || self.is_opencode
+        self.is_claude || self.is_antigravity || self.is_launched || self.is_gemini || self.is_codex || self.is_opencode
     }
 
     /// Detect current tool name, or "adhoc".
@@ -222,6 +227,29 @@ mod tests {
         assert!(!ctx.is_codex);
         assert_eq!(ctx.tool, Tool::Claude);
         assert_eq!(ctx.cwd, PathBuf::from("/tmp"));
+    }
+
+    #[test]
+    fn test_from_env_antigravity() {
+        let env = make_env(&[("ANTIGRAVITY_AGENT", "1"), ("HOME", "/home/test")]);
+        let ctx = HcomContext::from_env(&env, PathBuf::from("/tmp"));
+
+        assert!(ctx.is_antigravity);
+        assert_eq!(ctx.tool, Tool::Antigravity);
+    }
+
+    #[test]
+    fn test_antigravity_priority_over_gemini() {
+        let env = make_env(&[
+            ("ANTIGRAVITY_AGENT", "1"),
+            ("GEMINI_CLI", "1"),
+            ("HOME", "/home/test"),
+        ]);
+        let ctx = HcomContext::from_env(&env, PathBuf::from("/tmp"));
+
+        assert!(ctx.is_antigravity);
+        assert!(ctx.is_gemini);
+        assert_eq!(ctx.tool, Tool::Antigravity);
     }
 
     #[test]

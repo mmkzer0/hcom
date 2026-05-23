@@ -290,7 +290,7 @@ mod tests {
         // (unless running inside one, which is fine — it'll detect it)
         let tool = detect_current_tool();
         assert!(
-            ["claude", "gemini", "codex", "opencode", "adhoc"].contains(&tool),
+            ["claude", "gemini", "codex", "opencode", "antigravity", "adhoc"].contains(&tool),
             "unexpected tool: {tool}"
         );
     }

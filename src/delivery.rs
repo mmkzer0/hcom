@@ -313,6 +313,21 @@ impl ToolConfig {
         }
     }
 
+    /// Get config for Antigravity.
+    ///
+    /// Antigravity is a headless CLI with hook-based delivery (like Gemini).
+    /// No PTY TUI rendering — `require_ready_prompt=false`, no screen gating.
+    pub fn antigravity() -> Self {
+        Self {
+            tool: "antigravity".to_string(),
+            require_idle: true,
+            require_ready_prompt: false,
+            require_prompt_empty: false,
+            block_on_user_activity: true,
+            block_on_approval: true,
+        }
+    }
+
     /// Get config by tool.
     pub fn for_tool(tool: crate::tool::Tool) -> Self {
         match tool {
@@ -320,6 +335,7 @@ impl ToolConfig {
             crate::tool::Tool::Gemini => Self::gemini(),
             crate::tool::Tool::Codex => Self::codex(),
             crate::tool::Tool::OpenCode => Self::opencode(),
+            crate::tool::Tool::Antigravity => Self::antigravity(),
             crate::tool::Tool::Adhoc => Self::claude(),
         }
     }

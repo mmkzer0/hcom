@@ -344,6 +344,7 @@ impl ScreenTracker {
             Ok(Tool::Gemini) => self.get_gemini_input_text(),
             Ok(Tool::Codex) => self.get_codex_input_text(),
             Ok(Tool::OpenCode) => None, // OpenCode: plugin handles delivery, no PTY input detection needed
+            Ok(Tool::Antigravity) => Some(String::new()),
             Ok(Tool::Adhoc) => None,
             Err(_) => None,
         }
@@ -610,6 +611,7 @@ impl ScreenTracker {
                     Ok(Tool::Claude) => Some("❯"),
                     Ok(Tool::Codex) => Some("›"),
                     Ok(Tool::Gemini) => Some(">"),
+                    Ok(Tool::Antigravity) => None,
                     _ => None,
                 };
                 if let Some(pc) = prompt_char {

@@ -92,6 +92,7 @@ pub fn build_launch_argv(
             Tool::OpenCode => {
                 argv.extend(["--prompt".into(), prompt.into()]);
             }
+            Tool::Antigravity => {}
             Tool::Adhoc => {}
         }
     } else if headless {

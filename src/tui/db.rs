@@ -239,6 +239,7 @@ fn parse_tool(s: &str) -> Tool {
         "gemini" => Tool::Gemini,
         "codex" => Tool::Codex,
         "opencode" => Tool::OpenCode,
+        "antigravity" => Tool::Antigravity,
         _ => Tool::Adhoc,
     }
 }

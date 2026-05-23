@@ -56,6 +56,7 @@ pub const RELEASED_BACKGROUND: &[&str] = &["claude"];
 /// Tool detection markers — set by AI tools, cleared to prevent inheritance.
 pub const TOOL_MARKER_VARS: &[&str] = &[
     "CLAUDECODE",
+    "ANTIGRAVITY_AGENT",
     "GEMINI_CLI",
     "GEMINI_SYSTEM_MD",
     "CODEX_SANDBOX",

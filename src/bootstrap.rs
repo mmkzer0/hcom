@@ -412,7 +412,7 @@ pub fn get_bootstrap(
 
     // Tool-specific delivery
     if tool == "claude"
-        || ((tool == "codex" || tool == "gemini" || tool == "opencode") && ctx.is_launched)
+        || ((tool == "codex" || tool == "gemini" || tool == "opencode" || tool == "antigravity") && ctx.is_launched)
     {
         parts.push(DELIVERY_AUTO);
     } else {
