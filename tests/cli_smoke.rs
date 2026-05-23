@@ -363,3 +363,63 @@ fn unknown_command_errors() {
     assert_ne!(code, 0);
     assert!(!stderr.is_empty(), "expected error message on stderr");
 }
+
+#[test]
+fn antigravity_e2e_hook_dispatch() {
+    let h = Hcom::new();
+    let _me = h.start(); // Spawns active instance, e.g. "luna"
+
+    // 1. Pipe PreInvocation (session start) to gemini-sessionstart.
+    // This will bind the session_id "sess-agy-1" to the active instance.
+    let session_start_payload = serde_json::json!({
+        "conversationId": "sess-agy-1",
+        "transcriptPath": "/tmp/transcript.jsonl",
+    });
+
+    use std::process::Stdio;
+    use std::io::Write;
+
+    let mut cmd = h.cmd();
+    cmd.args(["gemini-sessionstart"]);
+    cmd.env("ANTIGRAVITY_AGENT", "1");
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().expect("failed to spawn hcom sessionstart");
+    {
+        let mut stdin = child.stdin.take().expect("failed to open stdin");
+        stdin.write_all(serde_json::to_string(&session_start_payload).unwrap().as_bytes()).unwrap();
+    }
+    let out = child.wait_with_output().expect("failed to wait sessionstart");
+    assert_eq!(out.status.code().unwrap_or(-1), 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+
+    // 2. Now pipe PreToolUse to gemini-beforetool.
+    // Since the session is bound, it should resolve the instance and execute successfully.
+    let before_tool_payload = serde_json::json!({
+        "conversationId": "sess-agy-1",
+        "transcriptPath": "/tmp/transcript.jsonl",
+        "toolCall": {
+            "name": "run_command",
+            "args": { "CommandLine": "echo hello", "Cwd": "/tmp" }
+        }
+    });
+
+    let mut cmd = h.cmd();
+    cmd.args(["gemini-beforetool"]);
+    cmd.env("ANTIGRAVITY_AGENT", "1");
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().expect("failed to spawn hcom beforetool");
+    {
+        let mut stdin = child.stdin.take().expect("failed to open stdin");
+        stdin.write_all(serde_json::to_string(&before_tool_payload).unwrap().as_bytes()).unwrap();
+    }
+    let out = child.wait_with_output().expect("failed to wait beforetool");
+    assert_eq!(out.status.code().unwrap_or(-1), 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    // With silent allow, stdout should be empty
+    assert!(stdout.trim().is_empty(), "stdout should be empty on allow: {stdout}");
+}
