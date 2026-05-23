@@ -520,6 +520,65 @@ fn get_handler(hook_name: &str) -> Option<fn(&HcomDb, &HcomContext, &HookPayload
     }
 }
 
+/// Helper to serialize HookResult based on tool type.
+///
+/// Antigravity uses a flat decision JSON schema, whereas Gemini wraps
+/// additionalContext inside a hookSpecificOutput object.
+fn serialize_hook_result(tool: &str, hook_name: &str, result: &HookResult) -> Option<Value> {
+    if tool == "antigravity" {
+        // Antigravity: flat decision schema, no hookSpecificOutput wrapper
+        match result {
+            HookResult::Allow { .. } => None, // silent allow = no output
+            HookResult::Block { reason } => Some(serde_json::json!({
+                "decision": "deny",
+                "reason": reason,
+            })),
+            HookResult::UpdateInput { updated_input } => Some(serde_json::json!({
+                "decision": "allow",
+                "overwrite": updated_input,
+            })),
+        }
+    } else {
+        // Gemini: hookSpecificOutput wrapper
+        match result {
+            // Note: system_message on Allow is unused for Gemini (not part of Gemini hook schema)
+            HookResult::Allow {
+                additional_context, ..
+            } => {
+                if let Some(ctx) = additional_context {
+                    // Map hook name to Gemini event name (e.g. "gemini-beforeagent" → "BeforeAgent")
+                    let event_name = match hook_name {
+                        "gemini-sessionstart" => "SessionStart",
+                        "gemini-beforeagent" => "BeforeAgent",
+                        "gemini-afteragent" => "AfterAgent",
+                        "gemini-beforetool" => "BeforeTool",
+                        "gemini-aftertool" => "AfterTool",
+                        "gemini-notification" => "Notification",
+                        "gemini-sessionend" => "SessionEnd",
+                        _ => hook_name,
+                    };
+                    Some(serde_json::json!({
+                        "decision": "allow",
+                        "hookSpecificOutput": {
+                            "hookEventName": event_name,
+                            "additionalContext": ctx,
+                        }
+                    }))
+                } else {
+                    None
+                }
+            }
+            HookResult::Block { reason } => Some(serde_json::json!({
+                "decision": "block",
+                "reason": reason,
+            })),
+            HookResult::UpdateInput { updated_input } => {
+                Some(serde_json::json!({ "updatedInput": updated_input }))
+            }
+        }
+    }
+}
+
 /// Main entry point for Gemini hooks — called by router.
 ///
 /// Reads stdin JSON, builds HookPayload + HcomContext, dispatches to handler.
@@ -537,8 +596,17 @@ pub fn dispatch_gemini_hook(hook_name: &str) -> i32 {
         Err(_) => Value::Object(Default::default()),
     };
 
-    // Build payload
-    let payload = HookPayload::from_gemini(stdin_json);
+    // Detect antigravity payload (nested toolCall schema)
+    let is_agy = stdin_json.get("conversationId").is_some()
+        || stdin_json.get("toolCall").is_some();
+
+    let payload = if is_agy {
+        let mut p = HookPayload::from_antigravity(stdin_json);
+        p.hook_name = hook_name.to_string();
+        p
+    } else {
+        HookPayload::from_gemini(stdin_json)
+    };
 
     // Pre-gate: skip BeforeAgent for non-participants
     if !ctx.is_launched && hook_name == "gemini-beforeagent" {
@@ -619,44 +687,9 @@ pub fn dispatch_gemini_hook(hook_name: &str) -> i32 {
         ),
     );
 
-    // Output result JSON to stdout — Gemini expects hookSpecificOutput wrapper
+    // Output result JSON to stdout
     let exit_code = result.exit_code();
-    let output_json = match &result {
-        // Note: system_message on Allow is unused for Gemini (not part of Gemini hook schema)
-        HookResult::Allow {
-            additional_context, ..
-        } => {
-            if let Some(ctx) = additional_context {
-                // Map hook name to Gemini event name (e.g. "gemini-beforeagent" → "BeforeAgent")
-                let event_name = match hook_name {
-                    "gemini-sessionstart" => "SessionStart",
-                    "gemini-beforeagent" => "BeforeAgent",
-                    "gemini-afteragent" => "AfterAgent",
-                    "gemini-beforetool" => "BeforeTool",
-                    "gemini-aftertool" => "AfterTool",
-                    "gemini-notification" => "Notification",
-                    "gemini-sessionend" => "SessionEnd",
-                    _ => hook_name,
-                };
-                Some(serde_json::json!({
-                    "decision": "allow",
-                    "hookSpecificOutput": {
-                        "hookEventName": event_name,
-                        "additionalContext": ctx,
-                    }
-                }))
-            } else {
-                None
-            }
-        }
-        HookResult::Block { reason } => Some(serde_json::json!({
-            "decision": "block",
-            "reason": reason,
-        })),
-        HookResult::UpdateInput { updated_input } => {
-            Some(serde_json::json!({ "updatedInput": updated_input }))
-        }
-    };
+    let output_json = serialize_hook_result(&payload.tool, hook_name, &result);
     if let Some(json) = output_json {
         let mut stdout = std::io::stdout().lock();
         if serde_json::to_writer(&mut stdout, &json).is_ok()
@@ -2850,5 +2883,60 @@ mod tests {
         );
 
         drop(_guard);
+    }
+
+    #[test]
+    fn test_antigravity_serialization_allow() {
+        let result = HookResult::Allow {
+            additional_context: None,
+            system_message: None,
+            delivery_ack: None,
+        };
+        let out = serialize_hook_result("antigravity", "gemini-beforetool", &result);
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn test_antigravity_serialization_block() {
+        let result = HookResult::Block {
+            reason: "permission denied".to_string(),
+        };
+        let out = serialize_hook_result("antigravity", "gemini-beforetool", &result).unwrap();
+        assert_eq!(out["decision"], "deny");
+        assert_eq!(out["reason"], "permission denied");
+    }
+
+    #[test]
+    fn test_antigravity_serialization_overwrite() {
+        let result = HookResult::UpdateInput {
+            updated_input: serde_json::json!({"command": "ls -l"}),
+        };
+        let out = serialize_hook_result("antigravity", "gemini-beforetool", &result).unwrap();
+        assert_eq!(out["decision"], "allow");
+        assert_eq!(out["overwrite"]["command"], "ls -l");
+    }
+
+    #[test]
+    fn test_gemini_serialization_allow_no_context() {
+        let result = HookResult::Allow {
+            additional_context: None,
+            system_message: None,
+            delivery_ack: None,
+        };
+        let out = serialize_hook_result("gemini", "gemini-beforetool", &result);
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn test_gemini_serialization_allow_with_context() {
+        let result = HookResult::Allow {
+            additional_context: Some("injected context".to_string()),
+            system_message: None,
+            delivery_ack: None,
+        };
+        let out = serialize_hook_result("gemini", "gemini-beforetool", &result).unwrap();
+        assert_eq!(out["decision"], "allow");
+        assert_eq!(out["hookSpecificOutput"]["hookEventName"], "BeforeTool");
+        assert_eq!(out["hookSpecificOutput"]["additionalContext"], "injected context");
     }
 }

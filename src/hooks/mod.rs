@@ -221,6 +221,34 @@ impl HookPayload {
         }
     }
 
+    /// Build from Antigravity hook JSON.
+    ///
+    /// Antigravity stdin format (nested toolCall):
+    ///   { "conversationId", "transcriptPath", "stepIdx",
+    ///     "toolCall": { "name", "args": { ... } },
+    ///     "workspacePaths", "artifactDirectoryPath" }
+    pub fn from_antigravity(raw: Value) -> Self {
+        let tool_call = raw.get("toolCall").cloned().unwrap_or_default();
+        let tool_name = tool_call.get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let tool_input = tool_call.get("args").cloned()
+            .unwrap_or_else(|| Value::Object(Default::default()));
+
+        Self {
+            session_id: Self::opt_str_field(&raw, &["conversationId"]),
+            transcript_path: Self::opt_str_field(&raw, &["transcriptPath"]),
+            hook_name: String::new(), // set by caller (dispatch_gemini_hook)
+            tool: "antigravity".to_string(),
+            tool_name,
+            tool_input,
+            tool_result: String::new(),
+            notification_type: None,
+            raw,
+        }
+    }
+
     /// Build from native Codex hook JSON.
     ///
     /// Codex hooks pass JSON on stdin with snake_case fields such as:
@@ -347,6 +375,31 @@ mod tests {
         assert_eq!(payload.tool, "gemini");
         assert_eq!(payload.tool_name, "run_shell_command");
         assert_eq!(payload.tool_input["command"], "echo hi");
+    }
+
+    #[test]
+    fn test_hook_payload_from_antigravity() {
+        let raw = serde_json::json!({
+            "conversationId": "6f000787-c5d3-4485-b266-142a15f7d79d",
+            "transcriptPath": "/tmp/transcript.jsonl",
+            "toolCall": {
+                "name": "run_command",
+                "args": { "CommandLine": "echo hi", "Cwd": "/tmp" }
+            }
+        });
+        let payload = HookPayload::from_antigravity(raw);
+        assert_eq!(payload.session_id.as_deref(), Some("6f000787-c5d3-4485-b266-142a15f7d79d"));
+        assert_eq!(payload.tool, "antigravity");
+        assert_eq!(payload.tool_name, "run_command");
+        assert_eq!(payload.tool_input["CommandLine"], "echo hi");
+    }
+
+    #[test]
+    fn test_hook_payload_from_antigravity_no_toolcall() {
+        let raw = serde_json::json!({"conversationId": "abc-123"});
+        let payload = HookPayload::from_antigravity(raw);
+        assert_eq!(payload.tool_name, "");
+        assert!(payload.tool_input.is_object());
     }
 
     #[test]
