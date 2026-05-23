@@ -48,7 +48,7 @@ pub static BIND_MARKER_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\[hcom:([a-z0-9_]+)\]").unwrap());
 
 /// Tools available for launch.
-pub const RELEASED_TOOLS: &[&str] = &["claude", "gemini", "codex", "opencode"];
+pub const RELEASED_TOOLS: &[&str] = &["claude", "gemini", "codex", "opencode", "antigravity"];
 
 /// Tools that support background/headless mode.
 pub const RELEASED_BACKGROUND: &[&str] = &["claude"];
@@ -209,7 +209,8 @@ mod tests {
         assert!(RELEASED_TOOLS.contains(&"gemini"));
         assert!(RELEASED_TOOLS.contains(&"codex"));
         assert!(RELEASED_TOOLS.contains(&"opencode"));
-        assert_eq!(RELEASED_TOOLS.len(), 4);
+        assert!(RELEASED_TOOLS.contains(&"antigravity"));
+        assert_eq!(RELEASED_TOOLS.len(), 5);
     }
 
     #[test]

@@ -31,6 +31,7 @@ pub enum LaunchTool {
     Gemini,
     Codex,
     OpenCode,
+    Antigravity,
 }
 
 impl LaunchTool {
@@ -42,6 +43,7 @@ impl LaunchTool {
             "gemini" => Ok(LaunchTool::Gemini),
             "codex" => Ok(LaunchTool::Codex),
             "opencode" => Ok(LaunchTool::OpenCode),
+            "antigravity" | "agy" => Ok(LaunchTool::Antigravity),
             _ => bail!("Unknown tool: {}", s),
         }
     }
@@ -53,6 +55,7 @@ impl LaunchTool {
             LaunchTool::Gemini => "gemini",
             LaunchTool::Codex => "codex",
             LaunchTool::OpenCode => "opencode",
+            LaunchTool::Antigravity => "antigravity",
         }
     }
 
@@ -63,6 +66,7 @@ impl LaunchTool {
             LaunchTool::Gemini => "gemini",
             LaunchTool::Codex => "codex",
             LaunchTool::OpenCode => "opencode",
+            LaunchTool::Antigravity => "antigravity",
         }
     }
 
@@ -102,7 +106,7 @@ impl LaunchBackend {
         match tool {
             LaunchTool::Claude if !pty => LaunchBackend::NativePrint,
             LaunchTool::Claude | LaunchTool::ClaudePty => LaunchBackend::HeadlessPty,
-            LaunchTool::Gemini | LaunchTool::Codex | LaunchTool::OpenCode => {
+            LaunchTool::Gemini | LaunchTool::Codex | LaunchTool::OpenCode | LaunchTool::Antigravity => {
                 LaunchBackend::HeadlessPty
             }
         }
@@ -277,7 +281,7 @@ fn install_diag_context(tool: &LaunchTool, paths: &[(&str, std::path::PathBuf)])
     );
     let tool_env_var = match tool {
         LaunchTool::Claude | LaunchTool::ClaudePty => Some("CLAUDE_CONFIG_DIR"),
-        LaunchTool::Gemini => Some("GEMINI_CLI_HOME"),
+        LaunchTool::Gemini | LaunchTool::Antigravity => Some("GEMINI_CLI_HOME"),
         LaunchTool::Codex => Some("CODEX_HOME"),
         LaunchTool::OpenCode => None,
     };
@@ -395,6 +399,26 @@ fn ensure_hooks_installed(tool: &LaunchTool) -> Result<()> {
             }
             let diag = install_diag_context(tool, &[]);
             bail!("Failed to setup OpenCode plugin. Run: hcom hooks add opencode\n{diag}");
+        }
+        LaunchTool::Antigravity => {
+            if crate::hooks::antigravity::verify_antigravity_hooks_installed(include_permissions) {
+                return Ok(());
+            }
+            if let Err(e) = crate::hooks::antigravity::try_setup_antigravity_hooks(include_permissions) {
+                let diag = install_diag_context(
+                    tool,
+                    &[(
+                        "hooks_path",
+                        crate::hooks::antigravity::get_antigravity_hooks_path(),
+                    )],
+                );
+                bail!(
+                    "Failed to setup Antigravity hooks: {e}\n\
+                     Run: hcom hooks add antigravity\n\
+                     {diag}"
+                );
+            }
+            Ok(())
         }
     }
 }
@@ -895,6 +919,10 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                 params.args.push("--prompt".to_string());
                 params.args.push(full_prompt);
             }
+            LaunchTool::Antigravity => {
+                // Antigravity: positional arg
+                params.args.push(full_prompt);
+            }
         }
     }
     let batch_id = params
@@ -1005,6 +1033,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
             LaunchTool::Gemini => "gemini",
             LaunchTool::Codex => "codex",
             LaunchTool::OpenCode => "opencode",
+            LaunchTool::Antigravity => "agy",
         };
         if !is_tool_installed(tool_binary) {
             eprintln!("Error: '{}' is not installed or not in PATH", tool_binary);
@@ -1278,6 +1307,33 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                         inside_ai_tool,
                     )
                 }
+                LaunchTool::Antigravity => {
+                    instances::update_instance_position(
+                        db,
+                        &instance_name,
+                        &serde_json::Map::from_iter([(
+                            "launch_args".to_string(),
+                            json!(params.args),
+                        )]),
+                    );
+                    launch_pty_or_background(
+                        &mut BackgroundLaunchCtx {
+                            db,
+                            tool: "antigravity",
+                            instance_name: &instance_name,
+                            process_id: &process_id,
+                            terminal_mode,
+                            tag: params.tag.as_deref().unwrap_or(""),
+                            working_dir,
+                            log_files: &mut log_files,
+                            handles: &mut handles,
+                        },
+                        &mut instance_env,
+                        &params.args,
+                        &params,
+                        inside_ai_tool,
+                    )
+                }
             }
         })();
 
@@ -1377,7 +1433,7 @@ fn validate_tool_args(tool: &LaunchTool, args: &[String]) -> Vec<String> {
             errs.extend(crate::tools::codex_args::validate_conflicts(&spec));
             errs
         }
-        LaunchTool::OpenCode => Vec::new(),
+        LaunchTool::OpenCode | LaunchTool::Antigravity => Vec::new(),
     }
 }
 
@@ -1413,6 +1469,14 @@ mod tests {
             LaunchTool::from_str("opencode", false).unwrap(),
             LaunchTool::OpenCode
         );
+        assert_eq!(
+            LaunchTool::from_str("antigravity", false).unwrap(),
+            LaunchTool::Antigravity
+        );
+        assert_eq!(
+            LaunchTool::from_str("agy", false).unwrap(),
+            LaunchTool::Antigravity
+        );
         assert!(LaunchTool::from_str("unknown", false).is_err());
     }
 
@@ -1421,6 +1485,7 @@ mod tests {
         assert_eq!(LaunchTool::Claude.as_str(), "claude");
         assert_eq!(LaunchTool::ClaudePty.as_str(), "claude-pty");
         assert_eq!(LaunchTool::Gemini.as_str(), "gemini");
+        assert_eq!(LaunchTool::Antigravity.as_str(), "antigravity");
     }
 
     #[test]
@@ -1428,6 +1493,7 @@ mod tests {
         assert_eq!(LaunchTool::Claude.base_tool(), "claude");
         assert_eq!(LaunchTool::ClaudePty.base_tool(), "claude");
         assert_eq!(LaunchTool::Codex.base_tool(), "codex");
+        assert_eq!(LaunchTool::Antigravity.base_tool(), "antigravity");
     }
 
     #[test]
@@ -1448,6 +1514,7 @@ mod tests {
             LaunchTool::Gemini,
             LaunchTool::Codex,
             LaunchTool::OpenCode,
+            LaunchTool::Antigravity,
         ] {
             let pty = tool.uses_pty();
             assert_eq!(
@@ -1480,7 +1547,7 @@ mod tests {
     #[test]
     fn test_launch_backend_resolve_other_tools_headless() {
         // gemini/codex/opencode + --headless → HeadlessPty (unchanged from today).
-        for tool in [LaunchTool::Gemini, LaunchTool::Codex, LaunchTool::OpenCode] {
+        for tool in [LaunchTool::Gemini, LaunchTool::Codex, LaunchTool::OpenCode, LaunchTool::Antigravity] {
             assert_eq!(
                 LaunchBackend::resolve(&tool, true, true),
                 LaunchBackend::HeadlessPty,
