@@ -495,7 +495,8 @@ pub fn create_runner_script(
         path_dirs.push(dir.to_string_lossy().into_owned());
     }
 
-    for bin_name in &[tool, "hcom", "python3", "node"] {
+    let tool_bin = if tool == "antigravity" { "agy" } else { tool };
+    for bin_name in &[tool_bin, "hcom", "python3", "node"] {
         if let Some(bin_path) = terminal::which_bin(bin_name)
             && let Some(dir) = Path::new(&bin_path).parent()
         {

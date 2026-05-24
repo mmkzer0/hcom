@@ -99,12 +99,13 @@ pub fn run_pty(args: &[String]) -> Result<()> {
     let instance_name = config::Config::get().instance_name;
 
     // Resolve tool to full path (PATH may be minimal in launched environments)
-    let resolved = terminal::which_bin(tool_str).unwrap_or_else(|| tool_str.to_string());
+    let tool_exe = if tool_str == "antigravity" { "agy" } else { tool_str };
+    let resolved = terminal::which_bin(tool_exe).unwrap_or_else(|| tool_exe.to_string());
 
     // On Termux, some wrapped tools need a launcher override instead of direct exec.
     let (command, extra_args): (String, Vec<String>);
     if let Some((launcher, prefix_args)) =
-        terminal::resolve_termux_tool_launcher(tool_str, &resolved)
+        terminal::resolve_termux_tool_launcher(tool_exe, &resolved)
     {
         command = launcher;
         extra_args = prefix_args;
