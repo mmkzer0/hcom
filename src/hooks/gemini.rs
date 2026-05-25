@@ -9,6 +9,7 @@ use std::time::Instant;
 
 use serde_json::Value;
 
+use crate::bootstrap;
 use crate::db::{HcomDb, InstanceRow};
 use crate::hooks::common;
 use crate::hooks::{HookPayload, HookResult};
@@ -289,8 +290,20 @@ fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) ->
     // Auto-spawn relay-worker now that an instance is active
     crate::relay::worker::ensure_worker(true);
 
-    // Bootstrap injection moved to BeforeAgent only
-    // Reason: Gemini doesn't display SessionStart hook output after /clear
+    // Gemini: SessionStart additionalContext is hidden after /clear — bootstrap stays in BeforeAgent.
+    // Antigravity: inject at session bind as fallback when launch-time GEMINI_SYSTEM_MD was missed.
+    if let Ok(Some(inst)) = db.get_instance_full(&instance_name)
+        && bootstrap::is_antigravity_tool(&inst.tool)
+        && let Some(bootstrap) =
+            common::inject_bootstrap_once(db, ctx, &instance_name, &inst, &inst.tool)
+    {
+        return HookResult::Allow {
+            additional_context: Some(bootstrap),
+            system_message: None,
+            delivery_ack: None,
+        };
+    }
+
     hook_noop()
 }
 
@@ -347,22 +360,38 @@ fn handle_beforeagent(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> 
     try_capture_transcript_path(db, instance_name, payload);
 
     let mut outputs: Vec<String> = Vec::new();
-
-    // Inject bootstrap if not already announced
-    if let Some(bootstrap) =
-        common::inject_bootstrap_once(db, ctx, instance_name, &instance, "gemini")
-    {
-        outputs.push(bootstrap);
-    }
-
-    // Deliver pending messages
     let mut delivery_ack = None;
-    if let Some(prepared) = common::prepare_pending_messages(db, instance_name) {
-        outputs.push(prepared.formatted);
-        delivery_ack = Some(prepared.ack);
+    let is_agy = bootstrap::is_antigravity_tool(&instance.tool);
+
+    if is_agy {
+        if let Some(prepared) = common::prepare_pending_messages(db, instance_name) {
+            outputs.push(bootstrap::ANTIGRAVITY_DELIVERY_ACTION.to_string());
+            outputs.push(prepared.formatted);
+            delivery_ack = Some(prepared.ack);
+        } else if instance.name_announced != 0 {
+            return HookResult::Allow {
+                additional_context: Some(bootstrap::ANTIGRAVITY_WAKE_NO_PENDING.to_string()),
+                system_message: None,
+                delivery_ack: None,
+            };
+        }
+        if let Some(bootstrap) =
+            common::inject_bootstrap_once(db, ctx, instance_name, &instance, &instance.tool)
+        {
+            outputs.push(bootstrap);
+        }
     } else {
-        // Real user prompt (not hcom injection)
-        lifecycle::set_status(db, instance_name, ST_ACTIVE, "prompt", Default::default());
+        if let Some(bootstrap) =
+            common::inject_bootstrap_once(db, ctx, instance_name, &instance, &instance.tool)
+        {
+            outputs.push(bootstrap);
+        }
+        if let Some(prepared) = common::prepare_pending_messages(db, instance_name) {
+            outputs.push(prepared.formatted);
+            delivery_ack = Some(prepared.ack);
+        } else {
+            lifecycle::set_status(db, instance_name, ST_ACTIVE, "prompt", Default::default());
+        }
     }
 
     if outputs.is_empty() {
@@ -433,19 +462,30 @@ fn handle_aftertool(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> Ho
 
     let instance_name = &instance.name;
     let mut outputs: Vec<String> = Vec::new();
-
-    // Inject bootstrap if not already announced
-    if let Some(bootstrap) =
-        common::inject_bootstrap_once(db, ctx, instance_name, &instance, "gemini")
-    {
-        outputs.push(bootstrap);
-    }
-
-    // Deliver pending messages (JSON format)
     let mut delivery_ack = None;
-    if let Some(prepared) = common::prepare_pending_messages(db, instance_name) {
-        outputs.push(prepared.formatted);
-        delivery_ack = Some(prepared.ack);
+    let is_agy = bootstrap::is_antigravity_tool(&instance.tool);
+
+    if is_agy {
+        if let Some(prepared) = common::prepare_pending_messages(db, instance_name) {
+            outputs.push(bootstrap::ANTIGRAVITY_DELIVERY_ACTION.to_string());
+            outputs.push(prepared.formatted);
+            delivery_ack = Some(prepared.ack);
+        }
+        if let Some(bootstrap) =
+            common::inject_bootstrap_once(db, ctx, instance_name, &instance, &instance.tool)
+        {
+            outputs.push(bootstrap);
+        }
+    } else {
+        if let Some(bootstrap) =
+            common::inject_bootstrap_once(db, ctx, instance_name, &instance, &instance.tool)
+        {
+            outputs.push(bootstrap);
+        }
+        if let Some(prepared) = common::prepare_pending_messages(db, instance_name) {
+            outputs.push(prepared.formatted);
+            delivery_ack = Some(prepared.ack);
+        }
     }
 
     if outputs.is_empty() {
@@ -480,34 +520,6 @@ fn handle_notification(db: &HcomDb, _ctx: &HcomContext, payload: &HookPayload) -
     hook_noop()
 }
 
-/// Antigravity Stop stdin uses `terminationReason`, not Gemini's `reason`.
-fn antigravity_sessionend_reason(raw: &Value) -> String {
-    raw.get("terminationReason")
-        .or_else(|| raw.get("reason"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_ascii_lowercase())
-        .unwrap_or_else(|| "closed".to_string())
-}
-
-/// True when agy Stop is turn-end only (session continues), not tab/process teardown.
-///
-/// Runtime evidence: `NO_TOOL_CALL` arrives with `fullyIdle: false` and still must not
-/// soft-stop (dove ping-pong 2026-05-25, debug log line `turn_idle_skip: false`).
-fn antigravity_stop_should_skip_soft_finalize(raw: &Value) -> bool {
-    if raw.get("fullyIdle").and_then(|v| v.as_bool()) == Some(true) {
-        return true;
-    }
-    let reason = raw
-        .get("terminationReason")
-        .or_else(|| raw.get("reason"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    matches!(
-        reason.to_ascii_uppercase().as_str(),
-        "NO_TOOL_CALL" | "NO_TOOL_CALLS"
-    )
-}
-
 /// Handle SessionEnd hook - fires when a session ends.
 fn handle_sessionend(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> HookResult {
     let instance = match resolve_instance_gemini(db, payload) {
@@ -517,7 +529,7 @@ fn handle_sessionend(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> H
 
     let is_agy = payload.tool == "antigravity" || instance.tool == "antigravity";
     let reason = if is_agy {
-        antigravity_sessionend_reason(&payload.raw)
+        crate::hooks::antigravity::sessionend_reason(&payload.raw)
     } else {
         payload
             .raw
@@ -526,7 +538,8 @@ fn handle_sessionend(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> H
             .unwrap_or("unknown")
             .to_string()
     };
-    let turn_idle_skip = is_agy && antigravity_stop_should_skip_soft_finalize(&payload.raw);
+    let turn_idle_skip =
+        is_agy && crate::hooks::antigravity::stop_should_skip_soft_finalize(&payload.raw);
 
     if turn_idle_skip {
         return hook_noop();
@@ -1780,32 +1793,6 @@ mod tests {
     fn test_get_handler_unknown() {
         assert!(get_handler("gemini-unknown").is_none());
         assert!(get_handler("sessionstart").is_none());
-    }
-
-    #[test]
-    fn test_antigravity_sessionend_reason_from_termination_reason() {
-        let raw = serde_json::json!({
-            "terminationReason": "USER_CANCEL",
-            "fullyIdle": true
-        });
-        assert_eq!(antigravity_sessionend_reason(&raw), "user_cancel");
-        assert!(antigravity_stop_should_skip_soft_finalize(&raw));
-    }
-
-    #[test]
-    fn test_antigravity_sessionend_reason_defaults_closed() {
-        let raw = serde_json::json!({ "fullyIdle": false });
-        assert_eq!(antigravity_sessionend_reason(&raw), "closed");
-        assert!(!antigravity_stop_should_skip_soft_finalize(&raw));
-    }
-
-    #[test]
-    fn test_antigravity_no_tool_call_skips_soft_finalize_when_not_fully_idle() {
-        let raw = serde_json::json!({
-            "terminationReason": "NO_TOOL_CALL",
-            "fullyIdle": false
-        });
-        assert!(antigravity_stop_should_skip_soft_finalize(&raw));
     }
 
     #[test]

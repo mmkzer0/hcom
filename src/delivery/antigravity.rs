@@ -1,8 +1,8 @@
-//! Antigravity (agy) delivery — minimal PTY wake; hook-primary message bodies.
+//! Antigravity (agy) delivery — preview PTY wake; hook-primary message bodies.
 //!
 //! Full payloads are delivered via `gemini-beforeagent` / `gemini-aftertool`
-//! (`additionalContext` + `commit_delivery_ack`). The PTY thread only injects
-//! `<hcom>` + Enter once per pending batch to start a turn when idle.
+//! (`additionalContext` + `commit_delivery_ack`). The PTY thread injects a
+//! `<hcom>…</hcom>` preview (envelope + sender + snippet) + Enter when idle.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,9 +17,6 @@ use super::{
     DeliveryState, IDLE_WAIT, ToolConfig, evaluate_gate, inject_enter, inject_text,
     refresh_binding, refresh_display_name, refresh_status,
 };
-
-/// Wake tag injected into the agy prompt (not the full message body).
-pub const WAKE_TAG: &str = "<hcom>";
 
 const WAKE_ENTER_DELAY: Duration = Duration::from_millis(200);
 
@@ -40,7 +37,7 @@ pub(crate) fn run_antigravity_delivery_loop(
         "native",
         "delivery.antigravity_mode",
         &format!(
-            "Antigravity mode for {}: minimal PTY wake, hooks deliver bodies",
+            "Antigravity mode for {}: preview PTY wake, hooks deliver bodies",
             current_name
         ),
     );
@@ -78,14 +75,22 @@ pub(crate) fn run_antigravity_delivery_loop(
             };
             let gate = evaluate_gate(config, state, is_idle);
             if gate.safe {
-                if inject_text(state.inject_port, WAKE_TAG) {
+                let cols = state.screen.read().map(|s| s.cols).unwrap_or(80) as usize;
+                let input_box_width = cols.saturating_sub(15).max(10);
+                let wake_text = super::build_wake_inject_text(db, current_name, input_box_width);
+                if inject_text(state.inject_port, &wake_text) {
                     std::thread::sleep(WAKE_ENTER_DELAY);
                     if inject_enter(state.inject_port) {
                         wake_sent_at_cursor = Some(cursor);
                         log_info(
                             "native",
                             "delivery.antigravity_wake",
-                            &format!("Wake inject for {} at cursor={}", current_name, cursor),
+                            &format!(
+                                "Wake inject for {} at cursor={} preview={}",
+                                current_name,
+                                cursor,
+                                super::truncate_chars(&wake_text, 48)
+                            ),
                         );
                     } else {
                         log_warn(
@@ -173,13 +178,3 @@ pub(crate) fn cleanup_antigravity_pty_exit(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn wake_tag_is_minimal() {
-        assert_eq!(WAKE_TAG, "<hcom>");
-        assert!(!WAKE_TAG.contains('\n'));
-    }
-}

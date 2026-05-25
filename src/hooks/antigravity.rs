@@ -67,6 +67,20 @@ pub fn get_antigravity_hooks_path() -> PathBuf {
     gemini_config_dir().join("config").join("hooks.json")
 }
 
+/// Shell wrapper for a single hcom hook subcommand (`gemini-beforeagent`, etc.).
+fn hook_sh_cmd(hcom_cmd: &str, subcmd: &str) -> String {
+    let bin = hcom_cmd.split_whitespace().next().unwrap_or("hcom");
+    format!("sh -c 'command -v {bin} >/dev/null 2>&1 && exec {hcom_cmd} {subcmd} || exit 0'")
+}
+
+/// PreInvocation sessionstart: once per agy process via lockfile; DB binding is authoritative.
+fn hook_sessionstart_cmd(hcom_cmd: &str) -> String {
+    let bin = hcom_cmd.split_whitespace().next().unwrap_or("hcom");
+    format!(
+        "sh -c 'if [ ! -f /tmp/agy-session-$PPID.lock ]; then touch /tmp/agy-session-$PPID.lock && command -v {bin} >/dev/null 2>&1 && exec {hcom_cmd} gemini-sessionstart || exit 0; fi'"
+    )
+}
+
 /// Try to set up Antigravity hooks in `hooks.json`.
 /// Reads existing hooks.json, merges "hcom-lifecycle" group, and preserves all other keys.
 pub fn try_setup_antigravity_hooks(_include_permissions: bool) -> Result<(), SetupError> {
@@ -84,21 +98,20 @@ pub fn try_setup_antigravity_hooks(_include_permissions: bool) -> Result<(), Set
     };
 
     let hcom_cmd = crate::runtime_env::build_hcom_command();
-    let bin = hcom_cmd.split_whitespace().next().unwrap_or("hcom");
 
     let hcom_lifecycle = json!({
         "PreInvocation": [
             {
                 "name": "hcom-sessionstart",
                 "type": "command",
-                "command": format!("sh -c 'if [ ! -f /tmp/agy-session-$PPID.lock ]; then touch /tmp/agy-session-$PPID.lock && command -v {bin} >/dev/null 2>&1 && exec {hcom_cmd} gemini-sessionstart || exit 0; fi'"),
+                "command": hook_sessionstart_cmd(&hcom_cmd),
                 "timeout": 5000,
                 "description": "Initialize hcom session"
             },
             {
                 "name": "hcom-beforeagent",
                 "type": "command",
-                "command": format!("sh -c 'command -v {bin} >/dev/null 2>&1 && exec {hcom_cmd} gemini-beforeagent || exit 0'"),
+                "command": hook_sh_cmd(&hcom_cmd, "gemini-beforeagent"),
                 "timeout": 5000,
                 "description": "Deliver pending messages"
             }
@@ -107,7 +120,7 @@ pub fn try_setup_antigravity_hooks(_include_permissions: bool) -> Result<(), Set
             {
                 "name": "hcom-afteragent",
                 "type": "command",
-                "command": format!("sh -c 'command -v {bin} >/dev/null 2>&1 && exec {hcom_cmd} gemini-afteragent || exit 0'"),
+                "command": hook_sh_cmd(&hcom_cmd, "gemini-afteragent"),
                 "timeout": 5000,
                 "description": "Signal ready for messages"
             }
@@ -116,14 +129,14 @@ pub fn try_setup_antigravity_hooks(_include_permissions: bool) -> Result<(), Set
             {
                 "name": "hcom-partner-teardown",
                 "type": "command",
-                "command": format!("sh -c 'command -v {bin} >/dev/null 2>&1 && exec {hcom_cmd} run partner-teardown || exit 0'"),
+                "command": hook_sh_cmd(&hcom_cmd, "run partner-teardown"),
                 "timeout": 5000,
                 "description": "Teardown partner session"
             },
             {
                 "name": "hcom-sessionend",
                 "type": "command",
-                "command": format!("sh -c 'command -v {bin} >/dev/null 2>&1 && exec {hcom_cmd} gemini-sessionend || exit 0'"),
+                "command": hook_sh_cmd(&hcom_cmd, "gemini-sessionend"),
                 "timeout": 5000,
                 "description": "Disconnect from hcom"
             },
@@ -142,7 +155,7 @@ pub fn try_setup_antigravity_hooks(_include_permissions: bool) -> Result<(), Set
                     {
                         "name": "hcom-beforetool",
                         "type": "command",
-                        "command": format!("sh -c 'command -v {bin} >/dev/null 2>&1 && exec {hcom_cmd} gemini-beforetool || exit 0'"),
+                        "command": hook_sh_cmd(&hcom_cmd, "gemini-beforetool"),
                         "timeout": 5000,
                         "description": "Track tool execution"
                     }
@@ -156,7 +169,7 @@ pub fn try_setup_antigravity_hooks(_include_permissions: bool) -> Result<(), Set
                     {
                         "name": "hcom-aftertool",
                         "type": "command",
-                        "command": format!("sh -c 'command -v {bin} >/dev/null 2>&1 && exec {hcom_cmd} gemini-aftertool || exit 0'"),
+                        "command": hook_sh_cmd(&hcom_cmd, "gemini-aftertool"),
                         "timeout": 5000,
                         "description": "Deliver messages after tools"
                     }
@@ -587,6 +600,31 @@ fn verify_hooks_at(path: &Path) -> Result<(), VerifyFailReason> {
     Ok(())
 }
 
+/// agy Stop payloads that end a turn but not the session (do not soft-stop).
+const AGY_TURN_END_REASONS: &[&str] = &["NO_TOOL_CALL", "NO_TOOL_CALLS"];
+
+/// Antigravity Stop stdin uses `terminationReason`, not Gemini's `reason`.
+pub(crate) fn sessionend_reason(raw: &Value) -> String {
+    raw.get("terminationReason")
+        .or_else(|| raw.get("reason"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_else(|| "closed".to_string())
+}
+
+/// True when agy Stop is turn-end only (session continues), not tab/process teardown.
+pub(crate) fn stop_should_skip_soft_finalize(raw: &Value) -> bool {
+    if raw.get("fullyIdle").and_then(|v| v.as_bool()) == Some(true) {
+        return true;
+    }
+    let reason = raw
+        .get("terminationReason")
+        .or_else(|| raw.get("reason"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    AGY_TURN_END_REASONS.contains(&reason.to_ascii_uppercase().as_str())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -718,5 +756,48 @@ mod tests {
         let (_dir, _test_home, _hooks_path, _guard) = antigravity_test_env();
         // File doesn't exist
         assert!(!verify_antigravity_hooks_installed(false));
+    }
+
+    #[test]
+    fn test_hook_sh_cmd_includes_subcmd_and_hcom() {
+        let cmd = hook_sh_cmd("hcom gemini-beforeagent", "gemini-beforeagent");
+        assert!(cmd.contains("gemini-beforeagent"));
+        assert!(cmd.contains("command -v hcom"));
+        assert!(cmd.contains("hcom gemini-beforeagent"));
+    }
+
+    #[test]
+    fn test_sessionend_reason_from_termination_reason() {
+        let raw = json!({
+            "terminationReason": "USER_CANCEL",
+            "fullyIdle": true
+        });
+        assert_eq!(sessionend_reason(&raw), "user_cancel");
+        assert!(stop_should_skip_soft_finalize(&raw));
+    }
+
+    #[test]
+    fn test_sessionend_reason_defaults_closed() {
+        let raw = json!({ "fullyIdle": false });
+        assert_eq!(sessionend_reason(&raw), "closed");
+        assert!(!stop_should_skip_soft_finalize(&raw));
+    }
+
+    #[test]
+    fn test_no_tool_call_skips_soft_finalize_when_not_fully_idle() {
+        let raw = json!({
+            "terminationReason": "NO_TOOL_CALL",
+            "fullyIdle": false
+        });
+        assert!(stop_should_skip_soft_finalize(&raw));
+    }
+
+    #[test]
+    fn test_real_teardown_does_not_skip_on_unknown_reason() {
+        let raw = json!({
+            "terminationReason": "USER_CLOSED",
+            "fullyIdle": false
+        });
+        assert!(!stop_should_skip_soft_finalize(&raw));
     }
 }

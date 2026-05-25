@@ -1312,13 +1312,29 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                     )
                 }
                 LaunchTool::Antigravity => {
+                    // Bake bootstrap into agy system prompt (like Codex developer_instructions).
+                    let bootstrap = crate::bootstrap::get_bootstrap(
+                        db,
+                        &paths::hcom_dir(),
+                        &instance_name,
+                        "antigravity",
+                        params.background,
+                        true,
+                        "",
+                        &effective_tag,
+                        hcom_config.relay_enabled,
+                        None,
+                    );
+                    let bootstrap_path = write_system_prompt_file(&bootstrap, "gemini");
+                    instance_env.insert("GEMINI_SYSTEM_MD".to_string(), bootstrap_path);
+
                     instances::update_instance_position(
                         db,
                         &instance_name,
-                        &serde_json::Map::from_iter([(
-                            "launch_args".to_string(),
-                            json!(params.args),
-                        )]),
+                        &serde_json::Map::from_iter([
+                            ("launch_args".to_string(), json!(params.args)),
+                            ("name_announced".to_string(), json!(true)),
+                        ]),
                     );
                     launch_pty_or_background(
                         &mut BackgroundLaunchCtx {

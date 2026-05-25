@@ -134,38 +134,29 @@ pub(crate) fn gate_block_detail(reason: &str) -> &'static str {
     }
 }
 
-/// Build message preview with DB access for Gemini/OpenCode bootstrap injection.
+/// Build PTY inject text: `<hcom>…</hcom>` with envelope, routing, and a short body snippet.
 ///
-/// Format: `<hcom>sender → recipient (+N)</hcom>`
-///
-/// ## Why different tools need different injection strategies:
-///
-/// - **Claude**: Injects minimal `<hcom>` trigger only. The Claude hook shows the full
-///   message to human via system message in TUI + separate text for agent. Minimal
-///   trigger is sufficient since hook handles both human and agent presentation.
-///
-/// - **Codex**: Similar to Claude except the agent message is shown to humans as well.
-///   So theres no seperate system message, the hook shows the full message in TUI.
-///   Minimal <hcom> trigger because the hook shows the full message in TUI already.
-///
-/// - **Gemini**: Injects message preview for human visibility. The Gemini hook only
-///   shows JSON to agent (no human-visible system message like Claude). Preview in
-///   terminal gives human context since hook output is agent-only. BeforeAgent hook
-///   still delivers full message to agent via additionalContext.
-///
-/// - **OpenCode**: Similar to Gemini.
-///   The OpenCode plugin just shows this one line and not the full message in TUI.
-///   So preview gives more context than a minimal <hcom> trigger.
-fn build_message_preview_with_db(db: &HcomDb, name: &str) -> String {
-    let messages = db.get_unread_messages(name);
+/// Hook-primary tools (Gemini, Antigravity) still deliver the full JSON body via
+/// `additionalContext`; this line is what the agent and human see in the prompt.
+/// Uses ` | ` before the snippet (not `: `) so `build_message_preview` truncation
+/// does not strip the message body.
+pub(crate) fn build_wake_inject_text(db: &HcomDb, recipient: &str, max_len: usize) -> String {
+    let messages = db.get_unread_messages(recipient);
     if messages.is_empty() {
-        return "<hcom></hcom>".to_string();
+        return crate::messages::build_message_preview("", max_len);
     }
 
-    // Build preview from first message:
-    // [intent:thread #id] sender → recipient
-    let msg = &messages[0];
+    let recipient_display = full_display_name(db, recipient);
+    let first_line = format_wake_message_line(db, &messages[0], &recipient_display);
+    let inner = if messages.len() == 1 {
+        first_line
+    } else {
+        format!("[{} new messages] | {}", messages.len(), first_line)
+    };
+    crate::messages::build_message_preview(&inner, max_len)
+}
 
+fn wake_message_prefix(msg: &crate::db::Message) -> String {
     let prefix = match (&msg.intent, &msg.thread) {
         (Some(i), Some(t)) => format!("{}:{}", i, t),
         (Some(i), None) => i.clone(),
@@ -176,25 +167,32 @@ fn build_message_preview_with_db(db: &HcomDb, name: &str) -> String {
         .event_id
         .map(|id| format!(" #{}", id))
         .unwrap_or_default();
-    let envelope = format!("[{}{}]", prefix, id_ref);
+    format!("[{}{}]", prefix, id_ref)
+}
 
+fn wake_message_snippet(text: &str, max_chars: usize) -> String {
+    let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    truncate_chars(&one_line, max_chars)
+}
+
+fn format_wake_message_line(
+    db: &HcomDb,
+    msg: &crate::db::Message,
+    recipient_display: &str,
+) -> String {
+    let envelope = wake_message_prefix(msg);
     let sender_display = full_display_name(db, &msg.from);
-    let recipient_display = full_display_name(db, name);
-
-    let preview = if messages.len() == 1 {
-        format!("{} {} → {}", envelope, sender_display, recipient_display)
+    let snippet = wake_message_snippet(&msg.text, 72);
+    if snippet.is_empty() {
+        format!("{envelope} {sender_display} → {recipient_display}")
     } else {
-        format!(
-            "{} {} → {} (+{})",
-            envelope,
-            sender_display,
-            recipient_display,
-            messages.len() - 1
-        )
-    };
+        format!("{envelope} {sender_display} → {recipient_display} | {snippet}")
+    }
+}
 
-    // Reuse messages.rs truncation + wrapping (max 60 chars)
-    crate::messages::build_message_preview(&preview, 60)
+/// Legacy helper — Gemini/OpenCode bootstrap path (60-char default).
+fn build_message_preview_with_db(db: &HcomDb, name: &str) -> String {
+    build_wake_inject_text(db, name, crate::messages::PREVIEW_MAX_LEN)
 }
 
 /// Tool-specific configuration for delivery gate.
@@ -318,7 +316,7 @@ impl ToolConfig {
 
     /// Get config for Antigravity.
     ///
-    /// Antigravity TUI: hook-primary delivery; PTY only sends a minimal wake tag.
+    /// Antigravity TUI: hook-primary delivery; PTY injects preview `<hcom>…</hcom>` wake line.
     pub fn antigravity() -> Self {
         Self {
             tool: "antigravity".to_string(),
@@ -873,20 +871,11 @@ pub fn run_delivery_loop(
                         use std::str::FromStr;
 
                         let parsed_tool = Tool::from_str(&config.tool).ok();
-                        let text = match parsed_tool {
-                            Some(Tool::Claude) | Some(Tool::Codex) => "<hcom>".to_string(),
-                            _ => {
-                                // Gemini/OpenCode: build preview from DB
-                                build_message_preview_with_db(db, &current_name)
-                            }
-                        };
-                        // Contract to minimal <hcom> if preview won't fit in input box
                         let cols = state.screen.read().map(|s| s.cols).unwrap_or(80);
                         let input_box_width = (cols as usize).saturating_sub(15).max(10);
-                        let text = if text.len() > input_box_width {
-                            "<hcom>".to_string()
-                        } else {
-                            text
+                        let text = match parsed_tool {
+                            Some(Tool::Claude) | Some(Tool::Codex) => "<hcom>".to_string(),
+                            _ => build_wake_inject_text(db, &current_name, input_box_width),
                         };
 
                         if inject_text(state.inject_port, &text) {
@@ -1643,5 +1632,40 @@ mod tests {
         assert!(claude.require_idle);
         assert!(gemini.require_idle);
         assert!(codex.require_idle);
+    }
+
+    #[test]
+    fn wake_inject_includes_sender_and_body_snippet() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("hcom.db");
+        let db = HcomDb::open_at(&db_path).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, status_context, created_at, last_event_id)
+                 VALUES ('keno', 'listening', '', 1.0, 0)",
+                [],
+            )
+            .unwrap();
+        let data = serde_json::json!({
+            "from": "life",
+            "text": "ping. Always reply to @life, not @bigboss.",
+            "scope": "mentions",
+            "mentions": ["keno"],
+            "intent": "request",
+            "thread": "hcom-ping-test",
+        });
+        db.conn()
+            .execute(
+                "INSERT INTO events (type, timestamp, instance, data)
+                 VALUES ('message', '2026-05-25T12:00:00Z', 'keno', ?1)",
+                rusqlite::params![data.to_string()],
+            )
+            .unwrap();
+
+        let text = build_wake_inject_text(&db, "keno", 120);
+        assert!(text.starts_with("<hcom>"), "text={text}");
+        assert!(text.contains("life"), "text={text}");
+        assert!(text.contains("ping"), "text={text}");
+        assert!(text.contains("request"), "text={text}");
     }
 }

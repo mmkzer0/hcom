@@ -178,6 +178,75 @@ pub(crate) fn build_and_insert_sql_subscription(
     })
 }
 
+/// After agy reports `listening`, wait before "idle without reply" (seconds).
+///
+/// Per idle spell only — reset when the target goes `active`/`blocked` again (tool/deliver).
+/// A few seconds is enough for `hcom send` after turn-end; stopped still fires immediately.
+pub(crate) const AGY_REQWATCH_IDLE_GRACE_SEC: f64 = 10.0;
+
+fn instance_tool(db: &HcomDb, name: &str) -> String {
+    db.conn()
+        .query_row(
+            "SELECT COALESCE(tool, '') FROM instances WHERE name = ?",
+            params![name],
+            |row| row.get(0),
+        )
+        .unwrap_or_default()
+}
+
+fn reqwatch_reply_exists(
+    db: &HcomDb,
+    request_id: i64,
+    target: &str,
+    sub_caller: &str,
+) -> bool {
+    if sub_caller.is_empty() {
+        return false;
+    }
+    db.conn()
+        .query_row(
+            "SELECT 1 FROM events_v WHERE id > ? AND type = 'message' \
+             AND msg_from = ? AND (\
+               (msg_scope = 'mentions' AND msg_delivered_to LIKE '%' || ? || '%') \
+               OR json_extract(data, '$.reply_to_local') = ? \
+             )",
+            params![request_id, target, sub_caller, request_id],
+            |_| Ok(true),
+        )
+        .unwrap_or(false)
+}
+
+fn kv_store_sub(db: &HcomDb, key: &str, sub: &serde_json::Value) {
+    match serde_json::to_string(sub) {
+        Ok(json) => {
+            if let Err(e) = db.kv_set(key, Some(&json)) {
+                crate::log::log_error("db", "reqwatch.kv_set", &format!("{e}"));
+            }
+        }
+        Err(e) => crate::log::log_error("db", "reqwatch.serialize", &format!("{e}")),
+    }
+}
+
+/// Clear agy grace timers when the target is working again (deliver/tool/active).
+fn clear_agy_reqwatch_idle_grace(db: &HcomDb, target: &str) {
+    for (key, sub, filters) in load_reqwatch_subs(db) {
+        if filters.get("target_tool").and_then(|v| v.as_str()) != Some("antigravity") {
+            continue;
+        }
+        if filters.get("target").and_then(|v| v.as_str()) != Some(target) {
+            continue;
+        }
+        if sub.get("idle_grace_until").is_none() {
+            continue;
+        }
+        let mut sub_mut = sub.clone();
+        if let Some(obj) = sub_mut.as_object_mut() {
+            obj.remove("idle_grace_until");
+            kv_store_sub(db, &key, &sub_mut);
+        }
+    }
+}
+
 /// Create request-watch subscriptions for each recipient.
 pub(crate) fn create_request_watches(
     db: &HcomDb,
@@ -191,6 +260,7 @@ pub(crate) fn create_request_watches(
     for recipient in recipients {
         let sub_id = format!("reqwatch-{request_event_id}-{recipient}");
         let sub_key = format!("events_sub:{sub_id}");
+        let target_tool = instance_tool(db, recipient);
 
         let sql = "(type='status' AND instance=? AND status_val='listening') OR (type='life' AND instance=? AND life_action='stopped')";
 
@@ -203,13 +273,14 @@ pub(crate) fn create_request_watches(
                 "request_watch": true,
                 "request_id": request_event_id,
                 "target": recipient,
+                "target_tool": target_tool,
             },
             "once": true,
             "last_id": last_id,
             "created": now,
         });
 
-        let _ = db.kv_set(&sub_key, Some(&sub_data.to_string()));
+        kv_store_sub(db, &sub_key, &sub_data);
     }
 }
 
@@ -376,6 +447,14 @@ pub(crate) fn process_logged_event(
         }
     }
 
+    // agy: turn-end `listening` is normal; reset reqwatch grace when target is active again.
+    if event_type == "status" {
+        let status = data.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        if status == "active" || status == "blocked" {
+            clear_agy_reqwatch_idle_grace(db, instance);
+        }
+    }
+
     let rows: Vec<(String, String)> = match db.conn.prepare_cached(
         "SELECT key, value FROM kv
          WHERE key LIKE 'events_sub:%'
@@ -474,48 +553,50 @@ pub(crate) fn process_logged_event(
                 if waterline < request_id {
                     let mut sub_mut = sub.clone();
                     sub_mut["last_id"] = serde_json::json!(event_id);
-                    match serde_json::to_string(&sub_mut) {
-                        Ok(json) => {
-                            if let Err(e) = db.kv_set(key, Some(&json)) {
-                                crate::log::log_error(
-                                    "db",
-                                    "check_event_subscriptions.kv_set",
-                                    &format!("{e}"),
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            crate::log::log_error(
-                                "db",
-                                "check_event_subscriptions.serialize",
-                                &format!("{e}"),
-                            );
-                        }
+                    kv_store_sub(db, key, &sub_mut);
+                    continue;
+                }
+
+                if reqwatch_reply_exists(db, request_id, target, sub_caller) {
+                    if let Err(e) = db.kv_set(key, None) {
+                        crate::log::log_error(
+                            "db",
+                            "check_event_subscriptions.kv_set_cleanup",
+                            &format!("{e}"),
+                        );
                     }
                     continue;
                 }
 
-                if !sub_caller.is_empty() {
-                    let already_replied: bool = db
-                        .conn
-                        .query_row(
-                            "SELECT 1 FROM events_v WHERE id > ? AND type = 'message' \
-                             AND msg_from = ? AND (\
-                               (msg_scope = 'mentions' AND msg_delivered_to LIKE '%' || ? || '%') \
-                               OR json_extract(data, '$.reply_to_local') = ? \
-                             )",
-                            params![request_id, target, sub_caller, request_id],
-                            |_| Ok(true),
-                        )
-                        .unwrap_or(false);
-                    if already_replied {
-                        if let Err(e) = db.kv_set(key, None) {
-                            crate::log::log_error(
-                                "db",
-                                "check_event_subscriptions.kv_set_cleanup",
-                                &format!("{e}"),
-                            );
+                let target_tool = sub_filters
+                    .get("target_tool")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if target_tool == "antigravity" {
+                    let is_listening = event_type == "status"
+                        && data.get("status").and_then(|v| v.as_str()) == Some("listening");
+                    let is_stopped = event_type == "life"
+                        && data.get("action").and_then(|v| v.as_str()) == Some("stopped");
+
+                    if is_listening {
+                        let now = crate::shared::time::now_epoch_f64();
+                        let grace_until = sub.get("idle_grace_until").and_then(|v| v.as_f64());
+                        let defer = match grace_until {
+                            None => true,
+                            Some(until) if now < until => true,
+                            Some(_) => false,
+                        };
+                        if defer {
+                            let mut sub_mut = sub.clone();
+                            sub_mut["last_id"] = serde_json::json!(event_id);
+                            if grace_until.is_none() {
+                                sub_mut["idle_grace_until"] =
+                                    serde_json::json!(now + AGY_REQWATCH_IDLE_GRACE_SEC);
+                            }
+                            kv_store_sub(db, key, &sub_mut);
+                            continue;
                         }
+                    } else if !is_stopped {
                         continue;
                     }
                 }
@@ -978,6 +1059,176 @@ mod tests {
 
     fn cleanup_test_db(path: PathBuf) {
         let _ = std::fs::remove_file(path);
+    }
+
+    fn count_reqwatch_without_reply_notifications(db: &HcomDb, requester: &str) -> i64 {
+        let pattern = format!("%@{requester} %");
+        db.conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'message'
+                 AND json_extract(data, '$.text') LIKE '%without responding to your request%'
+                 AND json_extract(data, '$.text') LIKE ?1",
+                params![pattern],
+                |row| row.get(0),
+            )
+            .unwrap_or(0)
+    }
+
+    fn setup_reqwatch_pair(
+        db: &HcomDb,
+        requester: &str,
+        responder: &str,
+        responder_tool: &str,
+    ) -> i64 {
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, last_event_id, created_at)
+                 VALUES (?1, 'claude', 0, 1000.0), (?2, ?3, 0, 1000.0)",
+                params![requester, responder, responder_tool],
+            )
+            .unwrap();
+        let req_data = serde_json::json!({
+            "from": requester,
+            "sender_kind": "instance",
+            "scope": "mentions",
+            "text": "ping",
+            "delivered_to": [responder],
+            "intent": "request",
+            "mentions": [responder],
+        });
+        let request_id = db.log_event("message", requester, &req_data).unwrap();
+        create_request_watches(db, requester, request_id, &[responder.to_string()]);
+        db.conn()
+            .execute(
+                "UPDATE instances SET last_event_id = ?1 WHERE name = ?2",
+                params![request_id, responder],
+            )
+            .unwrap();
+        request_id
+    }
+
+    #[test]
+    fn test_create_request_watches_records_antigravity_target_tool() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, created_at) VALUES ('gora', 'claude', 1000.0), ('nabe', 'antigravity', 1000.0)",
+                [],
+            )
+            .unwrap();
+        create_request_watches(&db, "gora", 42, &[String::from("nabe")]);
+        let sub_raw = db
+            .kv_get("events_sub:reqwatch-42-nabe")
+            .unwrap()
+            .expect("reqwatch row");
+        let sub: serde_json::Value = serde_json::from_str(&sub_raw).unwrap();
+        assert_eq!(
+            sub["filters"]["target_tool"].as_str(),
+            Some("antigravity")
+        );
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_agy_reqwatch_listening_defers_idle_notification() {
+        let (db, db_path) = setup_full_test_db();
+        let request_id = setup_reqwatch_pair(&db, "gora", "nabe", "antigravity");
+        let before = count_reqwatch_without_reply_notifications(&db, "gora");
+
+        let data = serde_json::json!({"status": "listening", "context": ""});
+        db.log_event("status", "nabe", &data).unwrap();
+
+        assert_eq!(
+            count_reqwatch_without_reply_notifications(&db, "gora"),
+            before,
+            "agy listening should defer reqwatch notification"
+        );
+        let sub_raw = db
+            .kv_get(&format!("events_sub:reqwatch-{request_id}-nabe"))
+            .unwrap()
+            .unwrap();
+        let sub: serde_json::Value = serde_json::from_str(&sub_raw).unwrap();
+        assert!(
+            sub.get("idle_grace_until").and_then(|v| v.as_f64()).is_some(),
+            "grace should be armed: {sub}"
+        );
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_agy_reqwatch_stopped_notifies_immediately() {
+        let (db, db_path) = setup_full_test_db();
+        let request_id = setup_reqwatch_pair(&db, "gora", "nabe", "antigravity");
+        let before = count_reqwatch_without_reply_notifications(&db, "gora");
+
+        let data = serde_json::json!({"action": "stopped", "by": "pty"});
+        db.log_event("life", "nabe", &data).unwrap();
+
+        assert_eq!(
+            count_reqwatch_without_reply_notifications(&db, "gora"),
+            before + 1,
+            "agy stopped should notify without waiting for grace"
+        );
+        assert!(
+            db.kv_get(&format!("events_sub:reqwatch-{request_id}-nabe"))
+                .unwrap()
+                .is_none(),
+            "once sub should be removed after notify"
+        );
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_gemini_reqwatch_listening_notifies_without_grace() {
+        let (db, db_path) = setup_full_test_db();
+        setup_reqwatch_pair(&db, "gora", "nova", "gemini");
+        let before = count_reqwatch_without_reply_notifications(&db, "gora");
+
+        let data = serde_json::json!({"status": "listening", "context": ""});
+        db.log_event("status", "nova", &data).unwrap();
+
+        assert_eq!(
+            count_reqwatch_without_reply_notifications(&db, "gora"),
+            before + 1,
+            "non-agy listening should notify immediately"
+        );
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_agy_reqwatch_active_clears_idle_grace() {
+        let (db, db_path) = setup_full_test_db();
+        let request_id = setup_reqwatch_pair(&db, "gora", "nabe", "antigravity");
+        let sub_key = format!("events_sub:reqwatch-{request_id}-nabe");
+
+        db.log_event(
+            "status",
+            "nabe",
+            &serde_json::json!({"status": "listening", "context": ""}),
+        )
+        .unwrap();
+        assert!(
+            db.kv_get(&sub_key)
+                .unwrap()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .and_then(|v| v.get("idle_grace_until").cloned())
+                .is_some()
+        );
+
+        db.log_event(
+            "status",
+            "nabe",
+            &serde_json::json!({"status": "active", "context": "tool:run_command"}),
+        )
+        .unwrap();
+
+        let sub: serde_json::Value =
+            serde_json::from_str(&db.kv_get(&sub_key).unwrap().unwrap()).unwrap();
+        assert!(
+            sub.get("idle_grace_until").is_none(),
+            "active should clear agy grace: {sub}"
+        );
+        cleanup_test_db(db_path);
     }
 
     #[test]

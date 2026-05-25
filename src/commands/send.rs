@@ -1488,6 +1488,37 @@ mod tests {
     }
 
     #[test]
+    fn send_mention_excludes_exit_no_tool_call_inactive() {
+        let (db, path) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, status_context, created_at)
+                 VALUES ('luna', 'listening', '', 1000.0),
+                        ('dove', 'inactive', 'exit:no_tool_call', 1000.0)",
+                [],
+            )
+            .unwrap();
+
+        let sender = SenderIdentity {
+            kind: SenderKind::Instance,
+            name: "luna".into(),
+            instance_data: None,
+            session_id: None,
+        };
+
+        let err =
+            send_message(&db, &sender, "ping", None, Some(&["dove".to_string()])).unwrap_err();
+        assert!(err.contains("@dove"), "err={err}");
+        let available_line = err.lines().find(|l| l.contains("Available:")).unwrap_or("");
+        assert!(
+            !available_line.contains("dove"),
+            "soft-stopped agent must not appear in Available: {err}"
+        );
+
+        cleanup_test_db(path);
+    }
+
+    #[test]
     fn process_compat_at_with_space() {
         // "@luna hi" → full text as message, no targets
         let (targets, msg) = process_positionals(&["@luna hi".to_string()]);
