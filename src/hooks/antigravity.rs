@@ -33,6 +33,20 @@ pub enum VerifyFailReason {
 
 #[derive(Debug, thiserror::Error)]
 pub enum SetupError {
+    #[error("existing hooks.json at {} could not be read: {source}", path.display())]
+    ExistingReadFailed {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("existing hooks.json at {} is not valid JSON: {source}", path.display())]
+    ExistingParseFailed {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("existing hooks.json at {} must be a JSON object", path.display())]
+    ExistingRootNotObject { path: PathBuf },
     #[error("JSON serialization failed: {0}")]
     SerializationFailed(#[from] serde_json::Error),
     #[error("atomic write to {} failed: {source}", path.display())]
@@ -60,7 +74,9 @@ pub fn get_antigravity_hooks_path() -> PathBuf {
 /// Shell wrapper for a single hcom hook subcommand (`gemini-beforeagent`, etc.).
 fn hook_sh_cmd(hcom_cmd: &str, subcmd: &str) -> String {
     let bin = hcom_cmd.split_whitespace().next().unwrap_or("hcom");
-    format!("sh -c 'command -v {bin} >/dev/null 2>&1 && exec {hcom_cmd} {subcmd} || exit 0'")
+    format!(
+        "sh -c 'command -v {bin} >/dev/null 2>&1 && ANTIGRAVITY_AGENT=1 exec {hcom_cmd} {subcmd} || exit 0'"
+    )
 }
 
 /// Substring present in sessionstart + Stop lockfile shell (verify tests).
@@ -70,14 +86,14 @@ pub(crate) const AGY_SESSION_LOCK_MARK: &str = "agy-session-";
 fn hook_sessionstart_cmd(hcom_cmd: &str) -> String {
     let bin = hcom_cmd.split_whitespace().next().unwrap_or("hcom");
     format!(
-        "sh -c 'parent_pid=$(ps -o ppid= -p $$ 2>/dev/null | tr -d \"[:space:]\"); lock=/tmp/{}${{parent_pid}}.lock; if [ -n \"$parent_pid\" ] && [ ! -f \"$lock\" ]; then touch \"$lock\" && command -v {bin} >/dev/null 2>&1 && exec {hcom_cmd} gemini-sessionstart || exit 0; fi'",
+        "sh -c 'parent_pid=$(ps -o ppid= -p $$ 2>/dev/null | tr -d \"[:space:]\"); lock=/tmp/{}${{parent_pid}}.lock; if [ -n \"$parent_pid\" ] && mkdir \"$lock\" 2>/dev/null; then command -v {bin} >/dev/null 2>&1 && ANTIGRAVITY_AGENT=1 exec {hcom_cmd} gemini-sessionstart || {{ rmdir \"$lock\" 2>/dev/null; exit 0; }}; fi'",
         AGY_SESSION_LOCK_MARK
     )
 }
 
 fn hook_lockfile_cleanup_cmd() -> String {
     format!(
-        "sh -c 'parent_pid=$(ps -o ppid= -p $$ 2>/dev/null | tr -d \"[:space:]\"); lock=/tmp/{}${{parent_pid}}.lock; [ -n \"$parent_pid\" ] && rm -f \"$lock\" || true'",
+        "sh -c 'parent_pid=$(ps -o ppid= -p $$ 2>/dev/null | tr -d \"[:space:]\"); lock=/tmp/{}${{parent_pid}}.lock; [ -n \"$parent_pid\" ] && {{ rmdir \"$lock\" 2>/dev/null || rm -f \"$lock\" 2>/dev/null || true; }} || true'",
         AGY_SESSION_LOCK_MARK
     )
 }
@@ -92,8 +108,23 @@ pub fn try_setup_antigravity_hooks(_include_permissions: bool) -> Result<(), Set
 
     // Load existing hooks or initialize an empty map
     let mut hooks_root = if hooks_path.exists() {
-        let content = std::fs::read_to_string(&hooks_path).unwrap_or_default();
-        serde_json::from_str::<serde_json::Map<String, Value>>(&content).unwrap_or_default()
+        let content = std::fs::read_to_string(&hooks_path).map_err(|source| {
+            SetupError::ExistingReadFailed {
+                path: hooks_path.clone(),
+                source,
+            }
+        })?;
+        let value: Value =
+            serde_json::from_str(&content).map_err(|source| SetupError::ExistingParseFailed {
+                path: hooks_path.clone(),
+                source,
+            })?;
+        value
+            .as_object()
+            .cloned()
+            .ok_or_else(|| SetupError::ExistingRootNotObject {
+                path: hooks_path.clone(),
+            })?
     } else {
         serde_json::Map::new()
     };
@@ -213,19 +244,21 @@ pub fn remove_antigravity_hooks() -> bool {
     }
     let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
-        Err(_) => return true,
+        Err(_) => return false,
     };
     let mut val: Value = match serde_json::from_str(&content) {
         Ok(v) => v,
-        Err(_) => return true,
+        Err(_) => return false,
     };
     let obj = match val.as_object_mut() {
         Some(o) => o,
-        None => return true,
+        None => return false,
     };
     obj.remove("hcom-lifecycle");
     if obj.is_empty() {
-        let _ = std::fs::remove_file(&path);
+        if std::fs::remove_file(&path).is_err() {
+            return false;
+        }
     } else {
         let json_str = match serde_json::to_string_pretty(&Value::Object(obj.clone())) {
             Ok(s) => s,
@@ -765,7 +798,57 @@ mod tests {
         let cmd = hook_sh_cmd("hcom gemini-beforeagent", "gemini-beforeagent");
         assert!(cmd.contains("gemini-beforeagent"));
         assert!(cmd.contains("command -v hcom"));
+        assert!(cmd.contains("ANTIGRAVITY_AGENT=1"));
         assert!(cmd.contains("hcom gemini-beforeagent"));
+    }
+
+    #[test]
+    fn test_sessionstart_uses_atomic_lock_and_env() {
+        let cmd = hook_sessionstart_cmd("hcom");
+        assert!(cmd.contains("mkdir \"$lock\""));
+        assert!(cmd.contains("ANTIGRAVITY_AGENT=1"));
+        assert!(!cmd.contains("[ ! -f \"$lock\" ]"));
+        assert!(!cmd.contains("touch \"$lock\""));
+    }
+
+    #[test]
+    fn test_lockfile_cleanup_removes_directory_lock_shape() {
+        let cmd = hook_lockfile_cleanup_cmd();
+        assert!(cmd.contains("rmdir \"$lock\""));
+        assert!(cmd.contains("rm -f \"$lock\""));
+        assert!(cmd.find("rmdir \"$lock\"").unwrap() < cmd.find("rm -f \"$lock\"").unwrap());
+    }
+
+    #[test]
+    #[serial]
+    fn test_setup_rejects_invalid_existing_hooks_json() {
+        let (_dir, _test_home, hooks_path, _guard) = antigravity_test_env();
+        std::fs::create_dir_all(hooks_path.parent().unwrap()).unwrap();
+        std::fs::write(&hooks_path, "{not json").unwrap();
+
+        let err = try_setup_antigravity_hooks(false).unwrap_err();
+        assert!(matches!(err, SetupError::ExistingParseFailed { .. }));
+    }
+
+    #[test]
+    #[serial]
+    fn test_setup_rejects_non_object_existing_hooks_json() {
+        let (_dir, _test_home, hooks_path, _guard) = antigravity_test_env();
+        std::fs::create_dir_all(hooks_path.parent().unwrap()).unwrap();
+        std::fs::write(&hooks_path, "[]").unwrap();
+
+        let err = try_setup_antigravity_hooks(false).unwrap_err();
+        assert!(matches!(err, SetupError::ExistingRootNotObject { .. }));
+    }
+
+    #[test]
+    #[serial]
+    fn test_remove_reports_invalid_existing_hooks_json() {
+        let (_dir, _test_home, hooks_path, _guard) = antigravity_test_env();
+        std::fs::create_dir_all(hooks_path.parent().unwrap()).unwrap();
+        std::fs::write(&hooks_path, "{not json").unwrap();
+
+        assert!(!remove_antigravity_hooks());
     }
 
     #[test]

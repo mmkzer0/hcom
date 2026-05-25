@@ -10,6 +10,30 @@ use super::shared::{
     has_user_text, is_error_result, normalize_tool_name, read_file_lossy, truncate_str,
 };
 
+fn extract_antigravity_entry_text(entry: &Value) -> String {
+    for key in [
+        "content",
+        "text",
+        "message",
+        "response",
+        "plannerResponse",
+        "userInput",
+        "input",
+    ] {
+        let text = extract_content_text(entry.get(key));
+        if !text.trim().is_empty() && !text.trim_start().starts_with('{') {
+            return text.trim().to_string();
+        }
+        if let Some(value) = entry.get(key) {
+            let nested = extract_text_content(value);
+            if !nested.trim().is_empty() {
+                return nested.trim().to_string();
+            }
+        }
+    }
+    String::new()
+}
+
 /// Parse Claude JSONL transcript.
 pub(crate) fn parse_claude_jsonl(
     path: &Path,
@@ -129,6 +153,50 @@ pub(crate) fn parse_claude_jsonl(
 
     for pe in &entries {
         match pe.entry_type.as_str() {
+            "USER_INPUT" => {
+                let user_text = extract_antigravity_entry_text(&pe.data);
+                if user_text.is_empty() {
+                    continue;
+                }
+
+                if !current_user.is_empty() || !current_action.is_empty() {
+                    position += 1;
+                    exchanges.push(Exchange {
+                        position,
+                        user: current_user.clone(),
+                        action: finalize_action_text(
+                            &current_action,
+                            &current_tools,
+                            &current_errors,
+                            current_last_was_error,
+                        ),
+                        files: dedup_sorted_capped(&current_files, 5),
+                        timestamp: current_ts.clone(),
+                        tools: std::mem::take(&mut current_tools),
+                        edits: std::mem::take(&mut current_edits),
+                        errors: std::mem::take(&mut current_errors),
+                        ended_on_error: current_last_was_error,
+                    });
+                }
+
+                current_user = user_text;
+                current_action = String::new();
+                current_tools = Vec::new();
+                current_files = Vec::new();
+                current_edits = Vec::new();
+                current_errors = Vec::new();
+                current_last_was_error = false;
+                current_ts = pe.ts.clone();
+            }
+            "PLANNER_RESPONSE" => {
+                let text = extract_antigravity_entry_text(&pe.data);
+                if !text.is_empty() {
+                    if !current_action.is_empty() {
+                        current_action.push('\n');
+                    }
+                    current_action.push_str(&text);
+                }
+            }
             "user" => {
                 // Check if this user entry has actual user text (not just tool_result blocks)
                 let has_text = has_user_text(&pe.data.get("message").cloned().unwrap_or(json!({})));

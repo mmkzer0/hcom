@@ -173,14 +173,19 @@ fn resolve_instance_gemini(db: &HcomDb, payload: &HookPayload) -> Option<Instanc
 
 /// Bind vanilla Gemini instance by parsing tool_result for [hcom:X] marker.
 fn bind_vanilla_instance(db: &HcomDb, payload: &HookPayload) -> Option<String> {
+    if payload.tool == "antigravity" {
+        return None;
+    }
+
     // Skip if no pending instances (optimization)
     let pending = common::get_pending_instances(db);
     if pending.is_empty() {
         return None;
     }
 
-    // Only check run_shell_command (gemini) or run_command (antigravity) tool responses
-    if payload.tool_name != "run_shell_command" && payload.tool_name != "run_command" {
+    // Only check run_shell_command tool responses for Gemini. Antigravity
+    // PostToolUse does not provide command output, so it binds at PreInvocation.
+    if payload.tool_name != "run_shell_command" {
         return None;
     }
 
@@ -202,12 +207,64 @@ fn bind_vanilla_instance(db: &HcomDb, payload: &HookPayload) -> Option<String> {
     )
 }
 
+/// Bind a vanilla Antigravity session to one unambiguous pending Antigravity instance.
+///
+/// Antigravity hooks expose `conversationId` at PreInvocation, but PostToolUse
+/// does not expose command stdout. That makes the Gemini marker-in-output path
+/// impossible for agy, so we adopt only when there is exactly one pending
+/// Antigravity instance.
+fn bind_pending_antigravity_instance(db: &HcomDb, payload: &HookPayload) -> Option<String> {
+    if payload.tool != "antigravity" {
+        return None;
+    }
+    let session_id = payload.session_id.as_deref()?;
+
+    let pending_agy: Vec<String> = common::get_pending_instances(db)
+        .into_iter()
+        .filter(|name| {
+            db.get_instance_full(name)
+                .ok()
+                .flatten()
+                .is_some_and(|inst| inst.tool == "antigravity")
+        })
+        .collect();
+
+    let [instance_name] = pending_agy.as_slice() else {
+        if pending_agy.len() > 1 {
+            log::log_warn(
+                "hooks",
+                "antigravity.bind.pending_ambiguous",
+                &format!("session_id={} pending={:?}", session_id, pending_agy),
+            );
+        }
+        return None;
+    };
+
+    super::family::bind_vanilla_instance(
+        db,
+        instance_name,
+        Some(session_id),
+        payload.transcript_path.as_deref(),
+        "antigravity",
+        "gemini-sessionstart",
+    )
+}
+
 /// Handle Gemini SessionStart hook.
 ///
 /// HCOM-launched: bind session_id, inject bootstrap if not announced.
 /// Vanilla: show hcom hint.
 fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> HookResult {
     if ctx.process_id.is_none() {
+        if let Some(instance_name) = bind_pending_antigravity_instance(db, payload) {
+            lifecycle::set_status(
+                db,
+                &instance_name,
+                ST_LISTENING,
+                "start",
+                Default::default(),
+            );
+        }
         // Vanilla instance - show hint
         return HookResult::Allow {
             additional_context: Some(format!(
@@ -422,7 +479,18 @@ fn handle_beforetool(db: &HcomDb, _ctx: &HcomContext, payload: &HookPayload) -> 
     } else {
         &payload.tool_name
     };
-    common::update_tool_status(db, &instance.name, "gemini", tool_name, &payload.tool_input);
+    let status_tool = if instance.tool.is_empty() {
+        payload.tool.as_str()
+    } else {
+        instance.tool.as_str()
+    };
+    common::update_tool_status(
+        db,
+        &instance.name,
+        status_tool,
+        tool_name,
+        &payload.tool_input,
+    );
 
     hook_noop()
 }
@@ -611,8 +679,8 @@ fn serialize_hook_result(tool: &str, hook_name: &str, result: &HookResult) -> Op
             } else if is_agy {
                 // agy noop: emit valid JSON rather than empty stdout. PreToolUse REQUIRES a
                 // decision field — `{}` is interpreted as deny and breaks all tool calls.
-                // Other phases tolerate `{}`.
-                if hook_name == "gemini-beforetool" {
+                // Stop also requires a decision field.
+                if matches!(hook_name, "gemini-beforetool" | "gemini-sessionend") {
                     Some(serde_json::json!({ "decision": "allow" }))
                 } else {
                     Some(serde_json::json!({}))
@@ -642,7 +710,7 @@ fn serialize_hook_result(tool: &str, hook_name: &str, result: &HookResult) -> Op
 
 /// Whether stdin/context should route through Antigravity payload parsing.
 ///
-/// Order: `ANTIGRAVITY_AGENT` env → exclude `GEMINI_CLI` gemini → `toolCall` schema fallback.
+/// Order: `ANTIGRAVITY_AGENT` env → exclude `GEMINI_CLI` gemini → Antigravity schema fallback.
 pub(crate) fn detect_antigravity_payload(ctx: &HcomContext, stdin_json: &Value) -> (bool, bool) {
     if ctx.is_antigravity {
         return (true, false);
@@ -651,6 +719,23 @@ pub(crate) fn detect_antigravity_payload(ctx: &HcomContext, stdin_json: &Value) 
         return (false, false);
     }
     if stdin_json.get("toolCall").is_some() {
+        return (true, true);
+    }
+    if stdin_json
+        .get("conversationId")
+        .and_then(|v| v.as_str())
+        .is_some()
+        && [
+            "workspacePaths",
+            "artifactDirectoryPath",
+            "invocationNum",
+            "executionNum",
+            "fullyIdle",
+            "terminationReason",
+        ]
+        .iter()
+        .any(|key| stdin_json.get(*key).is_some())
+    {
         return (true, true);
     }
     (false, false)
@@ -1874,6 +1959,42 @@ mod tests {
     }
 
     #[test]
+    fn test_detect_antigravity_lifecycle_schema_fallback() {
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        let env: HashMap<String, String> = [("HOME", "/home/test")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let ctx = HcomContext::from_env(&env, PathBuf::from("/tmp"));
+        let stdin = serde_json::json!({
+            "conversationId": "6f000787",
+            "workspacePaths": ["/tmp/project"],
+            "invocationNum": 1
+        });
+        let (is_agy, fallback) = detect_antigravity_payload(&ctx, &stdin);
+        assert!(is_agy);
+        assert!(fallback);
+    }
+
+    #[test]
+    fn test_detect_plain_conversation_id_does_not_steal_gemini_payload() {
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        let env: HashMap<String, String> = [("HOME", "/home/test")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let ctx = HcomContext::from_env(&env, PathBuf::from("/tmp"));
+        let stdin = serde_json::json!({"conversationId": "legacy"});
+        let (is_agy, fallback) = detect_antigravity_payload(&ctx, &stdin);
+        assert!(!is_agy);
+        assert!(!fallback);
+    }
+
+    #[test]
     fn test_hook_noop() {
         let result = hook_noop();
         assert_eq!(result.exit_code(), 0);
@@ -3026,6 +3147,10 @@ mod tests {
         // Other phases (PostToolUse, PreInvocation noop, etc.) emit `{}`.
         let aftertool = serialize_hook_result("antigravity", "gemini-aftertool", &result).unwrap();
         assert_eq!(aftertool, serde_json::json!({}));
+
+        let sessionend =
+            serialize_hook_result("antigravity", "gemini-sessionend", &result).unwrap();
+        assert_eq!(sessionend, serde_json::json!({ "decision": "allow" }));
     }
 
     #[test]
@@ -3234,6 +3359,38 @@ mod tests {
     }
 
     #[test]
+    fn test_antigravity_beforetool_uses_antigravity_status_detail() {
+        let (_dir, db) = make_test_db();
+        insert_test_instance(&db, "vago", "antigravity");
+        db.rebind_session("sess-vago", "vago").unwrap();
+
+        let payload = HookPayload {
+            session_id: Some("sess-vago".to_string()),
+            transcript_path: None,
+            hook_name: "gemini-beforetool".to_string(),
+            tool: "antigravity".to_string(),
+            tool_name: "run_command".to_string(),
+            tool_input: serde_json::json!({ "CommandLine": "cargo test" }),
+            tool_result: String::new(),
+            notification_type: None,
+            raw: serde_json::Value::Null,
+        };
+
+        let result = handle_beforetool(&db, &HcomContext::from_os(), &payload);
+        assert_eq!(result.exit_code(), 0);
+
+        let detail: String = db
+            .conn()
+            .query_row(
+                "SELECT status_detail FROM instances WHERE name = 'vago'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(detail, "cargo test");
+    }
+
+    #[test]
     fn test_bind_vanilla_instance_gemini_success() {
         let (_dir, db) = make_test_db();
         insert_test_instance(&db, "luna", "gemini");
@@ -3266,7 +3423,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bind_vanilla_instance_antigravity_success() {
+    fn test_bind_vanilla_instance_antigravity_does_not_fake_tool_result_binding() {
         let (_dir, db) = make_test_db();
         insert_test_instance(&db, "nova", "antigravity");
 
@@ -3283,17 +3440,39 @@ mod tests {
         };
 
         let result = bind_vanilla_instance(&db, &payload);
-        assert_eq!(result, Some("nova".to_string()));
+        assert_eq!(result, None);
+        assert_eq!(db.get_session_binding("sess-v2").unwrap(), None);
+    }
 
-        // Session binding should be created
+    #[test]
+    fn test_bind_pending_antigravity_instance_from_conversation_id() {
+        let (_dir, db) = make_test_db();
+        insert_test_instance(&db, "nova", "antigravity");
+
+        let payload = HookPayload {
+            session_id: Some("sess-v2".to_string()),
+            transcript_path: Some("/tmp/Antigravity/session.jsonl".to_string()),
+            hook_name: "gemini-sessionstart".to_string(),
+            tool: "antigravity".to_string(),
+            tool_name: String::new(),
+            tool_input: serde_json::Value::Null,
+            tool_result: String::new(),
+            notification_type: None,
+            raw: serde_json::Value::Null,
+        };
+
+        let result = bind_pending_antigravity_instance(&db, &payload);
+        assert_eq!(result, Some("nova".to_string()));
         assert_eq!(
             db.get_session_binding("sess-v2").unwrap(),
             Some("nova".to_string())
         );
-
-        // Instance should have session_id set
         let inst = db.get_instance_full("nova").unwrap().unwrap();
         assert_eq!(inst.session_id.as_deref(), Some("sess-v2"));
         assert_eq!(inst.tool, "antigravity");
+        assert_eq!(
+            inst.transcript_path,
+            "/tmp/Antigravity/session.jsonl".to_string()
+        );
     }
 }

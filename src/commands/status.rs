@@ -25,11 +25,25 @@ pub struct StatusArgs {
 // ── Tool Detection ───────────────────────────────────────────────────────
 
 /// Check if a binary is available in PATH.
+fn path_exists_or_symlink(path: &Path) -> bool {
+    path.exists() || std::fs::symlink_metadata(path).is_ok()
+}
+
 fn is_in_path(name: &str) -> bool {
     std::env::var("PATH")
         .unwrap_or_default()
         .split(':')
-        .any(|dir| Path::new(dir).join(name).exists())
+        .any(|dir| path_exists_or_symlink(&Path::new(dir).join(name)))
+}
+
+fn is_antigravity_installed() -> bool {
+    is_in_path("agy")
+        || is_in_path("antigravity")
+        || std::env::var_os("HOME").is_some_and(|home| {
+            let bin_dir = Path::new(&home).join(".antigravity/antigravity/bin");
+            path_exists_or_symlink(&bin_dir.join("agy"))
+                || path_exists_or_symlink(&bin_dir.join("antigravity"))
+        })
 }
 
 // Hook-installation checks delegate to the `verify_*` functions in `hooks::*`
@@ -50,6 +64,10 @@ fn check_codex_hooks() -> bool {
 
 fn check_opencode_hooks() -> bool {
     crate::hooks::opencode::verify_opencode_plugin_installed()
+}
+
+fn check_antigravity_hooks() -> bool {
+    crate::hooks::antigravity::verify_antigravity_hooks_installed(false)
 }
 
 // ── Status Collection ────────────────────────────────────────────────────
@@ -93,6 +111,11 @@ fn get_tool_statuses() -> Vec<ToolStatus> {
             name: "OpenCode",
             installed: is_in_path("opencode"),
             hooks: check_opencode_hooks(),
+        },
+        ToolStatus {
+            name: "Antigravity",
+            installed: is_antigravity_installed(),
+            hooks: check_antigravity_hooks(),
         },
     ]
 }
@@ -201,6 +224,7 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
     let claude_settings_path = crate::hooks::claude::get_claude_settings_path();
     let gemini_settings_path = crate::hooks::gemini::get_gemini_settings_path();
     let codex_config_path = crate::hooks::codex::get_codex_config_path();
+    let antigravity_hooks_path = crate::hooks::antigravity::get_antigravity_hooks_path();
 
     if json_mode {
         let log_summary = crate::log::get_log_summary(1.0);
@@ -239,6 +263,11 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
                 "opencode": {
                     "installed": tools[3].installed,
                     "hooks": tools[3].hooks,
+                },
+                "antigravity": {
+                    "installed": tools[4].installed,
+                    "hooks": tools[4].hooks,
+                    "settings_path": antigravity_hooks_path.to_string_lossy(),
                 },
             },
             "terminal": {
@@ -512,6 +541,7 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
 mod tests {
     use super::*;
     use crate::db::DEV_ROOT_KV_KEY;
+    use serial_test::serial;
 
     #[test]
     fn test_tool_symbol() {
@@ -542,6 +572,43 @@ mod tests {
         // ls should be in PATH on any Unix system
         assert!(is_in_path("ls"));
         assert!(!is_in_path("definitely_not_a_real_binary_xyz123"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_path_exists_or_symlink_accepts_broken_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("shim");
+        std::os::unix::fs::symlink(dir.path().join("missing-target"), &link).unwrap();
+        assert!(path_exists_or_symlink(&link));
+    }
+
+    #[test]
+    fn test_tool_statuses_include_antigravity() {
+        let tools = get_tool_statuses();
+        assert!(tools.iter().any(|t| t.name == "Antigravity"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_antigravity_install_fallback_checks_home_bin() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin_dir = dir.path().join(".antigravity/antigravity/bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::write(bin_dir.join("agy"), "").unwrap();
+
+        let old_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", dir.path());
+        }
+        assert!(is_antigravity_installed());
+        unsafe {
+            if let Some(home) = old_home {
+                std::env::set_var("HOME", home);
+            } else {
+                std::env::remove_var("HOME");
+            }
+        }
     }
 
     #[test]

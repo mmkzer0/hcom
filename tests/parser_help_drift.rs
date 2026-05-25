@@ -506,7 +506,7 @@ fn installed_opencode_help_crawls_but_hcom_keeps_opencode_args_pass_through() {
     let launcher = parser_source("src/launcher.rs");
     let launch_command = parser_source("src/commands/launch.rs");
     assert!(
-        launcher.contains("LaunchTool::OpenCode => Vec::new()"),
+        launcher.contains("LaunchTool::OpenCode | LaunchTool::Antigravity => Vec::new()"),
         "OpenCode has no hcom parser table; if validation is added, add opencode to this drift guard"
     );
     assert!(

@@ -22,6 +22,7 @@ pub(crate) use opencode::{get_opencode_db_path, search_opencode_sessions};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolKind {
     Claude,
+    Antigravity,
     Gemini,
     Codex,
     OpenCode,
@@ -57,6 +58,7 @@ pub fn read(path: &Path, kind: ToolKind, opts: &ReadOptions) -> Result<Vec<Excha
 
     let mut exchanges = match kind {
         ToolKind::Claude => claude::parse_claude_jsonl(path, opts.last, opts.detailed),
+        ToolKind::Antigravity => claude::parse_claude_jsonl(path, opts.last, opts.detailed),
         ToolKind::Gemini => gemini::parse_gemini_json(path, opts.last),
         ToolKind::Codex => codex::parse_codex_jsonl(path, opts.last, opts.detailed),
         ToolKind::OpenCode => {
@@ -100,6 +102,7 @@ pub fn detect_kind_from_path(path: &str) -> Option<ToolKind> {
 pub fn kind_from_agent_or_path(agent: &str, path: &str) -> ToolKind {
     match agent {
         "claude" => ToolKind::Claude,
+        "antigravity" | "agy" => ToolKind::Antigravity,
         "gemini" => ToolKind::Gemini,
         "codex" => ToolKind::Codex,
         "opencode" => ToolKind::OpenCode,

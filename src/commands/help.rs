@@ -659,16 +659,19 @@ const TERM_HELP: &[HelpEntry] = &[
 struct ToolHelpSpec {
     name: &'static str,
     label: &'static str,
+    args_env: Option<&'static str>,
     /// Tool-specific examples (forwarded flags, etc.)
     unique_examples: &'static [HelpEntry],
     /// Extra env vars beyond the shared set.
     extra_env: &'static [HelpEntry],
+    has_resume: bool,
     has_fork: bool,
 }
 
 const CLAUDE_SPEC: ToolHelpSpec = ToolHelpSpec {
     name: "claude",
     label: "Claude",
+    args_env: Some("HCOM_CLAUDE_ARGS"),
     unique_examples: &[
         ("hcom 1 claude --agent <name>", ".claude/agents/<name>.md"),
         (
@@ -680,12 +683,14 @@ const CLAUDE_SPEC: ToolHelpSpec = ToolHelpSpec {
         "HCOM_SUBAGENT_TIMEOUT",
         "Seconds subagents keep-alive after task",
     )],
+    has_resume: true,
     has_fork: true,
 };
 
 const GEMINI_SPEC: ToolHelpSpec = ToolHelpSpec {
     name: "gemini",
     label: "Gemini",
+    args_env: Some("HCOM_GEMINI_ARGS"),
     unique_examples: &[
         ("hcom N gemini --yolo", "Flags forwarded to gemini"),
         (
@@ -694,12 +699,14 @@ const GEMINI_SPEC: ToolHelpSpec = ToolHelpSpec {
         ),
     ],
     extra_env: &[("HCOM_GEMINI_SYSTEM_PROMPT", "System prompt (env var)")],
+    has_resume: true,
     has_fork: false,
 };
 
 const CODEX_SPEC: ToolHelpSpec = ToolHelpSpec {
     name: "codex",
     label: "Codex",
+    args_env: Some("HCOM_CODEX_ARGS"),
     unique_examples: &[
         (
             "hcom codex --sandbox danger-full-access",
@@ -720,18 +727,34 @@ const CODEX_SPEC: ToolHelpSpec = ToolHelpSpec {
             "workspace | untrusted | danger-full-access | none",
         ),
     ],
+    has_resume: true,
     has_fork: true,
 };
 
 const OPENCODE_SPEC: ToolHelpSpec = ToolHelpSpec {
     name: "opencode",
     label: "OpenCode",
+    args_env: Some("HCOM_OPENCODE_ARGS"),
     unique_examples: &[(
         "hcom opencode --model anthropic/claude-sonnet-4-6|openai/gpt-5.4",
         "Use a specific model",
     )],
     extra_env: &[],
+    has_resume: true,
     has_fork: true,
+};
+
+const AGY_SPEC: ToolHelpSpec = ToolHelpSpec {
+    name: "agy",
+    label: "Antigravity",
+    args_env: None,
+    unique_examples: &[
+        ("hcom antigravity", "Long-form alias"),
+        ("hcom agy --sandbox", "Flags forwarded to agy"),
+    ],
+    extra_env: &[],
+    has_resume: false,
+    has_fork: false,
 };
 
 fn get_tool_spec(name: &str) -> Option<&'static ToolHelpSpec> {
@@ -740,6 +763,7 @@ fn get_tool_spec(name: &str) -> Option<&'static ToolHelpSpec> {
         "gemini" => Some(&GEMINI_SPEC),
         "codex" => Some(&CODEX_SPEC),
         "opencode" => Some(&OPENCODE_SPEC),
+        "agy" | "antigravity" => Some(&AGY_SPEC),
         _ => None,
     }
 }
@@ -753,8 +777,6 @@ fn generate_tool_help(spec: &ToolHelpSpec) -> String {
     } else {
         "Runs in current terminal"
     };
-    let args_env = format!("HCOM_{}_ARGS", t.to_uppercase());
-
     let mut lines: Vec<String> = Vec::new();
 
     // Usage + examples
@@ -787,10 +809,12 @@ fn generate_tool_help(spec: &ToolHelpSpec) -> String {
     // Environment
     lines.push(String::new());
     lines.push("Environment:".to_string());
-    lines.push(format!(
-        "    {:<28} Default args (merged with CLI)",
-        args_env
-    ));
+    if let Some(args_env) = spec.args_env {
+        lines.push(format!(
+            "    {:<28} Default args (merged with CLI)",
+            args_env
+        ));
+    }
     lines.push(format!(
         "    {:<28} Group tag (agents become tag-*)",
         "HCOM_TAG"
@@ -822,7 +846,7 @@ fn generate_tool_help(spec: &ToolHelpSpec) -> String {
         lines.push(
             "    (append :<device> to run on a remote device; see `hcom r --help`)".to_string(),
         );
-    } else {
+    } else if spec.has_resume {
         lines.push("Resume:".to_string());
         lines.push(
             "    hcom r <target>                Resume by name / session UUID / thread name"
@@ -830,6 +854,12 @@ fn generate_tool_help(spec: &ToolHelpSpec) -> String {
         );
         lines.push(format!(
             "  {} does not support session forking (hcom f).",
+            spec.label
+        ));
+    } else {
+        lines.push("Resume / Fork:".to_string());
+        lines.push(format!(
+            "  {} resume/fork is not currently wired through hcom.",
             spec.label
         ));
     }
@@ -918,7 +948,7 @@ Usage:\n\
   hcom <command>                        Run command\n\
 \n\
 Launch:\n\
-  hcom [N] claude|gemini|codex|opencode [flags] [tool-args]\n\
+  hcom [N] claude|gemini|codex|opencode|agy [flags] [tool-args]\n\
   hcom r <name>                         Resume stopped agent\n\
   hcom f <name>                         Fork agent session (claude/codex/opencode)\n\
   hcom kill <name(s)|tag:T|all>         Kill + close terminal pane\n\
@@ -1136,6 +1166,8 @@ mod tests {
             "gemini",
             "codex",
             "opencode",
+            "agy",
+            "antigravity",
         ];
         for cmd in commands {
             let help = get_command_help(cmd);
@@ -1185,8 +1217,26 @@ mod tests {
     }
 
     #[test]
+    fn agy_help_uses_full_launch_template_without_fake_args_env() {
+        let help = get_command_help("agy");
+        assert!(help.contains("Launch N Antigravity agents"));
+        assert!(help.contains("hcom antigravity"));
+        assert!(help.contains("hcom agy --sandbox"));
+        assert!(!help.contains("hcom agy --model"));
+        assert!(help.contains("Run \"agy --help\" for agy options."));
+        assert!(help.contains("Antigravity resume/fork is not currently wired through hcom."));
+        assert!(!help.contains("hcom r <target>"));
+        assert!(!help.contains("HCOM_AGY_ARGS"));
+        assert!(!help.contains("HCOM_ANTIGRAVITY_ARGS"));
+
+        let alias_help = get_command_help("antigravity");
+        assert_eq!(alias_help, help);
+    }
+
+    #[test]
     fn top_level_help_scopes_fork_to_supported_tools() {
         let help = get_help_text();
+        assert!(help.contains("claude|gemini|codex|opencode|agy"));
         assert!(help.contains(
             "hcom f <name>                         Fork agent session (claude/codex/opencode)"
         ));

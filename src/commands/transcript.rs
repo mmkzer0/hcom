@@ -117,13 +117,16 @@ pub(crate) fn claude_config_dir() -> PathBuf {
 
 /// Detect agent type from transcript path.
 pub(crate) fn detect_agent_type(path: &str) -> &str {
-    if path.contains(".claude") || path.contains("/projects/") {
+    let lower = path.to_ascii_lowercase();
+    if lower.contains("antigravity") || lower.contains("/agy/") || lower.contains("/agy-") {
+        "antigravity"
+    } else if path.contains(".claude") || path.contains("/projects/") {
         "claude"
-    } else if path.contains(".gemini") {
+    } else if lower.contains(".gemini") {
         "gemini"
-    } else if path.contains(".codex") || path.contains("codex") {
+    } else if lower.contains(".codex") || lower.contains("codex") {
         "codex"
-    } else if path.contains("opencode") {
+    } else if lower.contains("opencode") {
         "opencode"
     } else {
         "unknown"
@@ -1321,6 +1324,10 @@ mod tests {
             detect_agent_type("/home/user/.local/share/opencode/opencode.db"),
             "opencode"
         );
+        assert_eq!(
+            detect_agent_type("/home/user/Library/Application Support/Antigravity/session.jsonl"),
+            "antigravity"
+        );
     }
 
     #[test]
@@ -1528,6 +1535,52 @@ mod tests {
         assert_eq!(first["position"], 1);
         assert_eq!(first["user"], "user prompt");
         assert_eq!(first["action"], "assistant answer");
+    }
+
+    #[test]
+    fn test_render_antigravity_transcript_user_input_and_planner_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript_path = dir.path().join("Antigravity-session.jsonl");
+        let db = test_db();
+        let now = crate::shared::time::now_epoch_f64();
+        let lines = [
+            json!({
+                "type": "USER_INPUT",
+                "timestamp": "2026-03-27T10:00:00Z",
+                "text": "review the hook changes"
+            }),
+            json!({
+                "type": "PLANNER_RESPONSE",
+                "timestamp": "2026-03-27T10:00:01Z",
+                "text": "I will inspect the Antigravity hook path."
+            }),
+        ];
+        fs::write(
+            &transcript_path,
+            lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let mut data = serde_json::Map::new();
+        data.insert("created_at".into(), json!(now));
+        data.insert("tool".into(), json!("antigravity"));
+        data.insert(
+            "transcript_path".into(),
+            json!(transcript_path.to_string_lossy().to_string()),
+        );
+        db.save_instance_named("vibo", &data).unwrap();
+
+        let rendered =
+            render_instance_transcript_with_options(&db, "vibo", None, 10, false, false, false)
+                .unwrap();
+
+        assert!(rendered.contains("review the hook changes"));
+        assert!(rendered.contains("inspect the Antigravity hook path."));
+        assert!(!rendered.contains("No exchanges found"));
     }
 
     #[test]
