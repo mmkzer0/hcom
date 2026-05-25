@@ -87,7 +87,7 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
             "launcher": launcher_name,
             "background": headless,
             "pty": pty_requested,
-            "terminal": terminal,
+            "terminal": terminal.clone(),
             "cwd": remote_cwd,
             "initial_prompt": hcom_flags.initial_prompt,
             "system_prompt": hcom_flags.system_prompt,

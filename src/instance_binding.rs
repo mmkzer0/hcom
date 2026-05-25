@@ -79,16 +79,18 @@ pub fn capture_and_store_launch_context(db: &HcomDb, instance_name: &str) {
     let new_ctx = capture_context();
 
     // Preserve fields from prior context that can't be recaptured in hook env
-    let preserve_keys = ["pane_id", "terminal_id", "kitty_listen_on", "process_id"];
+    let preserve_keys = [
+        "pane_id",
+        "terminal_id",
+        "kitty_listen_on",
+        "process_id",
+        "terminal_preset_effective",
+    ];
     let mut ctx = new_ctx;
 
     let missing: Vec<&str> = preserve_keys
         .iter()
-        .filter(|k| {
-            ctx.get(**k)
-                .and_then(|v| v.as_str())
-                .is_none_or(|s| s.is_empty())
-        })
+        .filter(|k| launch_context_value_missing(ctx.get(**k)))
         .copied()
         .collect();
 
@@ -99,8 +101,7 @@ pub fn capture_and_store_launch_context(db: &HcomDb, instance_name: &str) {
     {
         for k in &missing {
             if let Some(val) = old_ctx.get(*k)
-                && let Some(s) = val.as_str()
-                && !s.is_empty()
+                && !launch_context_value_missing(Some(val))
             {
                 ctx.insert(k.to_string(), val.clone());
             }
@@ -111,6 +112,19 @@ pub fn capture_and_store_launch_context(db: &HcomDb, instance_name: &str) {
     let mut updates = serde_json::Map::new();
     updates.insert("launch_context".into(), serde_json::json!(json));
     update_instance_position(db, instance_name, &updates);
+}
+
+/// "Missing" for the preserve-from-prior-context check. Treats absent, JSON
+/// null, and empty strings as missing. Non-string non-null values (numbers,
+/// objects, arrays) are considered present even though every preserved field
+/// is currently a string — this is intentionally conservative so a future
+/// non-string preserved field doesn't silently get clobbered by re-capture.
+fn launch_context_value_missing(value: Option<&serde_json::Value>) -> bool {
+    match value {
+        None | Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::String(s)) => s.is_empty(),
+        Some(_) => false,
+    }
 }
 
 /// Capture launch context snapshot.
@@ -182,14 +196,23 @@ fn capture_context() -> serde_json::Map<String, serde_json::Value> {
     }
     ctx.insert("env".into(), serde_json::Value::Object(env_map));
 
-    // Pane IDs are late-bound. The launcher already persisted the effective preset.
+    // The launcher already resolved the effective preset; record it so
+    // child agents can inherit it (see commands::launch). Pane IDs are
+    // late-bound from the env vars the preset declares.
     if let Ok(preset_name) = std::env::var("HCOM_LAUNCHED_PRESET")
         && !preset_name.is_empty()
-        && let Some(pane_id_env) = crate::config::get_merged_preset_pane_id_env(&preset_name)
-        && let Ok(pane_id) = std::env::var(pane_id_env)
-        && !pane_id.is_empty()
     {
-        ctx.insert("pane_id".into(), serde_json::json!(pane_id));
+        ctx.insert(
+            "terminal_preset_effective".into(),
+            serde_json::json!(preset_name),
+        );
+
+        if let Some(pane_id_env) = crate::config::get_merged_preset_pane_id_env(&preset_name)
+            && let Ok(pane_id) = std::env::var(pane_id_env)
+            && !pane_id.is_empty()
+        {
+            ctx.insert("pane_id".into(), serde_json::json!(pane_id));
+        }
     }
 
     // Process ID for kitty close-by-env matching
@@ -920,6 +943,74 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("kitty")
         );
+        assert_eq!(
+            ctx.get("process_id").and_then(|v| v.as_str()),
+            Some("proc-1")
+        );
+
+        cleanup(path);
+    }
+
+    #[test]
+    #[serial]
+    fn test_capture_context_records_launched_preset() {
+        // capture_context tags the launch with HCOM_LAUNCHED_PRESET so later
+        // child agents launched from inside this pane can inherit the preset.
+        // Running tests inside a herdr session would otherwise leak
+        // HERDR_PANE_ID into the captured context, so explicitly clear the
+        // herdr-related identity vars before exercising the capture path.
+        crate::config::Config::init();
+        let _preset = EnvVarGuard::set("HCOM_LAUNCHED_PRESET", "herdr");
+        let _herdr_pane = EnvVarGuard::set("HERDR_PANE_ID", "");
+        let _herdr_socket = EnvVarGuard::set("HERDR_SOCKET_PATH", "");
+        let _herdr_env = EnvVarGuard::set("HERDR_ENV", "");
+        let _process_id = EnvVarGuard::set("HCOM_PROCESS_ID", "");
+
+        let ctx = capture_context();
+
+        assert_eq!(
+            ctx.get("terminal_preset_effective")
+                .and_then(|v| v.as_str()),
+            Some("herdr")
+        );
+        assert!(
+            ctx.get("pane_id").is_none(),
+            "pane_id should be absent when HERDR_PANE_ID isn't set"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_capture_and_store_launch_context_preserves_terminal_metadata() {
+        // Preserve only the fields we can't recapture from hook env:
+        // pane_id, terminal_id, kitty_listen_on, process_id, and the resolved
+        // terminal preset name.
+        let (db, path) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, created_at, launch_context) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    "luna",
+                    "claude",
+                    1.0f64,
+                    r#"{"terminal_preset_effective":"herdr","pane_id":"p_7","process_id":"proc-1"}"#
+                ],
+            )
+            .unwrap();
+        let _preset = EnvVarGuard::set("HCOM_LAUNCHED_PRESET", "");
+        let _process_id = EnvVarGuard::set("HCOM_PROCESS_ID", "");
+
+        capture_and_store_launch_context(&db, "luna");
+
+        let row = db.get_instance_full("luna").unwrap().unwrap();
+        let ctx: serde_json::Value =
+            serde_json::from_str(row.launch_context.as_deref().unwrap_or("{}")).unwrap();
+        assert_eq!(
+            ctx.get("terminal_preset_effective")
+                .and_then(|v| v.as_str()),
+            Some("herdr")
+        );
+        assert_eq!(ctx.get("pane_id").and_then(|v| v.as_str()), Some("p_7"));
         assert_eq!(
             ctx.get("process_id").and_then(|v| v.as_str()),
             Some("proc-1")

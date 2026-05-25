@@ -454,6 +454,13 @@ fn background_runner_env(
 ) -> HashMap<String, String> {
     let mut runner_env = env.clone();
     runner_env.insert("HCOM_INSTANCE_NAME".to_string(), instance_name.to_string());
+    // Default HCOM_TOOL when the caller didn't already set it (most callers
+    // come from `launch()` which inserts it; this keeps the standalone PTY
+    // and headless paths consistent so `{tool}` template substitution and
+    // delivery-loop label formatting see the right value).
+    runner_env
+        .entry("HCOM_TOOL".to_string())
+        .or_insert_with(|| tool.to_string());
     runner_env.extend(tool_extra_env(tool));
     runner_env
 }
@@ -592,6 +599,9 @@ pub fn launch_pty(
 
     let mut runner_env = env.clone();
     runner_env.insert("HCOM_INSTANCE_NAME".to_string(), instance_name.to_string());
+    runner_env
+        .entry("HCOM_TOOL".to_string())
+        .or_insert_with(|| tool.to_string());
     runner_env.extend(tool_extra_env(tool));
 
     let script_file =
@@ -604,7 +614,7 @@ pub fn launch_pty(
 
     let (launch_result, effective_preset) = terminal::launch_terminal(
         &command,
-        env,
+        &runner_env,
         Some(cwd),
         false, // not background
         run_here,
@@ -986,6 +996,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         } else {
             instance_names::generate_unique_name(db)?
         };
+        instance_env.insert("HCOM_INSTANCE_NAME".to_string(), instance_name.clone());
 
         // Process ID export: allow custom env var name
         if let Ok(export_var) = std::env::var("HCOM_PROCESS_ID_EXPORT")
@@ -1004,6 +1015,27 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         }
 
         let tool_type = base_tool;
+        instance_env.insert("HCOM_TOOL".to_string(), tool_type.to_string());
+
+        // Pre-format the pane title for templates that substitute
+        // `{pane_title}` (custom user templates only — the built-in herdr
+        // preset passes `{instance_name}` and the delivery loop pushes the
+        // styled label via `pane.rename`). `display_for_title` mirrors
+        // `identity::get_display_name` for the about-to-be-created instance
+        // row.
+        let display_for_title = if effective_tag.is_empty() {
+            instance_name.clone()
+        } else {
+            format!("{}-{}", effective_tag, instance_name)
+        };
+        instance_env.insert(
+            "HCOM_PANE_TITLE".to_string(),
+            crate::shared::format_pane_title(
+                crate::shared::ST_LISTENING,
+                &display_for_title,
+                tool_type,
+            ),
+        );
 
         // Pre-register instance
         if let Err(e) = (|| -> Result<()> {

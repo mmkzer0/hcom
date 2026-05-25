@@ -121,6 +121,227 @@ pub(crate) fn refresh_display_name(
     }
 }
 
+/// Inputs for one delivery-loop title refresh.
+///
+/// Bundling these lets `refresh_title_state` stay one call inside an already
+/// hot loop without exploding the function signature.
+struct TitleRefresh<'a> {
+    db: &'a HcomDb,
+    process_id: &'a str,
+    current_name: &'a mut String,
+    current_status: &'a mut String,
+    shared_name: &'a Option<Arc<std::sync::RwLock<String>>>,
+    shared_status: &'a Option<Arc<std::sync::RwLock<String>>>,
+    tool: &'a str,
+    host_label: &'a mut host_label::HostLabel,
+}
+
+/// Refresh OSC title state and push a matching label to terminals that expose
+/// a programmatic label API (currently only herdr).
+fn refresh_title_state(args: TitleRefresh<'_>) {
+    let TitleRefresh {
+        db,
+        process_id,
+        current_name,
+        current_status,
+        shared_name,
+        shared_status,
+        tool,
+        host_label,
+    } = args;
+    refresh_binding(db, process_id, current_name, shared_name);
+    refresh_status(db, current_name, current_status, shared_status);
+    refresh_display_name(db, current_name, shared_name);
+    host_label.sync(db, current_name, current_status, tool);
+}
+
+/// Mirror the OSC 1/2 title into the terminal's own label API for terminals
+/// whose chrome doesn't render OSC titles. Currently only herdr; add a
+/// `Backend` variant and a `resolve` arm to support another.
+mod host_label {
+    use std::time::Duration;
+
+    use crate::db::HcomDb;
+    use crate::identity;
+    use crate::shared::format_pane_title;
+
+    /// Long enough to absorb a slow herdr server tick, short enough that a
+    /// dead socket doesn't visibly stall the delivery loop.
+    const SOCKET_TIMEOUT: Duration = Duration::from_millis(200);
+
+    /// Per-loop state: which backend (if any) we resolved at startup, and the
+    /// last label we successfully pushed (for dedupe). On the first I/O error
+    /// we drop the backend so subsequent iterations are no-ops — avoids log
+    /// spam and per-tick socket churn when herdr exits mid-session.
+    pub(super) struct HostLabel {
+        backend: Option<Backend>,
+        last_pushed: Option<String>,
+    }
+
+    enum Backend {
+        Herdr {
+            socket_path: String,
+            pane_id: String,
+        },
+    }
+
+    impl HostLabel {
+        pub(super) fn resolve() -> Self {
+            // `last_pushed` starts unset so the first delivery-loop iteration
+            // *always* pushes a styled label. The built-in herdr preset
+            // invokes `agent start {instance_name}` which leaves the pane
+            // labeled with the bare instance name; the styled
+            // `◉ luna [claude]` label only appears once we push it. Seeding
+            // from HCOM_PANE_TITLE (which a custom template might or might
+            // not have applied) would silently skip that first push and leave
+            // the pane stuck on the bare name until a later status change.
+            Self {
+                backend: Backend::resolve(),
+                last_pushed: None,
+            }
+        }
+
+        pub(super) fn sync(&mut self, db: &HcomDb, name: &str, status: &str, tool: &str) {
+            if self.backend.is_none() {
+                return;
+            }
+            let label = pane_title_label(db, name, status, tool);
+            if label.is_empty() || self.last_pushed.as_deref() == Some(label.as_str()) {
+                return;
+            }
+            // Take the backend so we can drop it on failure without holding a
+            // borrow across the I/O call.
+            let backend = self.backend.take().expect("backend present");
+            match backend.push(&label) {
+                Ok(()) => {
+                    self.backend = Some(backend);
+                    self.last_pushed = Some(label);
+                }
+                Err(err) => {
+                    crate::log::log_info(
+                        "host_label",
+                        "push_failed_disabling",
+                        &format!("{}: {err}", backend.kind()),
+                    );
+                }
+            }
+        }
+    }
+
+    impl Backend {
+        fn resolve() -> Option<Self> {
+            if std::env::var("HERDR_ENV").ok().as_deref() == Some("1") {
+                let socket_path = std::env::var("HERDR_SOCKET_PATH")
+                    .ok()
+                    .filter(|s| !s.is_empty())?;
+                let pane_id = std::env::var("HERDR_PANE_ID")
+                    .ok()
+                    .filter(|s| !s.is_empty())?;
+                return Some(Backend::Herdr {
+                    socket_path,
+                    pane_id,
+                });
+            }
+            None
+        }
+
+        fn kind(&self) -> &'static str {
+            match self {
+                Backend::Herdr { .. } => "herdr",
+            }
+        }
+
+        /// Push a visual label. Uses `pane.rename` (manual_label only) rather
+        /// than `agent.rename` (which would also overwrite the herdr-canonical
+        /// agent name with the status-icon-prefixed string and break
+        /// `herdr agent send <name>` targeting).
+        fn push(&self, label: &str) -> Result<(), String> {
+            match self {
+                Backend::Herdr {
+                    socket_path,
+                    pane_id,
+                } => {
+                    let request = serde_json::json!({
+                        "id": "hcom:pane:rename",
+                        "method": "pane.rename",
+                        "params": { "pane_id": pane_id, "label": label },
+                    });
+                    send_unix_request(socket_path, &request)
+                }
+            }
+        }
+    }
+
+    /// Build the same label hcom writes into OSC 1/2 (`◉ tag-luna [claude]`).
+    fn pane_title_label(db: &HcomDb, name: &str, status: &str, tool: &str) -> String {
+        let display = identity::get_display_name(db, name);
+        format_pane_title(status, &display, tool)
+    }
+
+    #[cfg(unix)]
+    fn send_unix_request(socket_path: &str, request: &serde_json::Value) -> Result<(), String> {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixStream;
+
+        let mut stream =
+            UnixStream::connect(socket_path).map_err(|e| format!("connect: {socket_path}: {e}"))?;
+        let _ = stream.set_read_timeout(Some(SOCKET_TIMEOUT));
+        let _ = stream.set_write_timeout(Some(SOCKET_TIMEOUT));
+        writeln!(stream, "{request}").map_err(|e| format!("write: {e}"))?;
+        let mut response = String::new();
+        BufReader::new(&stream)
+            .read_line(&mut response)
+            .map_err(|e| format!("read: {e}"))?;
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn send_unix_request(_socket_path: &str, _request: &serde_json::Value) -> Result<(), String> {
+        Err("unix sockets unavailable on this platform".into())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::shared::ST_LISTENING;
+        use serial_test::serial;
+
+        #[test]
+        fn pane_title_label_skips_when_tool_empty() {
+            let dir = tempfile::tempdir().unwrap();
+            // SAFETY: test-local HCOM_DIR.
+            unsafe { std::env::set_var("HCOM_DIR", dir.path()) };
+            let db = crate::db::HcomDb::open().unwrap();
+
+            assert_eq!(pane_title_label(&db, "luna", ST_LISTENING, ""), "");
+        }
+
+        #[test]
+        #[serial]
+        fn resolve_does_not_seed_last_pushed_from_pane_title_env() {
+            // The built-in herdr preset launches with `agent start
+            // {instance_name}`, so herdr's initial pane label is the bare
+            // name (e.g. `luna`). Seeding `last_pushed` from HCOM_PANE_TITLE
+            // would silently swallow the first push and leave the pane
+            // stuck on `luna` until the next status transition.
+            // SAFETY: test is #[serial].
+            unsafe {
+                std::env::set_var("HCOM_PANE_TITLE", "\u{25c9} luna [claude]");
+            }
+            let label = HostLabel::resolve();
+            // SAFETY: clear before assert so a panic doesn't leak env.
+            unsafe {
+                std::env::remove_var("HCOM_PANE_TITLE");
+            }
+            assert!(
+                label.last_pushed.is_none(),
+                "last_pushed must start unset so the first delivery-loop \
+                 iteration always pushes a styled label"
+            );
+        }
+    }
+}
+
 /// Human-readable descriptions for gate block reasons.
 pub(crate) fn gate_block_detail(reason: &str) -> &'static str {
     match reason {
@@ -627,6 +848,11 @@ pub fn run_delivery_loop(
         *s = full_display_name(db, &current_name);
     }
 
+    // Resolve once: only delivery-loop iterations push labels, so a single
+    // backend handle (or None) is captured at startup. First iteration will
+    // push the initial label, subsequent iterations only push on change.
+    let mut host_label = host_label::HostLabel::resolve();
+
     // OpenCode: plugin handles delivery after session exists. The delivery thread
     // only injects the FIRST message via PTY to bootstrap the session in the TUI.
     // After that, the plugin takes over (messages.transform for active, promptAsync for idle).
@@ -644,12 +870,19 @@ pub fn run_delivery_loop(
         let mut first_message_injected = false;
 
         // Status tracking for terminal title updates
-        let mut current_status = "listening".to_string();
+        let mut current_status = ST_LISTENING.to_string();
 
         while running.load(Ordering::Acquire) {
-            refresh_binding(db, &process_id, &mut current_name, &shared_name);
-            refresh_status(db, &current_name, &mut current_status, &shared_status);
-            refresh_display_name(db, &current_name, &shared_name);
+            refresh_title_state(TitleRefresh {
+                db,
+                process_id: &process_id,
+                current_name: &mut current_name,
+                current_status: &mut current_status,
+                shared_name: &shared_name,
+                shared_status: &shared_status,
+                tool: &config.tool,
+                host_label: &mut host_label,
+            });
 
             // Wait for notify or timeout
             notify.wait(IDLE_WAIT);
@@ -741,12 +974,19 @@ pub fn run_delivery_loop(
         let mut last_block_context: String = String::new();
 
         // Status tracking for terminal title updates
-        let mut current_status = "listening".to_string();
+        let mut current_status = ST_LISTENING.to_string();
 
         while running.load(Ordering::Acquire) {
-            refresh_binding(db, &process_id, &mut current_name, &shared_name);
-            refresh_status(db, &current_name, &mut current_status, &shared_status);
-            refresh_display_name(db, &current_name, &shared_name);
+            refresh_title_state(TitleRefresh {
+                db,
+                process_id: &process_id,
+                current_name: &mut current_name,
+                current_status: &mut current_status,
+                shared_name: &shared_name,
+                shared_status: &shared_status,
+                tool: &config.tool,
+                host_label: &mut host_label,
+            });
 
             match delivery_state {
                 State::Idle => {

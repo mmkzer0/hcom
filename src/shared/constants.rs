@@ -113,6 +113,19 @@ pub fn status_icon(status: &str) -> &'static str {
 /// Adhoc instance icon (neutral — not claiming alive or dead).
 pub const ADHOC_ICON: &str = "\u{25e6}"; // ◦
 
+/// Build the canonical pane-title label hcom writes into OSC 1/2 and pushes
+/// to host terminal label APIs (e.g. herdr's `pane.rename`).
+///
+/// Format: `"{icon} {display} [{tool}]"` (e.g. `"◉ luna [claude]"`).
+/// Returns an empty string when `display` or `tool` is empty so callers can
+/// short-circuit before doing terminal IO.
+pub fn format_pane_title(status: &str, display: &str, tool: &str) -> String {
+    if display.is_empty() || tool.is_empty() {
+        return String::new();
+    }
+    format!("{} {} [{}]", status_icon(status), display, tool)
+}
+
 /// Status foreground ANSI color.
 pub fn status_fg(status: &str) -> &'static str {
     match status {

@@ -89,6 +89,10 @@ const TERMINAL_CONTEXT_VARS: &[&str] = &[
     "TERMINATOR_UUID",
     "TILIX_ID",
     "WT_SESSION",
+    // HERDR_* not stripped: the herdr preset's CLI (`herdr agent start ...`)
+    // resolves its server socket from $HERDR_SOCKET_PATH; other presets pass
+    // the socket via CLI flag (e.g. `kitty @ --to {kitty_listen}`) and don't
+    // need their identity vars to survive in the launcher env.
     // Generic terminal identity
     "TERM_PROGRAM",
     "TERM_SESSION_ID",
@@ -755,12 +759,24 @@ where
         .collect()
 }
 
+/// Inputs to terminal command template substitution.
+///
+/// All fields are borrowed and may be empty; unknown placeholders are left
+/// in place by `parse_terminal_command` (no substitution panics).
+#[derive(Default, Clone, Copy)]
+pub(crate) struct TerminalCommandContext<'a> {
+    pub script: &'a str,
+    pub process_id: &'a str,
+    pub cwd: &'a str,
+    pub instance_name: &'a str,
+    pub tool: &'a str,
+    /// Pre-formatted pane title (e.g. `◉ team-luna [claude]`). Falls back to
+    /// `instance_name` when None or empty.
+    pub pane_title: Option<&'a str>,
+}
+
 /// Parse terminal command template safely to prevent shell injection.
-fn parse_terminal_command(
-    template: &str,
-    script_file: &str,
-    process_id: &str,
-) -> Result<Vec<String>> {
+fn parse_terminal_command(template: &str, ctx: TerminalCommandContext<'_>) -> Result<Vec<String>> {
     if !template.contains("{script}") {
         bail!(
             "Custom terminal command must include {{script}} placeholder\n\
@@ -768,16 +784,27 @@ fn parse_terminal_command(
         );
     }
 
-    let parts = shell_split(template)?;
+    let pane_title = ctx
+        .pane_title
+        .filter(|s| !s.is_empty())
+        .unwrap_or(ctx.instance_name);
 
     let mut replaced = Vec::new();
     let mut placeholder_found = false;
-    for mut part in parts {
-        if part.contains("{process_id}") {
-            part = part.replace("{process_id}", process_id);
+    for mut part in shell_split(template)? {
+        for (placeholder, value) in [
+            ("{process_id}", ctx.process_id),
+            ("{cwd}", ctx.cwd),
+            ("{instance_name}", ctx.instance_name),
+            ("{tool}", ctx.tool),
+            ("{pane_title}", pane_title),
+        ] {
+            if part.contains(placeholder) {
+                part = part.replace(placeholder, value);
+            }
         }
         if part.contains("{script}") {
-            part = part.replace("{script}", script_file);
+            part = part.replace("{script}", ctx.script);
             placeholder_found = true;
         }
         replaced.push(part);
@@ -1051,6 +1078,7 @@ fn is_external_terminal_launcher(argv: &[String]) -> bool {
             | "wt"
             | "wt.exe"
             | "mintty"
+            | "herdr"
     )
 }
 
@@ -1209,6 +1237,13 @@ fn write_terminal_id(env: &HashMap<String, String>, captured_id: &str) {
 
 fn normalize_captured_terminal_id(captured_id: &str) -> String {
     let captured_id = captured_id.trim();
+
+    // Herdr: parse JSON response and extract result.agent.pane_id
+    if let Some(pane_id) = parse_herdr_pane_id(captured_id) {
+        return pane_id;
+    }
+
+    // Waveterm: "run block created: block:abc123" -> "block:abc123"
     let Some((_, block_ref)) = captured_id.rsplit_once("block:") else {
         return captured_id.to_string();
     };
@@ -1218,6 +1253,27 @@ fn normalize_captured_terminal_id(captured_id: &str) -> String {
     } else {
         format!("block:{block_id}")
     }
+}
+
+/// Parse herdr `agent start` JSON output and extract `result.agent.pane_id`.
+///
+/// Gated on the response `id` field (`cli:agent:start`) so non-herdr terminal
+/// outputs that happen to be JSON don't accidentally match this shape.
+fn parse_herdr_pane_id(captured: &str) -> Option<String> {
+    let trimmed = captured.trim_start();
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+    let val: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+    if val.get("id").and_then(|v| v.as_str()) != Some("cli:agent:start") {
+        return None;
+    }
+    val.get("result")?
+        .get("agent")?
+        .get("pane_id")?
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 /// Launch terminal with command.
@@ -1434,12 +1490,32 @@ pub fn launch_terminal(
     }
 
     if let Some(cmd_template) = custom_cmd {
-        // Parse user-provided or preset command template
-        let final_argv = parse_terminal_command(
-            &cmd_template,
-            &script_str,
-            env.get("HCOM_PROCESS_ID").map(|s| s.as_str()).unwrap_or(""),
-        )?;
+        // {instance_name} falls back to process_id so presets that label panes
+        // (e.g. herdr) never produce an empty `[tool]-` suffix when invoked
+        // outside the normal launch flow.
+        let process_id = env.get("HCOM_PROCESS_ID").map(|s| s.as_str()).unwrap_or("");
+        let instance_name = env
+            .get("HCOM_INSTANCE_NAME")
+            .map(|s| s.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(process_id);
+        let ctx = TerminalCommandContext {
+            script: &script_str,
+            process_id,
+            cwd: cwd.unwrap_or(""),
+            instance_name,
+            tool: env
+                .get("HCOM_TOOL")
+                .map(|s| s.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("hcom"),
+            // launcher::launch pre-formats the title; here we only read it.
+            pane_title: env
+                .get("HCOM_PANE_TITLE")
+                .map(|s| s.as_str())
+                .filter(|s| !s.is_empty()),
+        };
+        let final_argv = parse_terminal_command(&cmd_template, ctx)?;
         let (success, captured_id) = spawn_terminal_process(&final_argv, inside_ai_tool)?;
         write_terminal_id(env, &captured_id);
         if success {
@@ -1479,8 +1555,17 @@ pub fn launch_terminal(
         let argv = match platform::platform_name() {
             "Darwin" => parse_terminal_command(
                 &get_macos_terminal_command(),
-                &script_str,
-                env.get("HCOM_PROCESS_ID").map(|s| s.as_str()).unwrap_or(""),
+                TerminalCommandContext {
+                    script: &script_str,
+                    process_id: env.get("HCOM_PROCESS_ID").map(|s| s.as_str()).unwrap_or(""),
+                    cwd: cwd.unwrap_or(""),
+                    instance_name: env
+                        .get("HCOM_INSTANCE_NAME")
+                        .map(|s| s.as_str())
+                        .unwrap_or(""),
+                    tool: env.get("HCOM_TOOL").map(|s| s.as_str()).unwrap_or(""),
+                    pane_title: None,
+                },
             )?,
             "Linux" => get_linux_terminal_argv()
                 .ok_or_else(|| anyhow::anyhow!("No supported terminal emulator found"))?,
@@ -1914,6 +1999,20 @@ mod tests {
     }
 
     #[test]
+    fn test_launcher_env_keeps_herdr_socket_path() {
+        // The herdr preset's CLI resolves its socket from env; see the comment
+        // on TERMINAL_CONTEXT_VARS for why HERDR_* is not stripped.
+        let env = get_launcher_env_from(vec![
+            ("HERDR_SOCKET_PATH".into(), "/tmp/herdr.sock".into()),
+            ("PATH".into(), "/bin".into()),
+        ]);
+        assert_eq!(
+            env.get("HERDR_SOCKET_PATH").map(String::as_str),
+            Some("/tmp/herdr.sock"),
+        );
+    }
+
+    #[test]
     fn test_zellij_session_ambiguity_stderr_fails_launch_even_with_exit_zero() {
         let output = std::process::Output {
             status: std::process::ExitStatus::from_raw(0),
@@ -2085,10 +2184,16 @@ mod tests {
         let _ = result;
     }
 
+    /// Detection vars not in `TERMINAL_CONTEXT_VARS` — tests that exercise
+    /// `detect_terminal_from_env` must clear these explicitly so a host shell
+    /// running inside herdr doesn't leak into the test.
+    const DETECT_ONLY_VARS: &[&str] = &["HERDR_PANE_ID", "HERDR_SOCKET_PATH", "HERDR_ENV"];
+
     #[test]
     #[serial]
     fn test_normalize_terminal_mode_for_launch_resolves_socket_for_auto_detected_kitty() {
         let _env = EnvGuard::clear(TERMINAL_CONTEXT_VARS);
+        let _detect = EnvGuard::clear(DETECT_ONLY_VARS);
         unsafe {
             std::env::set_var("KITTY_WINDOW_ID", "window-1");
             std::env::set_var("KITTY_LISTEN_ON", "unix:/tmp/kitty-test");
@@ -2104,6 +2209,7 @@ mod tests {
     #[serial]
     fn test_resolve_terminal_mode_for_tips_uses_normalized_auto_detected_mode() {
         let _env = EnvGuard::clear(TERMINAL_CONTEXT_VARS);
+        let _detect = EnvGuard::clear(DETECT_ONLY_VARS);
         unsafe {
             std::env::set_var("KITTY_WINDOW_ID", "window-1");
             std::env::set_var("KITTY_LISTEN_ON", "unix:/tmp/kitty-test");
@@ -2139,9 +2245,18 @@ mod tests {
         assert_eq!(info.kitty_listen_on, "unix:/tmp/kitty");
     }
 
+    fn ctx_with_script(script: &str) -> TerminalCommandContext<'_> {
+        TerminalCommandContext {
+            script,
+            ..TerminalCommandContext::default()
+        }
+    }
+
     #[test]
     fn test_parse_terminal_command_basic() {
-        let argv = parse_terminal_command("open -a Terminal {script}", "/tmp/test.sh", "").unwrap();
+        let argv =
+            parse_terminal_command("open -a Terminal {script}", ctx_with_script("/tmp/test.sh"))
+                .unwrap();
         assert_eq!(argv, vec!["open", "-a", "Terminal", "/tmp/test.sh"]);
     }
 
@@ -2224,15 +2339,20 @@ mod tests {
 
     #[test]
     fn test_parse_terminal_command_missing_placeholder() {
-        assert!(parse_terminal_command("open -a Terminal", "/tmp/test.sh", "").is_err());
+        assert!(
+            parse_terminal_command("open -a Terminal", ctx_with_script("/tmp/test.sh")).is_err()
+        );
     }
 
     #[test]
     fn test_parse_terminal_command_with_process_id() {
         let argv = parse_terminal_command(
             "tmux split -t {process_id} -- {script}",
-            "/tmp/test.sh",
-            "abc-123",
+            TerminalCommandContext {
+                script: "/tmp/test.sh",
+                process_id: "abc-123",
+                ..TerminalCommandContext::default()
+            },
         )
         .unwrap();
         assert_eq!(
@@ -2244,7 +2364,15 @@ mod tests {
     #[test]
     fn test_waveterm_preset_uses_run_separator() {
         let cmd = resolve_terminal_preset("waveterm").unwrap();
-        let argv = parse_terminal_command(&cmd, "/tmp/test.sh", "abc-123").unwrap();
+        let argv = parse_terminal_command(
+            &cmd,
+            TerminalCommandContext {
+                script: "/tmp/test.sh",
+                process_id: "abc-123",
+                ..TerminalCommandContext::default()
+            },
+        )
+        .unwrap();
         assert_eq!(argv, vec!["wsh", "run", "--", "bash", "/tmp/test.sh"]);
     }
 
@@ -2255,6 +2383,135 @@ mod tests {
             "block:abc123"
         );
         assert_eq!(normalize_captured_terminal_id("terminal_6"), "terminal_6");
+    }
+
+    #[test]
+    fn test_normalize_herdr_agent_start_json() {
+        let json = r#"{"id":"cli:agent:start","result":{"agent":{"agent_status":"unknown","cwd":"/tmp","focused":false,"name":"hcom-abc123","pane_id":"w123abc-3","revision":0,"tab_id":"w123abc:2","terminal_id":"term_abc","workspace_id":"w123abc"},"argv":["bash","/tmp/script.sh"],"type":"agent_started"}}"#;
+        assert_eq!(normalize_captured_terminal_id(json), "w123abc-3");
+    }
+
+    #[test]
+    fn test_normalize_herdr_error_json_falls_through() {
+        // Error JSON from herdr should not match (no result.agent.pane_id)
+        let json = r#"{"error":{"code":"server_unavailable","message":"herdr server not running"},"id":"cli:agent:start"}"#;
+        assert_eq!(normalize_captured_terminal_id(json), json);
+    }
+
+    #[test]
+    fn test_normalize_herdr_empty_pane_id() {
+        let json = r#"{"id":"cli:agent:start","result":{"agent":{"pane_id":""}}}"#;
+        assert_eq!(normalize_captured_terminal_id(json), json);
+    }
+
+    #[test]
+    fn test_herdr_preset_template_uses_stable_instance_name() {
+        // The herdr preset must launch with a stable agent name so
+        // `herdr agent send <name>` keeps working — the styled status label
+        // (`◉ luna [claude]`) is pushed separately via `pane.rename` from the
+        // delivery loop, not baked into the agent name.
+        let preset = crate::shared::terminal_presets::get_terminal_preset("herdr").unwrap();
+        assert!(preset.open.contains("{script}"));
+        assert!(preset.open.contains("{instance_name}"));
+        assert!(
+            !preset.open.contains("{pane_title}"),
+            "herdr preset must not use {{pane_title}} as agent name"
+        );
+        assert!(preset.open.contains("{cwd}"));
+        assert!(!preset.open.contains("{process_id}"));
+        assert_eq!(preset.binary, Some("herdr"));
+        assert!(preset.close.unwrap().contains("{id}"));
+    }
+
+    #[test]
+    fn test_parse_herdr_terminal_command_uses_pane_title() {
+        let cmd = "herdr agent start {pane_title} --cwd {cwd} --no-focus -- bash {script}";
+        let argv = parse_terminal_command(
+            cmd,
+            TerminalCommandContext {
+                script: "/tmp/test.sh",
+                process_id: "abc-123",
+                cwd: "/home/user/project",
+                instance_name: "luna",
+                tool: "claude",
+                pane_title: Some("\u{25c9} luna [claude]"),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            argv,
+            vec![
+                "herdr",
+                "agent",
+                "start",
+                "\u{25c9} luna [claude]",
+                "--cwd",
+                "/home/user/project",
+                "--no-focus",
+                "--",
+                "bash",
+                "/tmp/test.sh"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_terminal_command_pane_title_falls_back_to_instance_name() {
+        let argv = parse_terminal_command(
+            "herdr agent start {pane_title} -- bash {script}",
+            TerminalCommandContext {
+                script: "/tmp/test.sh",
+                instance_name: "abc-123",
+                tool: "codex",
+                ..TerminalCommandContext::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            argv,
+            vec![
+                "herdr",
+                "agent",
+                "start",
+                "abc-123",
+                "--",
+                "bash",
+                "/tmp/test.sh"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_terminal_command_cwd_placeholder() {
+        let argv = parse_terminal_command(
+            "myterm --dir {cwd} -- bash {script}",
+            TerminalCommandContext {
+                script: "/tmp/test.sh",
+                cwd: "/home/user",
+                ..TerminalCommandContext::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            argv,
+            vec![
+                "myterm",
+                "--dir",
+                "/home/user",
+                "--",
+                "bash",
+                "/tmp/test.sh"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_terminal_command_empty_cwd() {
+        // Templates without {cwd} should work with empty cwd
+        let argv =
+            parse_terminal_command("open -a Terminal {script}", ctx_with_script("/tmp/test.sh"))
+                .unwrap();
+        assert_eq!(argv, vec!["open", "-a", "Terminal", "/tmp/test.sh"]);
     }
 
     #[test]

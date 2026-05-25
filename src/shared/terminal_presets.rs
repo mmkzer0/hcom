@@ -338,6 +338,22 @@ pub static TERMINAL_PRESETS: LazyLock<Vec<(&'static str, TerminalPreset)>> = Laz
                 DL,
             ),
         ),
+        // Herdr workspace manager. `agent start <name>` sets both the herdr
+        // agent name AND the manual pane label, so we pass a stable
+        // `{instance_name}` here (e.g. `luna`) — that keeps `herdr agent send
+        // luna ...` working. The styled status label (`◉ luna [claude]`) is
+        // pushed separately via `pane.rename` from the delivery loop.
+        (
+            "herdr",
+            p(
+                Some("herdr"),
+                None,
+                "herdr agent start {instance_name} --cwd {cwd} --no-focus -- bash {script}",
+                Some("herdr pane close {id}"),
+                Some("HERDR_PANE_ID"),
+                DL,
+            ),
+        ),
     ]
 });
 
@@ -352,7 +368,9 @@ pub fn get_terminal_preset(name: &str) -> Option<&TerminalPreset> {
 /// Map environment variables to terminal presets for auto-detection.
 /// Used for same-terminal PTY launches to enable close-on-kill.
 pub const TERMINAL_ENV_MAP: &[(&str, &str)] = &[
-    // Multiplexers first — more specific than bare terminals (run inside them)
+    // Herdr — most specific, manages its own terminal panes
+    ("HERDR_PANE_ID", "herdr"),
+    // Multiplexers — more specific than bare terminals (run inside them)
     ("CMUX_WORKSPACE_ID", "cmux"),
     ("TMUX_PANE", "tmux-split"),
     ("ZELLIJ_PANE_ID", "zellij"),
@@ -377,7 +395,7 @@ mod tests {
 
     #[test]
     fn test_terminal_presets_count() {
-        assert_eq!(TERMINAL_PRESETS.len(), 27);
+        assert_eq!(TERMINAL_PRESETS.len(), 28);
     }
 
     #[test]

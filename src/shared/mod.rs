@@ -29,6 +29,7 @@ pub use constants::{
     SYSTEM_SENDER,
     // Functions
     extract_mentions,
+    format_pane_title,
     status_bg,
     status_fg,
     status_icon,

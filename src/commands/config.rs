@@ -1512,7 +1512,12 @@ pub fn terminal_help_text(show_current: bool) -> String {
         other => other,
     };
 
-    // Managed parents and their variants
+    // Managed parents and their variants. A preset is "managed" when it
+    // defines `close` — hcom can shut its agent window down on kill. The
+    // built-in list is hand-curated here for ordering and human-readable
+    // descriptions, but `is_managed_preset` below is the source of truth for
+    // section bucketing so a new managed preset never gets mis-listed under
+    // "Other (opens window only)".
     const MANAGED_PARENTS: &[(&str, &str)] = &[
         ("kitty", "auto split/tab/window"),
         ("wezterm", "auto tab/split/window"),
@@ -1520,6 +1525,7 @@ pub fn terminal_help_text(show_current: bool) -> String {
         ("cmux", "workspaces"),
         ("zellij", "panes"),
         ("waveterm", "blocks"),
+        ("herdr", "panes"),
     ];
     const MANAGED_VARIANTS: &[(&str, &[&str])] = &[
         ("kitty", &["kitty-window", "kitty-tab", "kitty-split"]),
@@ -1584,8 +1590,15 @@ pub fn terminal_help_text(show_current: bool) -> String {
 
     if show_current {
         let (current, source) = config_get("HCOM_TERMINAL");
-        if current.is_empty() {
-            lines.push("Current: default (auto-detect)".to_string());
+        if current.is_empty() || current == "default" {
+            // "default" is a sentinel meaning auto-detect; it isn't a preset,
+            // so don't run it through close-presence inference.
+            let suffix = if source == "default" {
+                String::new()
+            } else {
+                format!(" [{source}]")
+            };
+            lines.push(format!("Current: default (auto-detect){suffix}"));
         } else {
             let kind =
                 if crate::config::get_merged_preset(&current).is_some_and(|p| p.close.is_some()) {
@@ -1625,11 +1638,13 @@ pub fn terminal_help_text(show_current: bool) -> String {
         lines.push(format!("    {parent}: {}", variants.join(", ")));
     }
 
-    // Other (open-only, platform-filtered)
+    // Other (open-only, platform-filtered). Bucket by `close` presence rather
+    // than the hand-curated MANAGED_PARENTS list, so any built-in preset that
+    // grows a close command later doesn't silently land in the wrong section.
     lines.push(String::new());
     lines.push("Other (opens window only):".to_string());
     for (name, preset) in TERMINAL_PRESETS.iter() {
-        if all_managed.contains(name) {
+        if all_managed.contains(name) || preset.close.is_some() {
             continue;
         }
         if !preset.platforms.is_empty() && !preset.platforms.contains(&platform) {
@@ -1699,6 +1714,18 @@ pub fn terminal_help_text(show_current: bool) -> String {
     lines.push("  {process_id} = HCOM_PROCESS_ID for the launched agent".to_string());
     lines.push("  {pid}        = launched terminal process ID".to_string());
     lines.push("  {id}         = first line of stdout captured from the open command".to_string());
+    lines.push(
+        "                 (herdr `agent start` JSON is parsed for result.agent.pane_id)"
+            .to_string(),
+    );
+    lines.push("  {cwd}        = working directory the agent will start in".to_string());
+    lines.push("  {instance_name} = hcom instance name (e.g. \"luna\")".to_string());
+    lines.push("  {tool}          = tool label (e.g. \"claude\", \"codex\")".to_string());
+    lines.push(
+        "  {pane_title}    = pre-formatted label (\"\u{25c9} luna [claude]\"); falls back to"
+            .to_string(),
+    );
+    lines.push("                 {instance_name} when not set".to_string());
     lines.push(String::new());
     lines.push("Set:    hcom config terminal kitty".to_string());
     lines.push("Reset:  hcom config terminal default".to_string());
@@ -2168,6 +2195,18 @@ mod tests {
 
         assert!(managed.contains("cmux"));
         assert!(!other.contains("cmux"));
+    }
+
+    #[test]
+    fn test_terminal_help_text_documents_new_placeholders() {
+        // If you add a placeholder to parse_terminal_command, document it.
+        let help = terminal_help_text(false);
+        for placeholder in ["{instance_name}", "{tool}", "{cwd}", "{pane_title}"] {
+            assert!(
+                help.contains(placeholder),
+                "missing {placeholder} placeholder docs",
+            );
+        }
     }
 
     #[test]
