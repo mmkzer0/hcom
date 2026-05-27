@@ -781,6 +781,30 @@ fn launch_pty_or_background(
     }
 }
 
+/// Resolve a naming conflict for an explicit instance name.
+///
+/// - Name is free → Ok(()).
+/// - Name held by an inactive row → consume the row (delete) and return Ok(()).
+///   An inactive row is a resume handle from agy soft-finalize; launch will
+///   re-create a fresh row with the same name.
+/// - Name held by anything else (listening/active/blocked) → Err.
+fn resolve_explicit_name_conflict(db: &HcomDb, name: &str) -> Result<()> {
+    let Some(row) = db.get_instance(name).ok().flatten() else {
+        return Ok(());
+    };
+    let status = row.get("status").and_then(|v| v.as_str()).unwrap_or("");
+    if status == "inactive" {
+        db.delete_instance(name).map_err(|e| {
+            anyhow::anyhow!("Failed to clear inactive resume row '{}': {}", name, e)
+        })?;
+        return Ok(());
+    }
+    bail!(
+        "Instance '{}' already exists (stop it first or use a different name)",
+        name
+    );
+}
+
 /// Launch one or more AI tool instances with consistent tracking.
 ///
 /// This is the unified entry point for launching Claude, Gemini, Codex,
@@ -871,13 +895,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                 params.count
             );
         }
-        // Check if name is already in use by an active instance
-        if let Ok(Some(_)) = db.get_instance(name) {
-            bail!(
-                "Instance '{}' already exists (stop it first or use a different name)",
-                name
-            );
-        }
+        resolve_explicit_name_conflict(db, name)?;
     }
 
     // Tool args validation
@@ -945,7 +963,9 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                 params.args.push(full_prompt);
             }
             LaunchTool::Antigravity => {
-                // Antigravity: positional arg
+                // Antigravity: --prompt-interactive for interactive sessions
+                // (bare positional is not documented; agy --help shows -i/--prompt-interactive)
+                params.args.push("--prompt-interactive".to_string());
                 params.args.push(full_prompt);
             }
         }
@@ -1706,5 +1726,48 @@ mod tests {
             runner_env.get("ANTIGRAVITY_AGENT").map(String::as_str),
             Some("1")
         );
+    }
+
+    fn launcher_test_db() -> crate::db::HcomDb {
+        let db = crate::db::HcomDb::open_raw(std::path::Path::new(":memory:")).unwrap();
+        db.init_db().unwrap();
+        db
+    }
+
+    fn insert_test_instance(db: &crate::db::HcomDb, name: &str, status: &str) {
+        let now = chrono::Utc::now().timestamp() as f64;
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, created_at, tool) VALUES (?1, ?2, ?3, 'antigravity')",
+                rusqlite::params![name, status, now],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn resolve_explicit_name_conflict_allows_free_name() {
+        let db = launcher_test_db();
+        assert!(resolve_explicit_name_conflict(&db, "luna").is_ok());
+    }
+
+    #[test]
+    fn resolve_explicit_name_conflict_consumes_inactive_resume_row() {
+        let db = launcher_test_db();
+        insert_test_instance(&db, "zeno", "inactive");
+        assert!(resolve_explicit_name_conflict(&db, "zeno").is_ok());
+        // Row must be gone so the launcher can create a fresh row with the same name.
+        assert!(db.get_instance("zeno").unwrap().is_none());
+    }
+
+    #[test]
+    fn resolve_explicit_name_conflict_rejects_active_row() {
+        let db = launcher_test_db();
+        insert_test_instance(&db, "rune", "listening");
+        let err = resolve_explicit_name_conflict(&db, "rune")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("already exists"), "unexpected: {err}");
+        // Row should still be present — no deletion on conflict.
+        assert!(db.get_instance("rune").unwrap().is_some());
     }
 }

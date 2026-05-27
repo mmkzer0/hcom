@@ -53,7 +53,7 @@ fn first_non_empty_line(text: &str) -> Option<&str> {
 ///   gemini: `-i "prompt"` (interactive only, headless not supported)
 ///   codex:  bare positional (interactive)
 ///   opencode: `--prompt "prompt"`
-///   antigravity: bare positional (same as launcher)
+///   antigravity: `--prompt-interactive "prompt"` (agy's documented interactive flag)
 ///
 /// Always includes `--no-run-here` so the launcher opens a new terminal window/tab
 /// instead of running the agent in the TUI's own terminal (which would cause the
@@ -94,7 +94,8 @@ pub fn build_launch_argv(
                 argv.extend(["--prompt".into(), prompt.into()]);
             }
             Tool::Antigravity => {
-                argv.push(prompt.into());
+                // agy uses --prompt-interactive for interactive initial prompts
+                argv.extend(["--prompt-interactive".into(), prompt.into()]);
             }
             Tool::Adhoc => {}
         }
@@ -198,7 +199,7 @@ mod tests {
     }
 
     #[test]
-    fn launch_argv_antigravity_prompt_is_positional() {
+    fn launch_argv_antigravity_prompt_uses_prompt_interactive() {
         let argv = build_launch_argv(Tool::Antigravity, 1, "", false, "kitty", "review agy");
         assert_eq!(
             argv,
@@ -208,6 +209,7 @@ mod tests {
                 "--no-run-here",
                 "--terminal",
                 "kitty",
+                "--prompt-interactive",
                 "review agy"
             ]
         );
