@@ -181,6 +181,10 @@ pub struct PreparedDelivery {
 pub(crate) struct GeminiFamilyLifecycleOpts {
     /// BeforeAgent only: return wake-only context when agy has no pending messages.
     pub allow_wake_no_pending: bool,
+    /// Set instance status to active/prompt when there are no pending messages.
+    /// Should be true only for BeforeAgent; false for AfterTool (which fires mid-turn
+    /// after every tool call and must not overwrite the current in-progress status).
+    pub set_status_on_empty: bool,
 }
 
 /// Combined lifecycle hook text + optional deferred ack / early wake-only return.
@@ -228,7 +232,7 @@ pub(crate) fn assemble_gemini_family_lifecycle_outputs(
         if let Some(prepared) = prepare_pending_messages(db, instance_name) {
             parts.push(prepared.formatted);
             delivery_ack = Some(prepared.ack);
-        } else {
+        } else if opts.set_status_on_empty {
             lifecycle::set_status(db, instance_name, ST_ACTIVE, "prompt", Default::default());
         }
     }

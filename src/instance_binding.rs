@@ -450,7 +450,7 @@ pub fn bind_session_to_process(
         return Some(canonical_name.clone());
     }
 
-    // Path 1b: session_bindings CASCADE'd on delete — recover canonical name from life.stopped
+    // Path 2: session_bindings CASCADE'd on delete — recover canonical name from life.stopped
     if canonical.is_none()
         && let Ok(Some(stopped_name)) = db.find_stopped_instance_by_session_id(session_id)
     {
@@ -487,7 +487,7 @@ pub fn bind_session_to_process(
         return Some(stopped_name);
     }
 
-    // Path 2: No canonical, but placeholder exists — bind session to placeholder
+    // Path 3: No canonical, but placeholder exists — bind session to placeholder
     if let Some(ref ph_name) = placeholder_name {
         crate::log::log_info(
             "binding",

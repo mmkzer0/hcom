@@ -250,6 +250,26 @@ fn bind_pending_antigravity_instance(db: &HcomDb, payload: &HookPayload) -> Opti
     )
 }
 
+/// Resolve the directory value to record on this hook fire.
+///
+/// For antigravity, `ctx.cwd` is agy's internal config dir (~/.gemini/...), not
+/// the user's project. Prefer agy's own `workspacePaths[0]` from stdin instead.
+/// Returns None when no reliable directory is available — callers should leave
+/// the existing `instances.directory` field untouched rather than clobber it
+/// with agy's internal cwd (otherwise resume launches in the wrong folder).
+fn resolve_hook_directory(payload: &HookPayload, ctx: &HcomContext) -> Option<String> {
+    if payload.tool == "antigravity" {
+        return payload
+            .raw
+            .get("workspacePaths")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| arr.iter().find_map(|v| v.as_str()))
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+    }
+    Some(ctx.cwd.to_string_lossy().to_string())
+}
+
 /// Handle Gemini SessionStart hook.
 ///
 /// HCOM-launched: bind session_id, inject bootstrap if not announced.
@@ -298,17 +318,24 @@ fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) ->
         Some(name) => name,
         None => {
             if let Some(ref pid) = ctx.process_id {
+                // Preserve the actual tool identity: agy reuses the gemini hook
+                // family but must not be recorded as "gemini" in the instance row.
+                let orphan_tool = if ctx.is_antigravity {
+                    "antigravity"
+                } else {
+                    "gemini"
+                };
                 match instance_binding::create_orphaned_pty_identity(
                     db,
                     session_id,
                     Some(pid.as_str()),
-                    "gemini",
+                    orphan_tool,
                 ) {
                     Some(name) => {
                         log::log_info(
                             "hooks",
                             "gemini.sessionstart.orphan_created",
-                            &format!("instance={} process_id={}", name, pid),
+                            &format!("instance={} process_id={} tool={}", name, pid, orphan_tool),
                         );
                         name
                     }
@@ -322,18 +349,35 @@ fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) ->
 
     let _ = db.rebind_instance_session(&instance_name, session_id);
 
+    // agy fires PreInvocation per turn, not just at process start. Once the instance
+    // is bootstrapped on the same session, skip the setup side-effects below:
+    // re-running set_status("listening","start") mid-turn would briefly clobber an
+    // in-progress delivery status (e.g. "active:deliver:sender") set by the previous
+    // turn boundary. Bootstrap injection is already guarded by inject_bootstrap_once.
+    let already_bootstrapped = db
+        .get_instance_full(&instance_name)
+        .ok()
+        .flatten()
+        .is_some_and(|inst| {
+            inst.name_announced != 0 && inst.session_id.as_deref() == Some(session_id)
+        });
+    if already_bootstrapped {
+        return hook_noop();
+    }
+
     // Capture launch context
     instance_binding::capture_and_store_launch_context(db, &instance_name);
 
     let mut updates = serde_json::Map::new();
-    updates.insert(
-        "directory".into(),
-        Value::String(ctx.cwd.to_string_lossy().to_string()),
-    );
+    if let Some(dir) = resolve_hook_directory(payload, ctx) {
+        updates.insert("directory".into(), Value::String(dir));
+    }
     if let Some(ref tp) = payload.transcript_path {
         updates.insert("transcript_path".into(), Value::String(tp.clone()));
     }
-    instances::update_instance_position(db, &instance_name, &updates);
+    if !updates.is_empty() {
+        instances::update_instance_position(db, &instance_name, &updates);
+    }
     lifecycle::set_status(
         db,
         &instance_name,
@@ -377,13 +421,13 @@ fn handle_beforeagent(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> 
 
     let instance_name = &instance.name;
 
-    // Keep directory current
-    let mut dir_updates = serde_json::Map::new();
-    dir_updates.insert(
-        "directory".into(),
-        Value::String(ctx.cwd.to_string_lossy().to_string()),
-    );
-    instances::update_instance_position(db, instance_name, &dir_updates);
+    // Keep directory current — but for agy, prefer workspacePaths over the
+    // hook subprocess cwd (which is agy's internal config dir, not the project).
+    if let Some(dir) = resolve_hook_directory(payload, ctx) {
+        let mut dir_updates = serde_json::Map::new();
+        dir_updates.insert("directory".into(), Value::String(dir));
+        instances::update_instance_position(db, instance_name, &dir_updates);
+    }
 
     // Bind session_id if instance doesn't have one (fresh instance after /clear)
     if instance.session_id.is_none()
@@ -425,6 +469,7 @@ fn handle_beforeagent(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> 
         is_agy,
         common::GeminiFamilyLifecycleOpts {
             allow_wake_no_pending: true,
+            set_status_on_empty: true,
         },
     );
 
@@ -533,6 +578,7 @@ fn handle_aftertool(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> Ho
         is_agy,
         common::GeminiFamilyLifecycleOpts {
             allow_wake_no_pending: false,
+            set_status_on_empty: false,
         },
     );
 
@@ -569,7 +615,7 @@ fn handle_notification(db: &HcomDb, _ctx: &HcomContext, payload: &HookPayload) -
 }
 
 /// Handle SessionEnd hook - fires when a session ends.
-fn handle_sessionend(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> HookResult {
+fn handle_sessionend(db: &HcomDb, _ctx: &HcomContext, payload: &HookPayload) -> HookResult {
     let instance = match resolve_instance_gemini(db, payload) {
         Some(inst) => inst,
         None => return hook_noop(),
@@ -595,7 +641,10 @@ fn handle_sessionend(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> H
         return hook_noop();
     }
 
-    if ctx.is_launched && is_agy {
+    // agy always soft-finalizes: the instance row is the only resume handle for both
+    // launched and adhoc agy (hcom r reads it). Hard-deleting it would strand adhoc
+    // agy sessions that were bound via bind_pending_antigravity_instance.
+    if is_agy {
         common::soft_finalize_session(db, &instance.name, &reason, None);
     } else {
         common::finalize_session(db, &instance.name, &reason, None);

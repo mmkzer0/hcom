@@ -74,30 +74,33 @@ pub fn get_antigravity_hooks_path() -> PathBuf {
 }
 
 /// Shell wrapper for a single hcom hook subcommand (`gemini-beforeagent`, etc.).
-fn hook_sh_cmd(hcom_cmd: &str, subcmd: &str) -> String {
+///
+/// `fallback_json` is echoed to stdout when hcom is missing, before exiting 0.
+/// agy requires a `decision` JSON response on PreToolUse and Stop; PostToolUse and
+/// PostInvocation accept an empty body.
+///
+/// The fallback is delivered base64-encoded and piped through `base64 -d` so the
+/// JSON's quotes (and any apostrophes) survive the nested `sh -c '...'` pass —
+/// naive interpolation gets stripped or mis-tokenized by the inner shell.
+fn hook_sh_cmd(hcom_cmd: &str, subcmd: &str, fallback_json: &str) -> String {
     let bin = hcom_cmd.split_whitespace().next().unwrap_or("hcom");
-    format!(
-        "sh -c 'command -v {bin} >/dev/null 2>&1 && ANTIGRAVITY_AGENT=1 exec {hcom_cmd} {subcmd} || exit 0'"
-    )
+    if fallback_json.is_empty() {
+        format!(
+            "sh -c 'command -v {bin} >/dev/null 2>&1 && ANTIGRAVITY_AGENT=1 exec {hcom_cmd} {subcmd} || exit 0'"
+        )
+    } else {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(fallback_json.as_bytes());
+        format!(
+            "sh -c 'command -v {bin} >/dev/null 2>&1 && ANTIGRAVITY_AGENT=1 exec {hcom_cmd} {subcmd} || {{ printf %s {b64} | base64 -d; exit 0; }}'"
+        )
+    }
 }
 
-/// Substring present in sessionstart + Stop lockfile shell (verify tests).
-pub(crate) const AGY_SESSION_LOCK_MARK: &str = "agy-session-";
-
-/// PreInvocation sessionstart: once per agy process via lockfile; DB binding is authoritative.
+/// PreInvocation sessionstart: invoke hcom; idempotent via `name_announced`
+/// (bootstrap injection no-ops after first run, so re-firing per turn is safe).
 fn hook_sessionstart_cmd(hcom_cmd: &str) -> String {
-    let bin = hcom_cmd.split_whitespace().next().unwrap_or("hcom");
-    format!(
-        "sh -c 'parent_pid=$(ps -o ppid= -p $$ 2>/dev/null | tr -d \"[:space:]\"); lock=/tmp/{}${{parent_pid}}.lock; if [ -n \"$parent_pid\" ] && mkdir \"$lock\" 2>/dev/null; then command -v {bin} >/dev/null 2>&1 && ANTIGRAVITY_AGENT=1 exec {hcom_cmd} gemini-sessionstart || {{ rmdir \"$lock\" 2>/dev/null; exit 0; }}; fi'",
-        AGY_SESSION_LOCK_MARK
-    )
-}
-
-fn hook_lockfile_cleanup_cmd() -> String {
-    format!(
-        "sh -c 'parent_pid=$(ps -o ppid= -p $$ 2>/dev/null | tr -d \"[:space:]\"); lock=/tmp/{}${{parent_pid}}.lock; [ -n \"$parent_pid\" ] && {{ rmdir \"$lock\" 2>/dev/null || rm -f \"$lock\" 2>/dev/null || true; }} || true'",
-        AGY_SESSION_LOCK_MARK
-    )
+    hook_sh_cmd(hcom_cmd, "gemini-sessionstart", "")
 }
 
 /// Try to set up Antigravity hooks in `hooks.json`.
@@ -133,20 +136,31 @@ pub fn try_setup_antigravity_hooks(include_permissions: bool) -> Result<(), Setu
 
     let hcom_cmd = crate::runtime_env::build_hcom_command();
 
+    // Fallback JSON constants for hooks where agy requires a decision response when
+    // hcom is missing. PreToolUse needs `{"decision":"allow"}`; Stop needs a decision
+    // field where any value other than "continue" allows the stop. PostToolUse and the
+    // *Invocation lifecycle hooks accept an empty body.
+    const ALLOW_JSON: &str = "{\"decision\":\"allow\"}";
+
+    // 15s timeout: agy default is 30s; 5s was tight under cold-start + busy sqlite
+    // on slower machines / CI. 15s leaves margin without leaving a stuck hook
+    // blocking the agent turn for half a minute.
+    const HOOK_TIMEOUT_SEC: u64 = 15;
+
     let hcom_lifecycle = json!({
         "PreInvocation": [
             {
                 "name": "hcom-sessionstart",
                 "type": "command",
                 "command": hook_sessionstart_cmd(&hcom_cmd),
-                "timeout": 5000,
+                "timeout": HOOK_TIMEOUT_SEC,
                 "description": "Initialize hcom session"
             },
             {
                 "name": "hcom-beforeagent",
                 "type": "command",
-                "command": hook_sh_cmd(&hcom_cmd, "gemini-beforeagent"),
-                "timeout": 5000,
+                "command": hook_sh_cmd(&hcom_cmd, "gemini-beforeagent", ""),
+                "timeout": HOOK_TIMEOUT_SEC,
                 "description": "Deliver pending messages"
             }
         ],
@@ -154,32 +168,18 @@ pub fn try_setup_antigravity_hooks(include_permissions: bool) -> Result<(), Setu
             {
                 "name": "hcom-afteragent",
                 "type": "command",
-                "command": hook_sh_cmd(&hcom_cmd, "gemini-afteragent"),
-                "timeout": 5000,
+                "command": hook_sh_cmd(&hcom_cmd, "gemini-afteragent", ""),
+                "timeout": HOOK_TIMEOUT_SEC,
                 "description": "Signal ready for messages"
             }
         ],
         "Stop": [
             {
-                "name": "hcom-partner-teardown",
-                "type": "command",
-                "command": hook_sh_cmd(&hcom_cmd, "run partner-teardown"),
-                "timeout": 5000,
-                "description": "Teardown partner session"
-            },
-            {
                 "name": "hcom-sessionend",
                 "type": "command",
-                "command": hook_sh_cmd(&hcom_cmd, "gemini-sessionend"),
-                "timeout": 5000,
+                "command": hook_sh_cmd(&hcom_cmd, "gemini-sessionend", ALLOW_JSON),
+                "timeout": HOOK_TIMEOUT_SEC,
                 "description": "Disconnect from hcom"
-            },
-            {
-                "name": "hcom-lockfile-cleanup",
-                "type": "command",
-                "command": hook_lockfile_cleanup_cmd(),
-                "timeout": 5000,
-                "description": "Clean up session lockfile"
             }
         ],
         "PreToolUse": [
@@ -189,8 +189,8 @@ pub fn try_setup_antigravity_hooks(include_permissions: bool) -> Result<(), Setu
                     {
                         "name": "hcom-beforetool",
                         "type": "command",
-                        "command": hook_sh_cmd(&hcom_cmd, "gemini-beforetool"),
-                        "timeout": 5000,
+                        "command": hook_sh_cmd(&hcom_cmd, "gemini-beforetool", ALLOW_JSON),
+                        "timeout": HOOK_TIMEOUT_SEC,
                         "description": "Track tool execution"
                     }
                 ]
@@ -203,8 +203,8 @@ pub fn try_setup_antigravity_hooks(include_permissions: bool) -> Result<(), Setu
                     {
                         "name": "hcom-aftertool",
                         "type": "command",
-                        "command": hook_sh_cmd(&hcom_cmd, "gemini-aftertool"),
-                        "timeout": 5000,
+                        "command": hook_sh_cmd(&hcom_cmd, "gemini-aftertool", ""),
+                        "timeout": HOOK_TIMEOUT_SEC,
                         "description": "Deliver messages after tools"
                     }
                 ]
@@ -247,9 +247,23 @@ pub fn verify_antigravity_hooks_installed(check_permissions: bool) -> bool {
     verify_hooks_at(&get_antigravity_hooks_path(), check_permissions).is_ok()
 }
 
-/// Cleanly remove the `"hcom-lifecycle"` group key from `hooks.json`.
-/// Preserves other keys, and removes the file if no other keys remain.
+/// Cleanly remove the `"hcom-lifecycle"` group key from `hooks.json` and
+/// strip hcom permission rules from `~/.gemini/antigravity-cli/settings.json`.
+/// Preserves other hooks.json keys, and removes the file if no other keys remain.
+///
+/// Returns true only when BOTH the hooks cleanup and the permission cleanup
+/// succeed. Permission cleanup is attempted unconditionally \u2014 even when
+/// hooks.json is missing, unreadable, or invalid \u2014 so a partially broken
+/// install does not leave stale `command(hcom ...)` allow-rules behind.
 pub fn remove_antigravity_hooks() -> bool {
+    let hooks_ok = remove_hooks_lifecycle_block();
+    let perms_ok = remove_antigravity_permissions();
+    hooks_ok && perms_ok
+}
+
+/// Strip just the `"hcom-lifecycle"` block from hooks.json. Returns true on
+/// success, including the "file absent" case. Does not touch permissions.
+fn remove_hooks_lifecycle_block() -> bool {
     let path = get_antigravity_hooks_path();
     if !path.exists() {
         return true;
@@ -268,19 +282,13 @@ pub fn remove_antigravity_hooks() -> bool {
     };
     obj.remove("hcom-lifecycle");
     if obj.is_empty() {
-        if std::fs::remove_file(&path).is_err() {
-            return false;
-        }
-    } else {
-        let json_str = match serde_json::to_string_pretty(&Value::Object(obj.clone())) {
-            Ok(s) => s,
-            Err(_) => return false,
-        };
-        if crate::paths::atomic_write_io(&path, &json_str).is_err() {
-            return false;
-        }
+        return std::fs::remove_file(&path).is_ok();
     }
-    true
+    let json_str = match serde_json::to_string_pretty(&Value::Object(obj.clone())) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    crate::paths::atomic_write_io(&path, &json_str).is_ok()
 }
 
 fn verify_hooks_at(path: &Path, check_permissions: bool) -> Result<(), VerifyFailReason> {
@@ -336,10 +344,7 @@ fn verify_hooks_at(path: &Path, check_permissions: bool) -> Result<(), VerifyFai
                     "PreInvocation".to_string(),
                 ));
             }
-            if !command.contains("gemini-sessionstart")
-                || !command.contains(AGY_SESSION_LOCK_MARK)
-                || !command.contains("parent_pid=")
-            {
+            if !command.contains("gemini-sessionstart") {
                 return Err(VerifyFailReason::HookCommandMissing {
                     event: "PreInvocation".to_string(),
                     cmd_suffix: "gemini-sessionstart".to_string(),
@@ -429,9 +434,7 @@ fn verify_hooks_at(path: &Path, check_permissions: bool) -> Result<(), VerifyFai
         .get("Stop")
         .and_then(|v| v.as_array())
         .ok_or_else(|| VerifyFailReason::HookEventMissing("Stop".to_string()))?;
-    let mut found_partner_teardown = false;
     let mut found_sessionend = false;
-    let mut found_lockfile_cleanup = false;
     for hook in stop {
         let hook_obj = hook
             .as_object()
@@ -454,18 +457,7 @@ fn verify_hooks_at(path: &Path, check_permissions: bool) -> Result<(), VerifyFai
             });
         }
 
-        if name == "hcom-partner-teardown" {
-            if found_partner_teardown {
-                return Err(VerifyFailReason::HookDuplicated("Stop".to_string()));
-            }
-            if !command.contains("partner-teardown") {
-                return Err(VerifyFailReason::HookCommandMissing {
-                    event: "Stop".to_string(),
-                    cmd_suffix: "partner-teardown".to_string(),
-                });
-            }
-            found_partner_teardown = true;
-        } else if name == "hcom-sessionend" {
+        if name == "hcom-sessionend" {
             if found_sessionend {
                 return Err(VerifyFailReason::HookDuplicated("Stop".to_string()));
             }
@@ -476,35 +468,12 @@ fn verify_hooks_at(path: &Path, check_permissions: bool) -> Result<(), VerifyFai
                 });
             }
             found_sessionend = true;
-        } else if name == "hcom-lockfile-cleanup" {
-            if found_lockfile_cleanup {
-                return Err(VerifyFailReason::HookDuplicated("Stop".to_string()));
-            }
-            if !command.contains(AGY_SESSION_LOCK_MARK) || !command.contains("parent_pid=") {
-                return Err(VerifyFailReason::HookCommandMissing {
-                    event: "Stop".to_string(),
-                    cmd_suffix: "agy-session lockfile cleanup".to_string(),
-                });
-            }
-            found_lockfile_cleanup = true;
         }
-    }
-    if !found_partner_teardown {
-        return Err(VerifyFailReason::HookCommandMissing {
-            event: "Stop".to_string(),
-            cmd_suffix: "partner-teardown".to_string(),
-        });
     }
     if !found_sessionend {
         return Err(VerifyFailReason::HookCommandMissing {
             event: "Stop".to_string(),
             cmd_suffix: "gemini-sessionend".to_string(),
-        });
-    }
-    if !found_lockfile_cleanup {
-        return Err(VerifyFailReason::HookCommandMissing {
-            event: "Stop".to_string(),
-            cmd_suffix: "agy-session lockfile cleanup".to_string(),
         });
     }
 
@@ -956,6 +925,53 @@ mod tests {
 
     #[test]
     #[serial]
+    fn test_remove_also_strips_hcom_permissions() {
+        let (_dir, test_home, _hooks_path, _guard) = antigravity_test_env();
+
+        // Install hooks WITH permissions
+        try_setup_antigravity_hooks(true).unwrap();
+        assert!(verify_antigravity_hooks_installed(true));
+
+        // Check permissions were written
+        let settings_path = test_home
+            .join(".gemini")
+            .join("antigravity-cli")
+            .join("settings.json");
+        assert!(
+            settings_path.exists(),
+            "settings.json should exist after install"
+        );
+        let content = std::fs::read_to_string(&settings_path).unwrap();
+        let val: Value = serde_json::from_str(&content).unwrap();
+        let allow = val["permissions"]["allow"].as_array().unwrap();
+        assert!(
+            !allow.is_empty(),
+            "hcom rules should be present after install"
+        );
+
+        // Remove hooks — should also strip hcom permissions
+        assert!(remove_antigravity_hooks());
+
+        // Permissions should now be gone
+        if settings_path.exists() {
+            let content2 = std::fs::read_to_string(&settings_path).unwrap();
+            let val2: Value = serde_json::from_str(&content2).unwrap();
+            // permissions key should be absent, or allow should not contain hcom rules
+            let has_hcom_rules = val2
+                .get("permissions")
+                .and_then(|p| p.get("allow"))
+                .and_then(|a| a.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .any(|v| v.as_str().is_some_and(|s| s.contains("hcom")))
+                })
+                .unwrap_or(false);
+            assert!(!has_hcom_rules, "hcom permission rules should be removed");
+        }
+    }
+
+    #[test]
+    #[serial]
     fn test_verify_detects_missing_hooks() {
         let (_dir, _test_home, _hooks_path, _guard) = antigravity_test_env();
         // File doesn't exist
@@ -964,7 +980,7 @@ mod tests {
 
     #[test]
     fn test_hook_sh_cmd_includes_subcmd_and_hcom() {
-        let cmd = hook_sh_cmd("hcom gemini-beforeagent", "gemini-beforeagent");
+        let cmd = hook_sh_cmd("hcom gemini-beforeagent", "gemini-beforeagent", "");
         assert!(cmd.contains("gemini-beforeagent"));
         assert!(cmd.contains("command -v hcom"));
         assert!(cmd.contains("ANTIGRAVITY_AGENT=1"));
@@ -972,20 +988,80 @@ mod tests {
     }
 
     #[test]
-    fn test_sessionstart_uses_atomic_lock_and_env() {
-        let cmd = hook_sessionstart_cmd("hcom");
-        assert!(cmd.contains("mkdir \"$lock\""));
-        assert!(cmd.contains("ANTIGRAVITY_AGENT=1"));
-        assert!(!cmd.contains("[ ! -f \"$lock\" ]"));
-        assert!(!cmd.contains("touch \"$lock\""));
+    fn test_hook_sh_cmd_with_fallback_uses_base64_pipeline() {
+        let cmd = hook_sh_cmd("hcom", "gemini-beforetool", "{\"decision\":\"allow\"}");
+        assert!(cmd.contains("gemini-beforetool"));
+        assert!(cmd.contains("base64 -d"));
     }
 
     #[test]
-    fn test_lockfile_cleanup_removes_directory_lock_shape() {
-        let cmd = hook_lockfile_cleanup_cmd();
-        assert!(cmd.contains("rmdir \"$lock\""));
-        assert!(cmd.contains("rm -f \"$lock\""));
-        assert!(cmd.find("rmdir \"$lock\"").unwrap() < cmd.find("rm -f \"$lock\"").unwrap());
+    fn test_hook_sh_cmd_without_fallback_exits_zero_only() {
+        let cmd = hook_sh_cmd("hcom", "gemini-afteragent", "");
+        // no printf/echo when fallback is empty
+        assert!(!cmd.contains("printf"));
+        assert!(!cmd.contains("base64"));
+        assert!(cmd.contains("exit 0"));
+    }
+
+    /// Actually execute the generated command with a missing binary and confirm
+    /// the fallback JSON survives the inner shell pass (no quote stripping).
+    #[cfg(unix)]
+    #[test]
+    fn test_hook_sh_cmd_fallback_emits_valid_json_when_bin_missing() {
+        use std::process::Command;
+        // Reference an obviously-missing binary so the `||` fallback branch fires.
+        let cmd = hook_sh_cmd(
+            "definitely_missing_hcom_xyz123",
+            "gemini-beforetool",
+            "{\"decision\":\"allow\"}",
+        );
+        let out = Command::new("sh").arg("-c").arg(&cmd).output().unwrap();
+        assert!(
+            out.status.success(),
+            "shell exited non-zero: {:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+            panic!("fallback stdout is not valid JSON: stdout={stdout:?} err={e}")
+        });
+        assert_eq!(
+            parsed.get("decision").and_then(|v| v.as_str()),
+            Some("allow")
+        );
+    }
+
+    /// Same but with an apostrophe in the fallback to exercise the inner-quote escape.
+    #[cfg(unix)]
+    #[test]
+    fn test_hook_sh_cmd_fallback_handles_apostrophe_in_payload() {
+        use std::process::Command;
+        let payload = "{\"reason\":\"don't allow\"}";
+        let cmd = hook_sh_cmd(
+            "definitely_missing_hcom_xyz123",
+            "gemini-beforetool",
+            payload,
+        );
+        let out = Command::new("sh").arg("-c").arg(&cmd).output().unwrap();
+        assert!(out.status.success());
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+            panic!("fallback stdout is not valid JSON: stdout={stdout:?} err={e}")
+        });
+        assert_eq!(
+            parsed.get("reason").and_then(|v| v.as_str()),
+            Some("don't allow")
+        );
+    }
+
+    #[test]
+    fn test_sessionstart_cmd_invokes_hcom_with_env() {
+        let cmd = hook_sessionstart_cmd("hcom");
+        assert!(cmd.contains("gemini-sessionstart"));
+        assert!(cmd.contains("ANTIGRAVITY_AGENT=1"));
+        // Lockfile machinery removed — sessionstart is idempotent via name_announced.
+        assert!(!cmd.contains("mkdir"));
+        assert!(!cmd.contains("parent_pid="));
     }
 
     #[test]
