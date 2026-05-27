@@ -1107,17 +1107,27 @@ fn test_relay_roundtrip() {
         "  OK: marker consumed from input after enter; both inject RPCs ok=true"
     );
 
-    // ── Phase 10: real send+reply, then remote transcript ────────
+    // ── Phase 10: real send+reply round-trip via relay ───────────
     logln!(
         log,
-        "\n[Phase 10] Device A: send real question and verify reply via transcript..."
+        "\n[Phase 10] Device A: send real question and verify reply event via relay..."
     );
 
     let question = "Reply with exactly the single word PONG then stop.";
+
+    // Watermark Device A's events so we only count relayed replies that
+    // arrive AFTER the question goes out.
+    let pre_send_event_a = last_event_id(&path_a);
+
+    // Send from bigboss (`-b`) rather than a synthetic `--from` label.
+    // `--from <name>` is a CLI-only sender stamp with no return route on
+    // the receiving device — the receiver sees `name:DEVICE` but can't
+    // address it back, so the reply dead-ends locally. bigboss is the
+    // one universally-addressable target; the agent's system prompt
+    // ("Prioritize @bigboss") makes the reply land cleanly, and bigboss
+    // messages relay back like any other event.
     let send_out = hcom_with_dir(
-        &format!(
-            "send @{launched_name}:{short_b} --from relaytest --intent request -- \"{question}\""
-        ),
+        &format!("send -b @{launched_name}:{short_b} --intent request -- \"{question}\""),
         &path_a,
     );
     assert!(
@@ -1125,15 +1135,12 @@ fn test_relay_roundtrip() {
         "hcom send failed: {}",
         String::from_utf8_lossy(&send_out.stderr)
     );
-    logln!(log, "  OK: sent question to @{launched_name}:{short_b}");
+    logln!(
+        log,
+        "  OK: sent question from bigboss to @{launched_name}:{short_b}"
+    );
 
-    // Wait for the instance to process the message: status goes active
-    // (while claude is thinking) then back to listening. We can't rely on
-    // a reply message event — claude's hcom-send back to the sender fails
-    // when the sender lives on another device (@short_id isn't a known
-    // local agent on Device B). Instead we wait for the status round-trip
-    // and then inspect the transcript, which the task brief specifically
-    // allows as the OR path.
+    // Step 1: Device B's claude received and processed (status round-trip).
     poll_until(
         || {
             let out = hcom_with_dir(
@@ -1153,7 +1160,7 @@ fn test_relay_roundtrip() {
                 let data = &ev["data"];
                 let ctx = data["context"].as_str().unwrap_or("");
                 let status = data["status"].as_str().unwrap_or("");
-                if ctx.starts_with("deliver:relaytest") {
+                if ctx.starts_with("deliver:bigboss") {
                     saw_delivery = true;
                     continue;
                 }
@@ -1176,52 +1183,64 @@ fn test_relay_roundtrip() {
         "  OK: {launched_name} processed the message and returned to listening"
     );
 
-    // Device A's worker has likely auto-exited during the long wait above
-    // (watchdog exits after ~60s with no local instances). Re-arm before
-    // the transcript RPC.
+    // Device A's worker may have auto-exited during the long status wait
+    // (watchdog exits after ~60s with no local instances). Re-arm so the
+    // PONG reply event can land here.
     ensure_relay_worker(&path_a);
 
-    // Remote transcript: must contain PONG. Claude's response is in the
-    // session JSONL, rendered by render_instance_transcript. We also verify
-    // the incoming question landed via the deliver event above.
-    let mut last_seen_len = 0usize;
-    let tx_content: String = poll_until(
+    // Step 2: the real round-trip — claude's PONG reply must reach
+    // Device A as a relayed message event with `from = nara:TAMA`.
+    // This proves the event actually traversed the relay, not just that
+    // claude wrote something locally on Device B.
+    let expected_from = format!("{launched_name}:{short_b}");
+    let mut last_log_count = 0usize;
+    let pong_event = poll_until(
         || {
-            let transcript_out = hcom_with_dir(
-                &format!("transcript {remote_name} --last 5 --full"),
-                &path_a,
-            );
-            if !transcript_out.status.success() {
+            let out = hcom_with_dir("events --type message --last 50", &path_a);
+            if !out.status.success() {
                 return None;
             }
-            let rpc = poll_rpc_result_on_device(&path_b, "transcript");
-            if rpc["ok"].as_bool() != Some(true) {
-                return None;
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let mut new_count = 0usize;
+            for line in stdout.lines() {
+                let ev: serde_json::Value = match serde_json::from_str(line.trim()) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let id = ev["id"].as_i64().unwrap_or(0);
+                if id <= pre_send_event_a {
+                    continue;
+                }
+                new_count += 1;
+                let mut data = ev["data"].clone();
+                if let Some(s) = data.as_str()
+                    && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s)
+                {
+                    data = parsed;
+                }
+                let from = data["from"].as_str().unwrap_or("");
+                let text = data["text"].as_str().unwrap_or("");
+                if from == expected_from && text.to_uppercase().contains("PONG") {
+                    return Some(ev);
+                }
             }
-            let content = rpc["result"]["content"].as_str().unwrap_or("").to_string();
-            if content.to_uppercase().contains("PONG") {
-                return Some(content);
-            }
-            if content.len() != last_seen_len {
-                last_seen_len = content.len();
-                eprintln!("    transcript now {} bytes, no PONG yet", content.len());
+            if new_count != last_log_count {
+                last_log_count = new_count;
+                eprintln!(
+                    "    {new_count} new message events on A, none from {expected_from} with PONG yet"
+                );
             }
             None
         },
-        "remote transcript contains PONG",
-        Duration::from_secs(60),
+        &format!("Device A receives PONG reply event from {expected_from}"),
+        Duration::from_secs(90),
         Duration::from_secs(2),
     );
     logln!(
         log,
-        "  OK: remote transcript contains PONG reply ({} bytes). \
-         Incoming question already verified via deliver:relaytest status event.",
-        tx_content.len()
+        "  OK: Device A received PONG reply event (id={}, from={expected_from})",
+        pong_event["id"].as_i64().unwrap_or(0)
     );
-    // The original question came from Device A via relay; it's recorded as
-    // a delivered message event on Device B (verified by the deliver:relaytest
-    // context assertion in the status round-trip above). Claude's session
-    // JSONL reflects the assistant reply; combined, both sides are proven.
 
     // ── Phase 11: config_get on live instance ─────────────────────
     logln!(

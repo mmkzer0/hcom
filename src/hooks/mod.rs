@@ -17,12 +17,30 @@ use serde_json::Value;
 #[cfg(test)]
 pub mod test_helpers {
     use std::path::PathBuf;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    // Process-global serialization for tests that mutate HCOM_DIR/HOME.
+    // Env vars are process-wide; without this, parallel tests trample each
+    // other (e.g. one test's config write lands in another's tempdir).
+    // Recover from poison so a panic in one test doesn't cascade-fail the
+    // next — the shared state is just "one set of env vars at a time."
+    static TEST_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn acquire_env_lock() -> MutexGuard<'static, ()> {
+        TEST_ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
 
     /// RAII guard that saves/restores HCOM_DIR and HOME env vars, and resets Config.
     pub struct EnvGuard {
         saved_hcom: Option<String>,
         saved_home: Option<String>,
         saved_test_codex_cli_version: Option<String>,
+        // Declared last so it drops AFTER Drop::drop restores env vars,
+        // releasing the lock only once this test's env state is gone.
+        _lock: MutexGuard<'static, ()>,
     }
 
     impl Default for EnvGuard {
@@ -33,10 +51,12 @@ pub mod test_helpers {
 
     impl EnvGuard {
         pub fn new() -> Self {
+            let lock = acquire_env_lock();
             Self {
                 saved_hcom: std::env::var("HCOM_DIR").ok(),
                 saved_home: std::env::var("HOME").ok(),
                 saved_test_codex_cli_version: std::env::var("HCOM_TEST_CODEX_CLI_VERSION").ok(),
+                _lock: lock,
             }
         }
     }
