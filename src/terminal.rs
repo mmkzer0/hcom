@@ -2103,6 +2103,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_resolve_warp_cwd_uses_current_dir_for_relative_or_missing() {
         let home = Path::new("/h");
         let cwd_str = std::env::current_dir()
