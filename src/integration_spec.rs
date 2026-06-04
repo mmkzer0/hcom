@@ -360,10 +360,6 @@ const KIMI_HELP_EXAMPLES: &[HelpEntry] = &[
     ("hcom kimi --model kimi-k2.6", "Use a specific model"),
     ("hcom kimi --yolo", "Bypass permission prompts"),
 ];
-const KIMI_HELP_EXTRA_ENV: &[HelpEntry] = &[(
-    "HCOM_KIMI_SYSTEM_PROMPT",
-    "System prompt (env var or config)",
-)];
 
 const COPILOT_HELP_EXAMPLES: &[HelpEntry] = &[
     (
@@ -786,7 +782,10 @@ pub static KIMI: IntegrationSpec = IntegrationSpec {
     }),
     help: HelpSpec {
         unique_examples: KIMI_HELP_EXAMPLES,
-        extra_env: KIMI_HELP_EXTRA_ENV,
+        // No HCOM_KIMI_SYSTEM_PROMPT: kimi has no system-prompt config field or
+        // injection path (see hooks/kimi.rs — it's a future kimi feature), so
+        // advertising it here was a ghost.
+        extra_env: &[],
     },
     // Tool names verified against kimi-code 0.9.0 built-in tools
     // (docs/reference/tools.md): shell is `Bash`, file writes are `Write`/`Edit`,
@@ -1011,6 +1010,8 @@ mod tests {
             Tool::Antigravity,
             Tool::Cursor,
             Tool::Kimi,
+            Tool::Copilot,
+            Tool::Pi,
             Tool::Adhoc,
         ] {
             let spec = tool.spec();

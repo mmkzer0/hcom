@@ -239,6 +239,7 @@ mod tests {
             Tool::Codex,
             Tool::OpenCode,
             Tool::Cursor,
+            Tool::Kimi,
             Tool::Copilot,
             Tool::Pi,
         ] {

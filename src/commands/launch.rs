@@ -623,7 +623,25 @@ pub(crate) fn merge_tool_args(tool: &str, cli_args: &[String], config: &HcomConf
             tokens.extend(cli_args.iter().cloned());
             tokens
         }
-        _ => cli_args.to_vec(), // OpenCode-family tools: pass through
+        // OpenCode-family + Kimi: env config args first, explicit CLI args last
+        // (CLI wins on last-wins parsers). Without this they fell to the
+        // pass-through `_` arm and the `*_args` config was silently dropped at
+        // launch.
+        "opencode" | "kilo" | "kilocode" | "kimi" => {
+            let env_str = match tool {
+                "kilo" | "kilocode" => &config.kilo_args,
+                "kimi" => &config.kimi_args,
+                _ => &config.opencode_args,
+            };
+            let mut tokens: Vec<String> = if env_str.is_empty() {
+                Vec::new()
+            } else {
+                crate::tools::args_common::shell_split(env_str).unwrap_or_default()
+            };
+            tokens.extend(cli_args.iter().cloned());
+            tokens
+        }
+        _ => cli_args.to_vec(),
     }
 }
 
@@ -1005,6 +1023,27 @@ mod tests {
         let args = s(&["--model", "haiku"]);
         let merged = merge_tool_args("claude", &args, &config);
         assert_eq!(merged, args);
+    }
+
+    #[test]
+    fn test_merge_tool_args_applies_config_for_opencode_family_and_kimi() {
+        // These tools previously fell through to the `_` pass-through arm, which
+        // silently dropped their `*_args` config at launch.
+        let cli = s(&["--yolo"]);
+        for (tool, field) in [
+            ("opencode", "opencode_args"),
+            ("kilo", "kilo_args"),
+            ("kimi", "kimi_args"),
+        ] {
+            let mut config = HcomConfig::default();
+            config.set_field(field, "--model from-config").unwrap();
+            let merged = merge_tool_args(tool, &cli, &config);
+            assert_eq!(
+                merged,
+                s(&["--model", "from-config", "--yolo"]),
+                "config args must be merged for {tool}"
+            );
+        }
     }
 
     #[test]

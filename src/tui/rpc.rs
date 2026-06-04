@@ -56,6 +56,7 @@ fn first_non_empty_line(text: &str) -> Option<&str> {
 ///   antigravity: `--prompt-interactive "prompt"` (agy's documented interactive flag)
 ///   cursor: bare positional
 ///   copilot: `-i "prompt"`
+///   pi: bare positional (no `--prompt` flag)
 ///
 /// Always includes `--no-run-here` so the launcher opens a new terminal window/tab
 /// instead of running the agent in the TUI's own terminal (which would cause the
@@ -82,7 +83,9 @@ pub fn build_launch_argv(
     // Tool-specific prompt flags
     if !prompt.is_empty() {
         match tool {
-            Tool::Claude | Tool::Codex | Tool::Cursor | Tool::Kimi => {
+            // Pi takes the initial message positionally (`pi "message"`); it has
+            // no `--prompt` flag, so it groups with the bare-positional tools.
+            Tool::Claude | Tool::Codex | Tool::Cursor | Tool::Kimi | Tool::Pi => {
                 if headless && tool == Tool::Claude {
                     argv.push("-p".into());
                 }
@@ -95,7 +98,7 @@ pub fn build_launch_argv(
                 // gemini uses -i for initial prompt; headless not supported
                 argv.extend(["-i".into(), prompt.into()]);
             }
-            Tool::OpenCode | Tool::Kilo | Tool::Pi => {
+            Tool::OpenCode | Tool::Kilo => {
                 argv.extend(["--prompt".into(), prompt.into()]);
             }
             Tool::Antigravity => {
@@ -198,6 +201,23 @@ mod tests {
                 "--terminal",
                 "kitty",
                 "-i",
+                "fix the bug"
+            ]
+        );
+    }
+
+    #[test]
+    fn launch_argv_pi_prompt_is_positional() {
+        // Pi has no `--prompt` flag; the initial message is positional.
+        let argv = build_launch_argv(Tool::Pi, 1, "", false, "kitty", "fix the bug");
+        assert_eq!(
+            argv,
+            vec![
+                "1",
+                "pi",
+                "--no-run-here",
+                "--terminal",
+                "kitty",
                 "fix the bug"
             ]
         );
