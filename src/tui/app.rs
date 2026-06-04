@@ -417,6 +417,7 @@ mod tests {
                     options_cursor: None,
                     tag: String::new(),
                     headless: false,
+                    headless_pty: false,
                     terminal: 0,
                     terminal_presets: vec!["default".into()],
                     editing: None,

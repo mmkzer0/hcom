@@ -30,6 +30,7 @@ pub enum RpcOp {
         count: u8,
         tag: String,
         headless: bool,
+        headless_pty: bool,
         terminal: String,
         prompt: String,
     },
@@ -158,10 +159,19 @@ fn run_op(op: &RpcOp) -> Result<Response, String> {
             count,
             tag,
             headless,
+            headless_pty,
             terminal,
             prompt,
         } => {
-            let argv = build_launch_argv(*tool, *count, tag, *headless, terminal, prompt);
+            let argv = build_launch_argv(
+                *tool,
+                *count,
+                tag,
+                *headless,
+                *headless_pty,
+                terminal,
+                prompt,
+            );
             commands::run_native(&argv)
         }
     }

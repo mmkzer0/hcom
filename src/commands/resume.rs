@@ -1914,7 +1914,10 @@ fn extract_cwd_from_transcript(path: &str, tool: &str) -> Option<String> {
                 .and_then(|p| p.get("cwd"))
                 .and_then(|c| c.as_str())
         }),
-        "gemini" => recover_gemini_cwd(path),
+        // Antigravity shares Gemini's session tree/format (GEMINI_CLI_HOME);
+        // an agy-pathed transcript that detect_agent_type labels "antigravity"
+        // still has the gemini `projectHash` field, so reuse the same recovery.
+        "gemini" | "antigravity" => recover_gemini_cwd(path),
         "cursor" => recover_cursor_cwd(path),
         "kimi" => None, // Kimi context.jsonl does not store cwd
         "copilot" => scan_lines_for_cwd(path, 20, |v| {

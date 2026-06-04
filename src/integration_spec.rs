@@ -550,7 +550,12 @@ pub static OPENCODE: IntegrationSpec = IntegrationSpec {
     },
     launch: LaunchSpec {
         args_env: Some("HCOM_OPENCODE_ARGS"),
-        config_dir_env: None,
+        // OPENCODE_CONFIG_DIR is read by the plugin install/verify/remove path
+        // in hooks/opencode.rs; surface it for the launch diagnostic dump.
+        // This does NOT enable launcher config-isolation: isolated_tool_config_dir
+        // returns None for OpenCode (it isolates via OPENCODE_RUN_ID/_PROCESS_ROLE),
+        // so the auto-isolation arm in launcher.rs stays a no-op for this tool.
+        config_dir_env: Some("OPENCODE_CONFIG_DIR"),
         initial_prompt: InitialPromptShape::Flag("--prompt"),
         uses_pty_default: true,
         max_launch_count: 10,
@@ -581,7 +586,13 @@ pub static KILO: IntegrationSpec = IntegrationSpec {
     adhoc_icon: None,
     released: true,
     ready_pattern: b"ctrl+p commands",
-    instance_state_env: &["KILO_DB"],
+    // Kilo namespaces OpenCode's run/role state under its own vars (see
+    // kilocode packages/core/src/util/opencode-process.ts: KILO_RUN_ID /
+    // KILO_PROCESS_ROLE are `??=`-assigned, so an inherited value is reused
+    // rather than regenerated → a leaked parent value collides a same-tool
+    // child, exactly like OpenCode's OPENCODE_RUN_ID/OPENCODE_PROCESS_ROLE).
+    // KILO_DB is the on-disk session store; all three are instance-state.
+    instance_state_env: &["KILO_DB", "KILO_RUN_ID", "KILO_PROCESS_ROLE"],
     hooks: HooksSpec {
         names: OPENCODE_HOOKS,
         shared_hooks_with: Some(Tool::OpenCode),
@@ -838,9 +849,11 @@ pub static PI: IntegrationSpec = IntegrationSpec {
         unique_examples: PI_HELP_EXAMPLES,
         extra_env: &[],
     },
+    // `file` lists mutating ops only (like every other tool); Pi's `read` is a
+    // read-only op and was producing a path in the status bar on plain reads.
     status_detail: StatusDetailSpec {
         bash: &["bash"],
-        file: &["edit", "write", "read"],
+        file: &["edit", "write"],
         delegate: &[],
     },
 };

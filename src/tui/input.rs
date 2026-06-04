@@ -1033,6 +1033,7 @@ impl App {
                 let count = self.ui.launch.count;
                 let tag = self.ui.launch.tag.clone();
                 let headless = self.ui.launch.headless;
+                let headless_pty = self.ui.launch.headless_pty;
                 let terminal = self
                     .ui
                     .launch
@@ -1047,6 +1048,7 @@ impl App {
                     count,
                     tag,
                     headless,
+                    headless_pty,
                     terminal: terminal.into(),
                     prompt,
                 }) {

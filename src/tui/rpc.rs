@@ -46,17 +46,19 @@ fn first_non_empty_line(text: &str) -> Option<&str> {
 
 // ── Helpers ──────────────────────────────────────────────────────
 
-/// Build argv for launch: `hcom [count] [tool] [--tag T] [--terminal T] [tool-specific prompt]`
+/// Build argv for a TUI-initiated launch:
+/// `hcom [count] <tool> --no-run-here [--tag T] [--terminal T] [--headless] [--hcom-prompt P]`.
 ///
-/// Prompt handling varies per tool:
-///   claude: `-p "prompt"` (headless) or bare positional (interactive)
-///   gemini: `-i "prompt"` (interactive only, headless not supported)
-///   codex:  bare positional (interactive)
-///   opencode: `--prompt "prompt"`
-///   antigravity: `--prompt-interactive "prompt"` (agy's documented interactive flag)
-///   cursor: bare positional
-///   copilot: `-i "prompt"`
-///   pi: bare positional (no `--prompt` flag)
+/// Per-tool prompt shaping is NOT duplicated here: the prompt is passed through
+/// the launcher's generic `--hcom-prompt`, which applies the tool's
+/// `InitialPromptShape` from `integration_spec` (positional, `--prompt`,
+/// `--prompt-interactive`, `-i`, claude's `-- <positional>`, …). This keeps the
+/// tool argv contract in one place (the launcher) instead of drifting between
+/// here and `integration_spec`.
+///
+/// `--headless` is offered for every tool (it routes through the PTY headless
+/// wrapper). `headless_pty` is claude-only: claude's headless default is one-shot
+/// print mode, and `--pty` opts into a live PTY-backed session instead.
 ///
 /// Always includes `--no-run-here` so the launcher opens a new terminal window/tab
 /// instead of running the agent in the TUI's own terminal (which would cause the
@@ -66,6 +68,7 @@ pub fn build_launch_argv(
     count: u8,
     tag: &str,
     headless: bool,
+    headless_pty: bool,
     terminal: &str,
     prompt: &str,
 ) -> Vec<String> {
@@ -80,36 +83,15 @@ pub fn build_launch_argv(
     if !terminal.is_empty() {
         argv.extend(["--terminal".into(), terminal.into()]);
     }
-    // Tool-specific prompt flags
-    if !prompt.is_empty() {
-        match tool {
-            // Pi takes the initial message positionally (`pi "message"`); it has
-            // no `--prompt` flag, so it groups with the bare-positional tools.
-            Tool::Claude | Tool::Codex | Tool::Cursor | Tool::Kimi | Tool::Pi => {
-                if headless && tool == Tool::Claude {
-                    argv.push("-p".into());
-                }
-                argv.push(prompt.into());
-            }
-            Tool::Copilot => {
-                argv.extend(["-i".into(), prompt.into()]);
-            }
-            Tool::Gemini => {
-                // gemini uses -i for initial prompt; headless not supported
-                argv.extend(["-i".into(), prompt.into()]);
-            }
-            Tool::OpenCode | Tool::Kilo => {
-                argv.extend(["--prompt".into(), prompt.into()]);
-            }
-            Tool::Antigravity => {
-                // agy uses --prompt-interactive for interactive initial prompts
-                argv.extend(["--prompt-interactive".into(), prompt.into()]);
-            }
-            Tool::Adhoc => {}
+    if headless {
+        argv.push("--headless".into());
+        // claude-only: live PTY-backed headless session instead of print mode.
+        if headless_pty {
+            argv.push("--pty".into());
         }
-    } else if headless && tool == Tool::Claude {
-        // headless without prompt (claude only)
-        argv.push("-p".into());
+    }
+    if !prompt.is_empty() {
+        argv.extend(["--hcom-prompt".into(), prompt.into()]);
     }
     argv
 }
@@ -168,7 +150,7 @@ mod tests {
 
     #[test]
     fn launch_argv_numeric_count_first() {
-        let argv = build_launch_argv(Tool::Claude, 2, "review", true, "kitty", "hello");
+        let argv = build_launch_argv(Tool::Claude, 2, "review", true, false, "kitty", "hello");
         assert_eq!(argv[0], "2");
         assert_eq!(argv[1], "claude");
         assert!(argv.contains(&"--no-run-here".into()));
@@ -176,13 +158,15 @@ mod tests {
         assert!(argv.contains(&"review".into()));
         assert!(argv.contains(&"--terminal".into()));
         assert!(argv.contains(&"kitty".into()));
-        assert!(argv.contains(&"-p".into()));
+        // Headless → --headless; prompt → generic --hcom-prompt.
+        assert!(argv.contains(&"--headless".into()));
+        assert!(argv.contains(&"--hcom-prompt".into()));
         assert!(argv.contains(&"hello".into()));
     }
 
     #[test]
     fn launch_argv_always_includes_no_run_here() {
-        let argv = build_launch_argv(Tool::Gemini, 1, "", false, "default", "");
+        let argv = build_launch_argv(Tool::Gemini, 1, "", false, false, "default", "");
         assert_eq!(
             argv,
             vec!["1", "gemini", "--no-run-here", "--terminal", "default"]
@@ -190,8 +174,41 @@ mod tests {
     }
 
     #[test]
-    fn launch_argv_gemini_prompt_uses_dash_i() {
-        let argv = build_launch_argv(Tool::Gemini, 1, "", false, "kitty", "fix the bug");
+    fn launch_argv_prompt_is_tool_agnostic() {
+        // Per-tool prompt shaping now lives in the launcher (InitialPromptShape);
+        // the TUI always forwards the prompt via the generic --hcom-prompt flag,
+        // regardless of tool.
+        for tool in [
+            Tool::Gemini,
+            Tool::Pi,
+            Tool::Antigravity,
+            Tool::Codex,
+            Tool::Cursor,
+            Tool::Copilot,
+            Tool::OpenCode,
+        ] {
+            let argv = build_launch_argv(tool, 1, "", false, false, "kitty", "fix the bug");
+            assert_eq!(
+                argv,
+                vec![
+                    "1".to_string(),
+                    tool.name().to_string(),
+                    "--no-run-here".to_string(),
+                    "--terminal".to_string(),
+                    "kitty".to_string(),
+                    "--hcom-prompt".to_string(),
+                    "fix the bug".to_string(),
+                ],
+                "{tool:?} should forward prompt via --hcom-prompt"
+            );
+        }
+    }
+
+    #[test]
+    fn launch_argv_headless_for_non_claude_tool() {
+        // Headless is now offered for every tool; non-claude routes through the
+        // PTY headless wrapper via a plain --headless (no --pty).
+        let argv = build_launch_argv(Tool::Gemini, 1, "", true, false, "kitty", "do task");
         assert_eq!(
             argv,
             vec![
@@ -200,90 +217,29 @@ mod tests {
                 "--no-run-here",
                 "--terminal",
                 "kitty",
-                "-i",
-                "fix the bug"
-            ]
-        );
-    }
-
-    #[test]
-    fn launch_argv_pi_prompt_is_positional() {
-        // Pi has no `--prompt` flag; the initial message is positional.
-        let argv = build_launch_argv(Tool::Pi, 1, "", false, "kitty", "fix the bug");
-        assert_eq!(
-            argv,
-            vec![
-                "1",
-                "pi",
-                "--no-run-here",
-                "--terminal",
-                "kitty",
-                "fix the bug"
-            ]
-        );
-    }
-
-    #[test]
-    fn launch_argv_antigravity_prompt_uses_prompt_interactive() {
-        let argv = build_launch_argv(Tool::Antigravity, 1, "", false, "kitty", "review agy");
-        assert_eq!(
-            argv,
-            vec![
-                "1",
-                "antigravity",
-                "--no-run-here",
-                "--terminal",
-                "kitty",
-                "--prompt-interactive",
-                "review agy"
-            ]
-        );
-    }
-
-    #[test]
-    fn launch_argv_codex_prompt_is_positional() {
-        let argv = build_launch_argv(Tool::Codex, 1, "", false, "tmux", "do task");
-        assert_eq!(
-            argv,
-            vec![
-                "1",
-                "codex",
-                "--no-run-here",
-                "--terminal",
-                "tmux",
+                "--headless",
+                "--hcom-prompt",
                 "do task"
             ]
         );
     }
 
     #[test]
-    fn launch_argv_cursor_prompt_is_positional() {
-        let argv = build_launch_argv(Tool::Cursor, 1, "", false, "tmux", "do task");
+    fn launch_argv_claude_pty_headless_adds_pty() {
+        // Claude's PTY headless mode adds --pty after --headless (live session
+        // instead of one-shot print mode).
+        let argv = build_launch_argv(Tool::Claude, 1, "", true, true, "kitty", "do task");
         assert_eq!(
             argv,
             vec![
                 "1",
-                "cursor",
+                "claude",
                 "--no-run-here",
                 "--terminal",
-                "tmux",
-                "do task"
-            ]
-        );
-    }
-
-    #[test]
-    fn launch_argv_copilot_prompt_uses_interactive_flag() {
-        let argv = build_launch_argv(Tool::Copilot, 1, "", false, "tmux", "do task");
-        assert_eq!(
-            argv,
-            vec![
-                "1",
-                "copilot",
-                "--no-run-here",
-                "--terminal",
-                "tmux",
-                "-i",
+                "kitty",
+                "--headless",
+                "--pty",
+                "--hcom-prompt",
                 "do task"
             ]
         );

@@ -542,6 +542,10 @@ pub struct LaunchState {
     pub options_cursor: Option<LaunchField>,
     pub tag: String,
     pub headless: bool,
+    /// Claude-only: when headless, choose a live PTY-backed session (`--pty`)
+    /// instead of one-shot print mode. Ignored for other tools (their only
+    /// headless mode is the PTY wrapper).
+    pub headless_pty: bool,
     pub terminal: usize,
     pub terminal_presets: Vec<String>,
     pub editing: Option<LaunchField>,
@@ -570,6 +574,7 @@ impl LaunchState {
             options_cursor: None,
             tag: defaults.tag,
             headless: false,
+            headless_pty: false,
             terminal: terminal_idx,
             terminal_presets: presets,
             editing: None,
@@ -580,33 +585,22 @@ impl LaunchState {
 
     /// Height of the inline panel.
     pub fn panel_height(&self) -> u16 {
-        if self.tool == Tool::Claude {
-            // sep + tool + count + tag + headless + terminal
-            6
-        } else {
-            // sep + tool + count + tag + terminal
-            5
-        }
+        // sep + tool + count + tag + headless + terminal. Headless is available
+        // for every tool (claude additionally toggles print vs PTY headless).
+        6
     }
 
     /// Ordered navigable fields in the settings area.
     pub fn settings_fields(&self) -> &'static [LaunchField] {
-        if self.tool == Tool::Claude {
-            &[
-                LaunchField::Tool,
-                LaunchField::Count,
-                LaunchField::Tag,
-                LaunchField::Headless,
-                LaunchField::Terminal,
-            ]
-        } else {
-            &[
-                LaunchField::Tool,
-                LaunchField::Count,
-                LaunchField::Tag,
-                LaunchField::Terminal,
-            ]
-        }
+        // Headless applies to every tool. For non-claude tools it routes through
+        // the PTY headless wrapper; claude's Headless field cycles off/print/pty.
+        &[
+            LaunchField::Tool,
+            LaunchField::Count,
+            LaunchField::Tag,
+            LaunchField::Headless,
+            LaunchField::Terminal,
+        ]
     }
 
     /// Move cursor up. At top, wraps to None (input focus).
@@ -668,7 +662,12 @@ impl LaunchState {
 
     pub fn adjust_left(&mut self) {
         match self.options_cursor {
-            Some(LaunchField::Tool) => self.tool = self.tool.prev(),
+            Some(LaunchField::Tool) => {
+                self.tool = self.tool.prev();
+                if self.tool != Tool::Claude {
+                    self.headless_pty = false;
+                }
+            }
             Some(LaunchField::Count) if self.count > 1 => {
                 self.count -= 1;
             }
@@ -685,7 +684,12 @@ impl LaunchState {
 
     pub fn adjust_right(&mut self) {
         match self.options_cursor {
-            Some(LaunchField::Tool) => self.tool = self.tool.next(),
+            Some(LaunchField::Tool) => {
+                self.tool = self.tool.next();
+                if self.tool != Tool::Claude {
+                    self.headless_pty = false;
+                }
+            }
             Some(LaunchField::Count) if self.count < 99 => {
                 self.count += 1;
             }
@@ -698,7 +702,17 @@ impl LaunchState {
 
     pub fn toggle_or_select(&mut self) {
         if self.options_cursor == Some(LaunchField::Headless) {
-            self.headless = !self.headless;
+            if self.tool == Tool::Claude {
+                // Cycle off → print headless → PTY headless → off.
+                (self.headless, self.headless_pty) = match (self.headless, self.headless_pty) {
+                    (false, _) => (true, false),    // print
+                    (true, false) => (true, true),  // pty
+                    (true, true) => (false, false), // off
+                };
+            } else {
+                self.headless = !self.headless;
+                self.headless_pty = false;
+            }
         }
     }
 
@@ -1307,6 +1321,7 @@ mod tests {
             options_cursor: None,
             tag: String::new(),
             headless: false,
+            headless_pty: false,
             terminal: 0,
             terminal_presets: vec!["default".into(), "kitty".into()],
             editing: None,
@@ -1316,24 +1331,20 @@ mod tests {
     }
 
     #[test]
-    fn launch_panel_height_claude_vs_others() {
+    fn launch_panel_height_constant_across_tools() {
+        // Headless is available for every tool, so the panel is the same height.
         let mut ls = test_launch();
-        assert_eq!(ls.panel_height(), 6); // claude has headless field
+        assert_eq!(ls.panel_height(), 6);
         ls.tool = Tool::Gemini;
-        assert_eq!(ls.panel_height(), 5);
+        assert_eq!(ls.panel_height(), 6);
     }
 
     #[test]
-    fn launch_settings_fields_claude_has_headless() {
-        let ls = test_launch();
+    fn launch_settings_fields_have_headless_for_all_tools() {
+        let mut ls = test_launch();
         assert!(ls.settings_fields().contains(&LaunchField::Headless));
-    }
-
-    #[test]
-    fn launch_settings_fields_gemini_no_headless() {
-        let mut ls = test_launch();
         ls.tool = Tool::Gemini;
-        assert!(!ls.settings_fields().contains(&LaunchField::Headless));
+        assert!(ls.settings_fields().contains(&LaunchField::Headless));
     }
 
     #[test]
@@ -1402,14 +1413,39 @@ mod tests {
     }
 
     #[test]
-    fn launch_headless_toggles() {
+    fn launch_headless_cycles_off_print_pty_for_claude() {
+        let mut ls = test_launch(); // claude by default
+        ls.options_cursor = Some(LaunchField::Headless);
+        assert!(!ls.headless && !ls.headless_pty); // off
+        ls.toggle_or_select();
+        assert!(ls.headless && !ls.headless_pty); // print
+        ls.toggle_or_select();
+        assert!(ls.headless && ls.headless_pty); // pty
+        ls.toggle_or_select();
+        assert!(!ls.headless && !ls.headless_pty); // back to off
+    }
+
+    #[test]
+    fn launch_headless_is_plain_toggle_for_non_claude() {
         let mut ls = test_launch();
+        ls.tool = Tool::Gemini;
         ls.options_cursor = Some(LaunchField::Headless);
         assert!(!ls.headless);
         ls.toggle_or_select();
-        assert!(ls.headless);
+        assert!(ls.headless && !ls.headless_pty);
         ls.toggle_or_select();
-        assert!(!ls.headless);
+        assert!(!ls.headless && !ls.headless_pty);
+    }
+
+    #[test]
+    fn launch_switching_tool_off_claude_clears_pty() {
+        let mut ls = test_launch(); // claude
+        ls.options_cursor = Some(LaunchField::Tool);
+        ls.headless = true;
+        ls.headless_pty = true;
+        ls.adjust_right(); // cycle off claude
+        assert_ne!(ls.tool, Tool::Claude);
+        assert!(!ls.headless_pty);
     }
 
     #[test]
