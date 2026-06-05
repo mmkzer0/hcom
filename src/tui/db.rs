@@ -350,17 +350,28 @@ fn load_instances(conn: &Connection, device_uuid: &str, now: f64) -> (Vec<Agent>
 
         let has_tcp = tcp_mode != 0;
 
-        // Device name for remote agents (short suffix from device UUID)
-        let device_name = if is_remote {
-            Some(
-                origin_device_id
-                    .chars()
-                    .take(4)
-                    .collect::<String>()
-                    .to_uppercase(),
-            )
+        // Remote rows are stored namespaced as "base:SHORT" (SHORT = the origin
+        // device's relay short-id). Split it back so display_name() re-appends
+        // the real short-id rather than a UUID prefix that doesn't match.
+        let (name, device_name) = if is_remote {
+            match name.rsplit_once(':') {
+                Some((base, short)) if !base.is_empty() && !short.is_empty() => {
+                    (base.to_string(), Some(short.to_string()))
+                }
+                // Fallback for an unexpectedly un-namespaced remote row.
+                _ => (
+                    name,
+                    Some(
+                        origin_device_id
+                            .chars()
+                            .take(4)
+                            .collect::<String>()
+                            .to_uppercase(),
+                    ),
+                ),
+            }
         } else {
-            None
+            (name, None)
         };
 
         // Sync age for remote agents from KV
