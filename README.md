@@ -34,6 +34,11 @@ curl -fsSL https://github.com/aannoo/hcom/releases/latest/download/hcom-installe
 uv tool install hcom  # or: pip install hcom
 ```
 
+```bash
+# Update any existing install to latest hcom version
+hcom update
+```
+
 </details>
 
 ---
