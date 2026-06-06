@@ -57,8 +57,10 @@ fn first_non_empty_line(text: &str) -> Option<&str> {
 /// here and `integration_spec`.
 ///
 /// `--headless` is offered for every tool (it routes through the PTY headless
-/// wrapper). `headless_pty` is claude-only: claude's headless default is one-shot
-/// print mode, and `--pty` opts into a live PTY-backed session instead.
+/// wrapper). `headless_pty` is claude-only: claude's headless default is a live
+/// PTY-backed session; when it is `false` the launch opts into `-p` print mode
+/// instead (also kept alive by the stop-hook loop, but it draws from a separate
+/// Agent SDK credit pool).
 ///
 /// Always includes `--no-run-here` so the launcher opens a new terminal window/tab
 /// instead of running the agent in the TUI's own terminal (which would cause the
@@ -85,9 +87,10 @@ pub fn build_launch_argv(
     }
     if headless {
         argv.push("--headless".into());
-        // claude-only: live PTY-backed headless session instead of print mode.
-        if headless_pty {
-            argv.push("--pty".into());
+        // claude-only: headless defaults to the live PTY session (no extra flag);
+        // when headless_pty is false, opt into `-p` print mode.
+        if matches!(tool, Tool::Claude) && !headless_pty {
+            argv.push("-p".into());
         }
     }
     if !prompt.is_empty() {
@@ -225,9 +228,9 @@ mod tests {
     }
 
     #[test]
-    fn launch_argv_claude_pty_headless_adds_pty() {
-        // Claude's PTY headless mode adds --pty after --headless (live session
-        // instead of one-shot print mode).
+    fn launch_argv_claude_headless_pty_is_default_no_extra_flag() {
+        // Claude's headless default is the live PTY session — just --headless, no
+        // extra flag (headless_pty = true).
         let argv = build_launch_argv(Tool::Claude, 1, "", true, true, "kitty", "do task");
         assert_eq!(
             argv,
@@ -238,7 +241,26 @@ mod tests {
                 "--terminal",
                 "kitty",
                 "--headless",
-                "--pty",
+                "--hcom-prompt",
+                "do task"
+            ]
+        );
+    }
+
+    #[test]
+    fn launch_argv_claude_headless_print_adds_dash_p() {
+        // Claude print mode (headless_pty = false) opts into `-p`.
+        let argv = build_launch_argv(Tool::Claude, 1, "", true, false, "kitty", "do task");
+        assert_eq!(
+            argv,
+            vec![
+                "1",
+                "claude",
+                "--no-run-here",
+                "--terminal",
+                "kitty",
+                "--headless",
+                "-p",
                 "--hcom-prompt",
                 "do task"
             ]

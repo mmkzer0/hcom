@@ -76,9 +76,11 @@ pub struct GatesSpec {
 /// - `Unsupported`: tool has no background launch path. Currently only Adhoc.
 /// - `HeadlessPty`: background is routed through the PTY wrapper in a detached
 ///   runner; the live TUI keeps running there. gemini, codex, opencode, agy.
-/// - `NativePrint`: background launches a detached one-shot in the tool's own
-///   print mode (Claude `-p --output-format stream-json --verbose`).
-///   `--pty --headless` still routes through `HeadlessPty`.
+/// - `NativePrint`: background launches a detached process in the tool's own
+///   print mode (Claude `-p --output-format stream-json --verbose`), opt-in via
+///   an explicit `-p`/`--print` and kept alive across turns by hcom's stop-hook
+///   loop. Default Claude `--headless` routes through `HeadlessPty` (live PTY
+///   session) instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackgroundMode {
     Unsupported,
@@ -1214,7 +1216,7 @@ mod tests {
             if !spec.released {
                 continue;
             }
-            let lt = LaunchTool::from_str(spec.name, false)
+            let lt = LaunchTool::from_str(spec.name)
                 .unwrap_or_else(|e| panic!("LaunchTool::from_str({}) failed: {e}", spec.name));
             assert_eq!(
                 lt.tool(),
@@ -1229,7 +1231,7 @@ mod tests {
                 spec.name
             );
             for alias in spec.aliases {
-                let lt = LaunchTool::from_str(alias, false)
+                let lt = LaunchTool::from_str(alias)
                     .unwrap_or_else(|e| panic!("LaunchTool::from_str alias {alias} failed: {e}"));
                 assert_eq!(
                     lt.tool(),

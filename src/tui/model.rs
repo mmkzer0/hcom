@@ -584,9 +584,9 @@ pub struct LaunchState {
     pub options_cursor: Option<LaunchField>,
     pub tag: String,
     pub headless: bool,
-    /// Claude-only: when headless, choose a live PTY-backed session (`--pty`)
-    /// instead of one-shot print mode. Ignored for other tools (their only
-    /// headless mode is the PTY wrapper).
+    /// Claude-only: when headless, `true` keeps the default live PTY-backed
+    /// session; `false` opts into `-p` print mode. Ignored for other
+    /// tools (their only headless mode is the PTY wrapper).
     pub headless_pty: bool,
     pub terminal: usize,
     pub terminal_presets: Vec<String>,
@@ -745,11 +745,13 @@ impl LaunchState {
     pub fn toggle_or_select(&mut self) {
         if self.options_cursor == Some(LaunchField::Headless) {
             if self.tool == Tool::Claude {
-                // Cycle off → print headless → PTY headless → off.
+                // Cycle off → PTY headless (default) → print headless → off.
+                // PTY is the default; print (`-p`) is the opt-in second stop
+                // because it draws from a separate Agent SDK credit pool.
                 (self.headless, self.headless_pty) = match (self.headless, self.headless_pty) {
-                    (false, _) => (true, false),    // print
-                    (true, false) => (true, true),  // pty
-                    (true, true) => (false, false), // off
+                    (false, _) => (true, true),      // pty (default)
+                    (true, true) => (true, false),   // print
+                    (true, false) => (false, false), // off
                 };
             } else {
                 self.headless = !self.headless;
@@ -1455,14 +1457,14 @@ mod tests {
     }
 
     #[test]
-    fn launch_headless_cycles_off_print_pty_for_claude() {
+    fn launch_headless_cycles_off_pty_print_for_claude() {
         let mut ls = test_launch(); // claude by default
         ls.options_cursor = Some(LaunchField::Headless);
         assert!(!ls.headless && !ls.headless_pty); // off
         ls.toggle_or_select();
-        assert!(ls.headless && !ls.headless_pty); // print
+        assert!(ls.headless && ls.headless_pty); // pty (default)
         ls.toggle_or_select();
-        assert!(ls.headless && ls.headless_pty); // pty
+        assert!(ls.headless && !ls.headless_pty); // print
         ls.toggle_or_select();
         assert!(!ls.headless && !ls.headless_pty); // back to off
     }

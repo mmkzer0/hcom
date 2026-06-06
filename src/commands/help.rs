@@ -707,7 +707,12 @@ fn generate_tool_help(spec: &crate::integration_spec::IntegrationSpec) -> String
     lines.push(String::new());
     lines.push("hcom Flags:".to_string());
     for (flag, desc) in SHARED_LAUNCH_FLAGS {
-        lines.push(format!("    {:<29}{}", flag, desc));
+        let extra = if *flag == "--headless" && spec.tool == crate::tool::Tool::Claude {
+            " (use -p instead for print mode)"
+        } else {
+            ""
+        };
+        lines.push(format!("    {:<29}{}{}", flag, desc, extra));
     }
     lines.push(format!(
         "    {:<29}{}",
@@ -907,8 +912,7 @@ const SHARED_LAUNCH_FLAGS: &[(&str, &str)] = &[
     ("--tag <name>", "Group tag (names become tag-*)"),
     ("--terminal <preset>", "Where new windows open"),
     ("--dir <path>", "Working directory"),
-    ("--headless", "Run in background (no terminal window)"),
-    ("--pty", "Force PTY wrapper (claude: live headless session)"),
+    ("--headless", "Run in background"),
     ("--run-here", "Run in current terminal"),
     ("--hcom-prompt <text>", "Initial prompt"),
     ("--hcom-system-prompt <text>", "System prompt"),

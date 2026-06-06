@@ -431,13 +431,26 @@ fn prepare_resume_plan_from_source(
 
     let is_headless =
         launch_flags.headless || is_background_from_args(&tool, &merged_args) || background;
-    let use_pty = (tool == "claude" || tool == "kimi") && !is_headless && cfg!(unix);
 
+    // Claude background defaults to the live PTY session; only an explicit
+    // `-p`/`--print` (NativePrint) gets the detached print-mode defaults. This
+    // mirrors `prepare_launch_execution` on the launch path so resume/fork and
+    // launch share one execution-mode policy. `-p` is opt-in because, from
+    // 2026-06-15, `claude -p` draws from a separate Agent SDK credit pool.
     if tool == "claude" && is_headless {
         let spec = claude_args::resolve_claude_args(Some(&merged_args), None);
-        let updated = claude_args::add_background_defaults(&spec);
-        merged_args = updated.rebuild_tokens(true);
+        if spec.is_background {
+            let updated = claude_args::add_background_defaults(&spec);
+            merged_args = updated.rebuild_tokens(true);
+        }
     }
+
+    crate::commands::launch::validate_claude_headless_launch(
+        &tool,
+        is_headless,
+        &merged_args,
+        launch_flags.initial_prompt.as_deref(),
+    )?;
 
     let launcher_name =
         resolve_launcher_name(db, flags, std::env::var("HCOM_PROCESS_ID").ok().as_deref());
@@ -506,7 +519,6 @@ fn prepare_resume_plan_from_source(
             tag: launch_tag,
             system_prompt: effective_system_prompt,
             initial_prompt: fork_initial_prompt,
-            pty: use_pty,
             background: is_headless,
             cwd: Some(effective_cwd),
             env: None,

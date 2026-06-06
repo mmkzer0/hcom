@@ -234,7 +234,8 @@ hcom f <session_id>           # Fork a session in hcom
 Detached background processes in print mode stay alive. Manage through the TUI.
 
 ```bash
-hcom claude -p 'say hi in hcom'
+hcom claude -p 'say hi in hcom'   # print mode (separate Agent SDK credits)
+hcom claude --headless            # Run normal claude in background pty (works for any tool)
 ```
 
 For subagents, run `hcom claude`, then prompt:
@@ -267,7 +268,7 @@ hcom launch flags:
 | `--tag <name>` | Group label — agents can be addressed as `@tag` |
 | `--terminal <preset>` | Where windows open: `default` (auto-detect), `kitty`, `wezterm`, `tmux`, `cmux`, `iterm`, etc… |
 | `--dir <path>` | Directory where the agent launches |
-| `--headless` | Run in background with no terminal window |
+| `--headless` | Run in background pty with no terminal window |
 | `--device <name>` | Spawn on a remote device (via relay) |
 | `--hcom-prompt <text>` | Initial user prompt |
 | `--hcom-system-prompt <text>` | Append to system prompt |

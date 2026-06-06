@@ -43,9 +43,9 @@ pub enum LaunchTool {
 }
 
 impl LaunchTool {
-    pub fn from_str(s: &str, pty: bool) -> Result<Self> {
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Result<Self> {
         match s {
-            "claude" if pty => Ok(LaunchTool::ClaudePty),
             "claude" => Ok(LaunchTool::Claude),
             "claude-pty" => Ok(LaunchTool::ClaudePty),
             "gemini" => Ok(LaunchTool::Gemini),
@@ -127,10 +127,10 @@ impl LaunchTool {
 ///
 /// - `InteractiveVisible`: foreground, user-visible terminal. All tools.
 /// - `HeadlessPty`:       background, PTY wrapper in a detached runner. Default
-///   for gemini/codex/opencode; claude with `--pty`.
+///   for gemini/codex/opencode and for default claude `--headless`.
 /// - `NativePrint`:       background, direct claude spawn in print mode
-///   (`-p --output-format stream-json --verbose`). Claude
-///   only; one-shot, exits after the prompt.
+///   (`-p --output-format stream-json --verbose`). Claude only, opt-in via an
+///   explicit `-p`/`--print`; kept alive across turns by hcom's stop-hook loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaunchBackend {
     InteractiveVisible,
@@ -139,19 +139,20 @@ pub enum LaunchBackend {
 }
 
 impl LaunchBackend {
-    /// Resolve from the already-prepared (tool, background, pty) triple.
+    /// Resolve from the already-prepared (tool, background) pair.
     ///
-    /// `pty` here is the effective use-pty decision coming out of
-    /// `prepare_launch_execution` — for claude, that tracks the user's `--pty`
-    /// opt-in (plus the existing interactive default). For other tools it is
-    /// always true.
-    pub fn resolve(tool: &LaunchTool, background: bool, pty: bool) -> Self {
+    /// The PTY-vs-print decision for Claude is encoded in the [`LaunchTool`]
+    /// surface chosen by `launch()`: `Claude` is the `-p`/`--print` surface
+    /// (→ `NativePrint`), `ClaudePty` is the live PTY surface (→ `HeadlessPty`).
+    /// Background Claude defaults to `ClaudePty`; it only becomes
+    /// `Claude`/`NativePrint` when the caller passes `-p`/`--print`.
+    pub fn resolve(tool: &LaunchTool, background: bool) -> Self {
         if !background {
             return LaunchBackend::InteractiveVisible;
         }
         match tool {
-            LaunchTool::Claude if !pty => LaunchBackend::NativePrint,
-            LaunchTool::Claude | LaunchTool::ClaudePty => LaunchBackend::HeadlessPty,
+            LaunchTool::Claude => LaunchBackend::NativePrint,
+            LaunchTool::ClaudePty => LaunchBackend::HeadlessPty,
             LaunchTool::Gemini
             | LaunchTool::Codex
             | LaunchTool::OpenCode
@@ -174,7 +175,6 @@ pub struct LaunchParams {
     pub tag: Option<String>,
     pub system_prompt: Option<String>,
     pub initial_prompt: Option<String>,
-    pub pty: bool,
     pub background: bool,
     pub cwd: Option<String>,
     pub env: Option<HashMap<String, String>>,
@@ -196,7 +196,6 @@ impl Default for LaunchParams {
             tag: None,
             system_prompt: None,
             initial_prompt: None,
-            pty: false,
             background: false,
             cwd: None,
             env: None,
@@ -1150,13 +1149,34 @@ pub(crate) fn inject_workspace_trust_args(
 /// and OpenCode instances with batch tracking, environment setup, and
 /// error handling.
 pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
-    let normalized = LaunchTool::from_str(&params.tool, params.pty)?;
+    // Claude background defaults to the live PTY surface (`ClaudePty`); it only
+    // drops to the `-p`/`--print` surface (`Claude`/`NativePrint`) when the
+    // caller explicitly passes `-p`/`--print` in the args. Both stay alive —
+    // PTY hosts the live TUI, print mode loops via the stop hook. `-p` is gated
+    // behind explicit opt-in because, from 2026-06-15, `claude -p` draws from a
+    // separate Agent SDK credit pool on subscription plans.
+    let claude_print = (params.tool == "claude" || params.tool == "claude-pty")
+        && crate::hooks::claude_args::resolve_claude_args(Some(&params.args), None).is_background;
+
+    // `claude-pty` is the PTY surface; `-p`/`--print` selects the NativePrint
+    // surface. The two are mutually exclusive: passing both would route print
+    // mode through the HeadlessPty runner, which is broken. Fail fast.
+    if params.tool == "claude-pty" && claude_print {
+        bail!(
+            "The PTY surface does not support `-p`/`--print`.\n\
+             Use one of:\n\
+             • `hcom claude --headless`  — live PTY session\n\
+             • `hcom claude -p ...`      — print/pipe mode"
+        );
+    }
+
+    let normalized = if params.tool == "claude" && !claude_print {
+        LaunchTool::ClaudePty
+    } else {
+        LaunchTool::from_str(&params.tool)?
+    };
     let base_tool = normalized.base_tool();
-    let backend = LaunchBackend::resolve(
-        &normalized,
-        params.background,
-        normalized.uses_pty() || params.pty,
-    );
+    let backend = LaunchBackend::resolve(&normalized, params.background);
 
     // Validation
     if params.count == 0 {
@@ -2050,47 +2070,32 @@ mod tests {
 
     #[test]
     fn test_launch_tool_from_str() {
+        assert_eq!(LaunchTool::from_str("claude").unwrap(), LaunchTool::Claude);
         assert_eq!(
-            LaunchTool::from_str("claude", false).unwrap(),
-            LaunchTool::Claude
-        );
-        assert_eq!(
-            LaunchTool::from_str("claude", true).unwrap(),
+            LaunchTool::from_str("claude-pty").unwrap(),
             LaunchTool::ClaudePty
         );
+        assert_eq!(LaunchTool::from_str("gemini").unwrap(), LaunchTool::Gemini);
+        assert_eq!(LaunchTool::from_str("codex").unwrap(), LaunchTool::Codex);
         assert_eq!(
-            LaunchTool::from_str("gemini", false).unwrap(),
-            LaunchTool::Gemini
-        );
-        assert_eq!(
-            LaunchTool::from_str("codex", false).unwrap(),
-            LaunchTool::Codex
-        );
-        assert_eq!(
-            LaunchTool::from_str("opencode", false).unwrap(),
+            LaunchTool::from_str("opencode").unwrap(),
             LaunchTool::OpenCode
         );
+        assert_eq!(LaunchTool::from_str("kilo").unwrap(), LaunchTool::Kilo);
+        assert_eq!(LaunchTool::from_str("kilocode").unwrap(), LaunchTool::Kilo);
         assert_eq!(
-            LaunchTool::from_str("kilo", false).unwrap(),
-            LaunchTool::Kilo
-        );
-        assert_eq!(
-            LaunchTool::from_str("kilocode", false).unwrap(),
-            LaunchTool::Kilo
-        );
-        assert_eq!(
-            LaunchTool::from_str("antigravity", false).unwrap(),
+            LaunchTool::from_str("antigravity").unwrap(),
             LaunchTool::Antigravity
         );
         assert_eq!(
-            LaunchTool::from_str("agy", false).unwrap(),
+            LaunchTool::from_str("agy").unwrap(),
             LaunchTool::Antigravity
         );
         assert_eq!(
-            LaunchTool::from_str("copilot", false).unwrap(),
+            LaunchTool::from_str("copilot").unwrap(),
             LaunchTool::Copilot
         );
-        assert!(LaunchTool::from_str("unknown", false).is_err());
+        assert!(LaunchTool::from_str("unknown").is_err());
     }
 
     #[test]
@@ -2142,9 +2147,8 @@ mod tests {
             LaunchTool::Antigravity,
             LaunchTool::Copilot,
         ] {
-            let pty = tool.uses_pty();
             assert_eq!(
-                LaunchBackend::resolve(&tool, false, pty),
+                LaunchBackend::resolve(&tool, false),
                 LaunchBackend::InteractiveVisible,
                 "{:?} should resolve to InteractiveVisible without background",
                 tool
@@ -2154,18 +2158,20 @@ mod tests {
 
     #[test]
     fn test_launch_backend_resolve_claude_native_print() {
-        // claude + background + NO pty → NativePrint (detached -p stream-json).
+        // claude `-p`/`--print` surface (`Claude`) + background → NativePrint
+        // (detached -p stream-json). Only chosen when the caller passes -p.
         assert_eq!(
-            LaunchBackend::resolve(&LaunchTool::Claude, true, false),
+            LaunchBackend::resolve(&LaunchTool::Claude, true),
             LaunchBackend::NativePrint
         );
     }
 
     #[test]
     fn test_launch_backend_resolve_claude_pty_headless() {
-        // claude --pty --headless → HeadlessPty (PTY wrapper, live TUI).
+        // claude --headless default surface (`ClaudePty`) → HeadlessPty
+        // (PTY wrapper, live TUI).
         assert_eq!(
-            LaunchBackend::resolve(&LaunchTool::ClaudePty, true, true),
+            LaunchBackend::resolve(&LaunchTool::ClaudePty, true),
             LaunchBackend::HeadlessPty
         );
     }
@@ -2182,7 +2188,7 @@ mod tests {
             LaunchTool::Copilot,
         ] {
             assert_eq!(
-                LaunchBackend::resolve(&tool, true, true),
+                LaunchBackend::resolve(&tool, true),
                 LaunchBackend::HeadlessPty,
                 "{:?} --headless should be HeadlessPty",
                 tool

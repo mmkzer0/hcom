@@ -658,7 +658,6 @@ struct RemoteLaunchRequest {
     system_prompt: Option<String>,
     initial_prompt: Option<String>,
     background: bool,
-    pty: bool,
     terminal: Option<String>,
     cwd: Option<String>,
 }
@@ -678,7 +677,6 @@ impl RemoteLaunchRequest {
             system_prompt: optional_param(params, "system_prompt").map(ToString::to_string),
             initial_prompt: optional_param(params, "initial_prompt").map(ToString::to_string),
             background: bool_param(params, "background", false),
-            pty: bool_param(params, "pty", false),
             terminal: optional_param(params, "terminal").map(ToString::to_string),
             cwd: optional_param(params, "cwd").map(ToString::to_string),
         })
@@ -688,26 +686,19 @@ impl RemoteLaunchRequest {
 struct PreparedRemoteLaunch {
     args: Vec<String>,
     background: bool,
-    pty: bool,
 }
 
 fn prepare_remote_launch(
     request: &RemoteLaunchRequest,
     config: &HcomConfig,
 ) -> PreparedRemoteLaunch {
-    let (args, background, pty) = crate::commands::launch::prepare_launch_execution(
+    let (args, background) = crate::commands::launch::prepare_launch_execution(
         &request.tool,
         &request.args,
         config,
         request.background,
-        request.pty,
-        request.initial_prompt.as_deref(),
     );
-    PreparedRemoteLaunch {
-        args,
-        background,
-        pty,
-    }
+    PreparedRemoteLaunch { args, background }
 }
 
 struct RemoteResumeRequest {
@@ -744,7 +735,6 @@ fn handle_remote_launch(
     crate::commands::launch::validate_claude_headless_launch(
         &request.tool,
         prepared.background,
-        prepared.pty,
         &prepared.args,
         request.initial_prompt.as_deref(),
     )
@@ -760,7 +750,6 @@ fn handle_remote_launch(
             tag: request.tag,
             system_prompt: request.system_prompt,
             initial_prompt: request.initial_prompt,
-            pty: prepared.pty,
             background: prepared.background,
             cwd: Some(cwd.clone()),
             env: None,
@@ -1453,7 +1442,7 @@ mod tests {
     }
 
     #[test]
-    fn test_prepare_remote_launch_supports_interactive_pty() {
+    fn test_prepare_remote_launch_supports_interactive() {
         let request = RemoteLaunchRequest::from_params(&json!({
             "tool": "codex",
             "count": 1,
@@ -1463,7 +1452,6 @@ mod tests {
         .unwrap();
         let prepared = prepare_remote_launch(&request, &HcomConfig::default());
         assert!(!prepared.background);
-        assert!(prepared.pty);
         assert_eq!(prepared.args, vec!["--model", "gpt-5.4"]);
     }
 
@@ -1478,13 +1466,32 @@ mod tests {
         .unwrap();
         let prepared = prepare_remote_launch(&request, &HcomConfig::default());
         assert!(prepared.background);
-        assert!(!prepared.pty);
     }
 
     #[test]
-    fn test_prepare_remote_launch_claude_headless_with_hcom_prompt_injects_print() {
-        // Remote claude --headless --hcom-prompt "..." must go through the same
+    fn test_prepare_remote_launch_claude_print_normalizes() {
+        // Remote `claude -p` (explicit print mode) must go through the same
         // print-mode normalization as the local path.
+        let request = RemoteLaunchRequest::from_params(&json!({
+            "tool": "claude",
+            "count": 1,
+            "args": ["-p"],
+            "background": true,
+            "initial_prompt": "say hi in hcom",
+        }))
+        .unwrap();
+        let prepared = prepare_remote_launch(&request, &HcomConfig::default());
+        assert!(prepared.background);
+        let spec = crate::hooks::claude_args::resolve_claude_args(Some(&prepared.args), None);
+        assert!(spec.is_background);
+        assert!(spec.has_flag(&["--output-format"], &["--output-format="]));
+        assert!(spec.has_flag(&["--verbose"], &[]));
+    }
+
+    #[test]
+    fn test_prepare_remote_launch_claude_headless_stays_pty() {
+        // Bare remote `claude --headless` (no -p) is the live PTY session — no -p
+        // is injected, no print-mode defaults, matching the local path.
         let request = RemoteLaunchRequest::from_params(&json!({
             "tool": "claude",
             "count": 1,
@@ -1495,27 +1502,18 @@ mod tests {
         .unwrap();
         let prepared = prepare_remote_launch(&request, &HcomConfig::default());
         assert!(prepared.background);
-        assert!(!prepared.pty);
         let spec = crate::hooks::claude_args::resolve_claude_args(Some(&prepared.args), None);
-        assert!(
-            spec.is_background,
-            "remote claude + --headless + --hcom-prompt must inject -p"
-        );
-        assert!(spec.has_flag(&["--output-format"], &["--output-format="]));
-        assert!(spec.has_flag(&["--verbose"], &[]));
+        assert!(!spec.is_background, "no -p → live PTY session, not print");
     }
 
     #[test]
-    fn test_remote_launch_rejects_bare_claude_headless() {
-        // Bare remote `claude --headless` with no prompt must be rejected, matching
-        // the local CLI path's validate_claude_headless_launch invariant. Without
-        // this, the remote handler would fall through to a detached plain-claude
-        // launch. (We only assert the prepared state + validator result here,
-        // without calling the full handle_remote_launch which needs a live DB.)
+    fn test_remote_launch_rejects_claude_print_without_prompt() {
+        // Remote `claude -p` with no prompt must be rejected, matching the local
+        // CLI path's validate_claude_headless_launch invariant.
         let request = RemoteLaunchRequest::from_params(&json!({
             "tool": "claude",
             "count": 1,
-            "args": [],
+            "args": ["-p"],
             "background": true,
         }))
         .unwrap();
@@ -1524,7 +1522,6 @@ mod tests {
         let err = crate::commands::launch::validate_claude_headless_launch(
             &request.tool,
             prepared.background,
-            prepared.pty,
             &prepared.args,
             request.initial_prompt.as_deref(),
         )

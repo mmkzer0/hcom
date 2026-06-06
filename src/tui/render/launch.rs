@@ -18,8 +18,9 @@ pub fn render_launch_inline(frame: &mut Frame, area: Rect, app: &App) {
         field_row_text("Tag", &ls.tag, LaunchField::Tag, ls, w),
     ];
 
-    // Headless is available for every tool. Claude cycles off/print/pty; other
-    // tools are a plain on/off toggle (their only headless mode is the PTY wrapper).
+    // Headless is available for every tool. Claude cycles off/pty/print (pty is
+    // the default; print is opt-in `-p`); other tools are a plain on/off toggle
+    // (their only headless mode is the PTY wrapper).
     {
         let check = if ls.tool == Tool::Claude {
             match (ls.headless, ls.headless_pty) {
