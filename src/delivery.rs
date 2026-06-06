@@ -1916,7 +1916,18 @@ fn instance_owns_process_binding(db: &HcomDb, process_id: &str, current_name: &s
 /// Hard PTY exit cleanup: inactive status, life event, delete instance row.
 pub(crate) fn cleanup_deleted_instance(db: &mut HcomDb, current_name: &str) {
     let snapshot = match db.get_instance_snapshot(current_name) {
-        Ok(snap) => snap,
+        Ok(Some(snap)) => Some(snap),
+        Ok(None) => {
+            log_info(
+                "native",
+                "delivery.cleanup_skipped",
+                &format!(
+                    "Skipping PTY stop event for {} because the instance row is already gone",
+                    current_name
+                ),
+            );
+            return;
+        }
         Err(e) => {
             log_error(
                 "native",
@@ -2017,6 +2028,46 @@ mod tests {
             last_prompt_submit: None,
             approval_scrape_latched: false,
         }
+    }
+
+    #[test]
+    fn pty_cleanup_does_not_log_stop_after_instance_already_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let mut db = HcomDb::open_raw(&db_path).unwrap();
+        db.init_db().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, status_context, status_time, created_at)
+                 VALUES ('buli', 'pi', 'active', 'running', 0, 0)",
+                [],
+            )
+            .unwrap();
+
+        let snapshot = db.get_instance_snapshot("buli").unwrap();
+        db.log_life_event("buli", "stopped", "samu", "killed", snapshot)
+            .unwrap();
+        db.delete_instance("buli").unwrap();
+
+        cleanup_deleted_instance(&mut db, "buli");
+
+        let events: Vec<(String, String)> = db
+            .conn()
+            .prepare(
+                "SELECT json_extract(data, '$.by'), json_extract(data, '$.reason')
+                 FROM events
+                 WHERE type = 'life'
+                   AND instance = 'buli'
+                   AND json_extract(data, '$.action') = 'stopped'
+                 ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+
+        assert_eq!(events, vec![("samu".to_string(), "killed".to_string())]);
     }
 
     // ---- evaluate_gate tests ----
