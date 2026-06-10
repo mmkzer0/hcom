@@ -37,6 +37,41 @@ use crate::delivery::{DeliveryState, ScreenState, ToolConfig, run_delivery_loop}
 use crate::log::{log_error, log_info, log_warn};
 use crate::notify::NotifyServer;
 use crate::shared::status_icon;
+use crate::tool::Tool;
+
+/// Identity of the process wrapped by the PTY.
+///
+/// Arbitrary commands are supported for diagnostics and tests, but they must
+/// remain explicitly ad-hoc rather than inheriting a known integration's
+/// behavior when their command name does not parse as a [`Tool`].
+#[derive(Clone, Debug)]
+pub enum PtyTarget {
+    Known(Tool),
+    AdhocCommand(String),
+}
+
+impl PtyTarget {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Known(tool) => tool.as_str(),
+            Self::AdhocCommand(command) => command,
+        }
+    }
+
+    fn known_tool(&self) -> Option<Tool> {
+        match self {
+            Self::Known(tool) => Some(*tool),
+            Self::AdhocCommand(_) => None,
+        }
+    }
+
+    fn delivery_tool(&self) -> Tool {
+        match self {
+            Self::Known(tool) => *tool,
+            Self::AdhocCommand(_) => Tool::Adhoc,
+        }
+    }
+}
 
 /// Tracks what type of incomplete escape sequence is pending on stdout.
 /// Used to defer title writes until the sequence completes across read boundaries.
@@ -589,8 +624,8 @@ pub struct ProxyConfig {
     pub ready_pattern: Vec<u8>,
     /// Instance name for logging and database tracking
     pub instance_name: Option<String>,
-    /// Tool name (claude, gemini, codex)
-    pub tool: String,
+    /// Known integration or explicit ad-hoc command.
+    pub target: PtyTarget,
     /// Extra environment variables to set in the child process
     pub env_vars: Vec<(String, String)>,
 }
@@ -600,7 +635,7 @@ impl Default for ProxyConfig {
         Self {
             ready_pattern: b"? for shortcuts".to_vec(),
             instance_name: None,
-            tool: "claude".to_string(),
+            target: PtyTarget::Known(Tool::Claude),
             env_vars: vec![],
         }
     }
@@ -812,18 +847,15 @@ impl Proxy {
 
         // For Claude in accept-edits mode, ready pattern may be hidden.
         // Start delivery after timeout if ready pattern not seen.
-        use crate::tool::Tool;
-        use std::str::FromStr;
-
-        let delivery_start_timeout = match Tool::from_str(&self.config.tool) {
-            Ok(Tool::Claude)
-            | Ok(Tool::Codex)
-            | Ok(Tool::Antigravity)
-            | Ok(Tool::Cursor)
-            | Ok(Tool::Kimi) => {
+        let delivery_start_timeout = match self.config.target.known_tool() {
+            Some(Tool::Claude)
+            | Some(Tool::Codex)
+            | Some(Tool::Antigravity)
+            | Some(Tool::Cursor)
+            | Some(Tool::Kimi) => {
                 Duration::from_secs(5) // ? for shortcuts footer (Claude/Codex/agy)
             }
-            Ok(Tool::OpenCode) | Ok(Tool::Kilo) | Ok(Tool::Pi) => Duration::from_secs(5),
+            Some(Tool::OpenCode) | Some(Tool::Kilo) | Some(Tool::Pi) => Duration::from_secs(5),
             _ => Duration::from_secs(60), // Gemini: ready pattern always visible
         };
 
@@ -913,7 +945,7 @@ impl Proxy {
                     // child-output path at line ~621 may never run)
                     if !delivery_started && startup_time.elapsed() > delivery_start_timeout {
                         self.screen.dump_screen(
-                            &self.config.tool,
+                            self.config.target.name(),
                             self.inject_server.port(),
                             "Starting delivery thread (poll timeout)",
                         );
@@ -924,7 +956,7 @@ impl Proxy {
                     self.screen.check_debug_flag();
                     // Periodic debug dump every 5 seconds
                     self.screen.check_periodic_dump(
-                        &self.config.tool,
+                        self.config.target.name(),
                         self.inject_server.port(),
                         "Periodic dump (main loop)",
                     );
@@ -1037,7 +1069,7 @@ impl Proxy {
                         if !ready_signaled && self.screen.is_ready() {
                             ready_signaled = true;
                             self.screen.dump_screen(
-                                &self.config.tool,
+                                self.config.target.name(),
                                 self.inject_server.port(),
                                 "Ready pattern detected",
                             );
@@ -1047,7 +1079,7 @@ impl Proxy {
                                 ready_signaled || startup_time.elapsed() > delivery_start_timeout;
                             if should_start {
                                 self.screen.dump_screen(
-                                    &self.config.tool,
+                                    self.config.target.name(),
                                     self.inject_server.port(),
                                     "Starting delivery thread",
                                 );
@@ -1110,7 +1142,7 @@ impl Proxy {
                             // must not force-clear it, or the status flickers off
                             // "blocked: approval pending". The update_delivery_state
                             // latch clears once the prompt actually leaves the screen.
-                            let cursor_scrape = self.config.tool == "cursor";
+                            let cursor_scrape = self.config.target.name() == "cursor";
                             if !cursor_scrape {
                                 self.screen.clear_approval();
                             }
@@ -1125,7 +1157,7 @@ impl Proxy {
                             // (it enables DECSET 1004). Since hcom drives it via
                             // injection, that pause silently stalls delivery until the
                             // pane is refocused — so hide focus events from it.
-                            if self.config.tool == "copilot"
+                            if self.config.target.name() == "copilot"
                                 && let Some(filtered) = strip_focus_events(&buf[..n])
                             {
                                 write_all(&self.pty_master, &filtered)?;
@@ -1168,9 +1200,10 @@ impl Proxy {
                         }
                         inject::InjectResult::Query(client) => match client.command {
                             inject::QueryCommand::Screen => {
-                                let dump = self
-                                    .screen
-                                    .get_screen_dump(&self.config.tool, self.inject_server.port());
+                                let dump = self.screen.get_screen_dump(
+                                    self.config.target.name(),
+                                    self.inject_server.port(),
+                                );
                                 client.respond(&dump);
                             }
                             inject::QueryCommand::Unknown => {
@@ -1207,7 +1240,7 @@ impl Proxy {
                 if !name.is_empty() && (name != last_written_name || status != last_written_status)
                 {
                     let icon = status_icon(&status);
-                    let title = format!("{} {} [{}]", icon, name, self.config.tool);
+                    let title = format!("{} {} [{}]", icon, name, self.config.target.name());
                     let escape = format!("\x1b]1;{}\x07\x1b]2;{}\x07", title, title);
                     write_all(&stdout_fd, escape.as_bytes())?;
                     last_written_name = name;
@@ -1393,7 +1426,7 @@ impl Proxy {
             // through to `prompt_has_text` ("uncommitted text"). Codex (OSC9) and
             // antigravity keep their existing immediate signals below.
             let cursor_approval =
-                self.config.tool == "cursor" && self.screen.is_cursor_approval_visible();
+                self.config.target.name() == "cursor" && self.screen.is_cursor_approval_visible();
             state.approval_scrape_latched = crate::delivery::latch_scraped_approval(
                 state.approval_scrape_latched,
                 cursor_approval,
@@ -1401,10 +1434,10 @@ impl Proxy {
                     .is_output_stable(crate::delivery::APPROVAL_SCRAPE_CLEAR_MS),
             );
             state.approval = self.screen.is_waiting_approval()
-                || (self.config.tool == "antigravity"
+                || (self.config.target.name() == "antigravity"
                     && self.screen.is_antigravity_approval_visible())
                 || state.approval_scrape_latched;
-            let input_text = self.screen.get_input_box_text(&self.config.tool);
+            let input_text = self.screen.get_input_box_text(self.config.target.name());
             let new_prompt_empty = input_text.as_ref().is_some_and(|t| t.is_empty());
             // Stamp submit-edge cooldown when input transitions from a known
             // non-empty value to empty or briefly undetected. Guards against
@@ -1459,17 +1492,14 @@ impl Proxy {
         let delivery_state = self.delivery_state.clone();
         let launch_phase_active = self.launch_phase_active.clone();
         let inject_port = self.inject_server.port();
-        let tool = self.config.tool.clone();
+        let target = self.config.target.clone();
         let user_activity_cooldown_ms = self.user_activity_cooldown_ms;
         let notify_port_shared = self.notify_port.clone();
         let shared_name = self.current_name.clone();
         let shared_status = self.current_status.clone();
 
         // For Codex: spawn transcript watcher thread
-        use crate::tool::Tool;
-        use std::str::FromStr;
-
-        if let Ok(Tool::Codex) = Tool::from_str(&tool) {
+        if matches!(target.known_tool(), Some(Tool::Codex)) {
             let watcher_running = self.running.clone();
             let watcher_name = instance_name.clone();
             std::thread::spawn(move || {
@@ -1540,8 +1570,7 @@ impl Proxy {
             };
 
             // Get tool config
-            let tool_kind = Tool::from_str(&tool).unwrap_or(Tool::Claude);
-            let config = ToolConfig::for_tool(tool_kind);
+            let config = ToolConfig::for_tool(target.delivery_tool());
 
             // Run delivery loop (pass shared state for main loop's OSC override)
             run_delivery_loop(
@@ -1723,11 +1752,21 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{initialize_delivery_components, prompt_submit_observed, strip_focus_events};
+    use super::{
+        PtyTarget, initialize_delivery_components, prompt_submit_observed, strip_focus_events,
+    };
     use anyhow::anyhow;
     use rusqlite::Connection;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn adhoc_pty_target_stays_adhoc_for_delivery() {
+        let target = PtyTarget::AdhocCommand("bash".to_string());
+        assert_eq!(target.name(), "bash");
+        assert_eq!(target.known_tool(), None);
+        assert_eq!(target.delivery_tool(), crate::tool::Tool::Adhoc);
+    }
 
     fn setup_test_db(with_notify_endpoints: bool) -> PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);

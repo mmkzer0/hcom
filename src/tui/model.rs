@@ -75,7 +75,7 @@ impl AgentStatus {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Tool {
     Claude,
     Gemini,
@@ -88,33 +88,43 @@ pub enum Tool {
     Kimi,
     Copilot,
     Adhoc,
+    /// Persisted value written by a newer or third-party integration.
+    Unknown(String),
 }
 
 impl Tool {
     /// Convert to the canonical `crate::tool::Tool` for spec lookup.
-    pub fn canonical(self) -> crate::tool::Tool {
+    pub fn canonical(&self) -> Option<crate::tool::Tool> {
         match self {
-            Self::Claude => crate::tool::Tool::Claude,
-            Self::Gemini => crate::tool::Tool::Gemini,
-            Self::Codex => crate::tool::Tool::Codex,
-            Self::OpenCode => crate::tool::Tool::OpenCode,
-            Self::Kilo => crate::tool::Tool::Kilo,
-            Self::Pi => crate::tool::Tool::Pi,
-            Self::Antigravity => crate::tool::Tool::Antigravity,
-            Self::Cursor => crate::tool::Tool::Cursor,
-            Self::Kimi => crate::tool::Tool::Kimi,
-            Self::Copilot => crate::tool::Tool::Copilot,
-            Self::Adhoc => crate::tool::Tool::Adhoc,
+            Self::Claude => Some(crate::tool::Tool::Claude),
+            Self::Gemini => Some(crate::tool::Tool::Gemini),
+            Self::Codex => Some(crate::tool::Tool::Codex),
+            Self::OpenCode => Some(crate::tool::Tool::OpenCode),
+            Self::Kilo => Some(crate::tool::Tool::Kilo),
+            Self::Pi => Some(crate::tool::Tool::Pi),
+            Self::Antigravity => Some(crate::tool::Tool::Antigravity),
+            Self::Cursor => Some(crate::tool::Tool::Cursor),
+            Self::Kimi => Some(crate::tool::Tool::Kimi),
+            Self::Copilot => Some(crate::tool::Tool::Copilot),
+            Self::Adhoc => Some(crate::tool::Tool::Adhoc),
+            Self::Unknown(_) => None,
         }
     }
 
-    /// Integration spec for this TUI tool.
-    pub fn spec(self) -> &'static crate::integration_spec::IntegrationSpec {
-        self.canonical().spec()
+    /// Integration spec for known TUI tools.
+    pub fn spec(&self) -> Option<&'static crate::integration_spec::IntegrationSpec> {
+        self.canonical().map(crate::tool::Tool::spec)
     }
 
-    pub fn name(&self) -> &'static str {
-        self.spec().name
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Unknown(raw) => raw,
+            _ => {
+                self.spec()
+                    .expect("known TUI tool must have an integration spec")
+                    .name
+            }
+        }
     }
 
     /// Cycle forward (for launch panel). Adhoc is not launchable.
@@ -131,6 +141,7 @@ impl Tool {
             Self::Kimi => Self::Copilot,
             Self::Copilot => Self::Claude,
             Self::Adhoc => Self::Adhoc,
+            Self::Unknown(raw) => Self::Unknown(raw.clone()),
         }
     }
 
@@ -148,6 +159,7 @@ impl Tool {
             Self::Kimi => Self::Cursor,
             Self::Copilot => Self::Kimi,
             Self::Adhoc => Self::Adhoc,
+            Self::Unknown(raw) => Self::Unknown(raw.clone()),
         }
     }
 }
@@ -204,7 +216,7 @@ impl Agent {
     }
 
     pub fn can_resume(&self) -> bool {
-        self.is_stopped() && self.tool.spec().resume.is_some()
+        self.is_stopped() && self.tool.spec().is_some_and(|spec| spec.resume.is_some())
     }
 
     pub fn can_fork_from_tui(&self) -> bool {
@@ -213,7 +225,7 @@ impl Agent {
             && self
                 .tool
                 .spec()
-                .resume
+                .and_then(|spec| spec.resume)
                 .is_some_and(|resume| resume.fork.is_some())
     }
 

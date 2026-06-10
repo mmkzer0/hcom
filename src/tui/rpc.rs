@@ -190,7 +190,7 @@ mod tests {
             Tool::Copilot,
             Tool::OpenCode,
         ] {
-            let argv = build_launch_argv(tool, 1, "", false, false, "kitty", "fix the bug");
+            let argv = build_launch_argv(tool.clone(), 1, "", false, false, "kitty", "fix the bug");
             assert_eq!(
                 argv,
                 vec![

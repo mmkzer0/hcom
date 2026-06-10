@@ -175,7 +175,7 @@ fn run_op(op: &RpcOp) -> Result<Response, String> {
             prompt,
         } => {
             let argv = build_launch_argv(
-                *tool,
+                tool.clone(),
                 *count,
                 tag,
                 *headless,

@@ -1080,7 +1080,7 @@ impl App {
             KeyCode::Right => cursor_right(&self.ui.input, &mut self.ui.input_cursor),
 
             KeyCode::Enter => {
-                let tool = self.ui.launch.tool;
+                let tool = self.ui.launch.tool.clone();
                 let count = self.ui.launch.count;
                 let tag = self.ui.launch.tag.clone();
                 let headless = self.ui.launch.headless;
@@ -1093,6 +1093,7 @@ impl App {
                     .map(|s| s.as_str())
                     .unwrap_or("auto");
                 let prompt = self.ui.input.clone();
+                let tool_name = tool.name().to_string();
 
                 if let Err(e) = self.enqueue_rpc(RpcOp::Launch {
                     tool,
@@ -1109,7 +1110,7 @@ impl App {
                     ));
                 } else {
                     self.ui.flash = Some(Flash::new(
-                        format!("Launching {} {}", count, tool.name()),
+                        format!("Launching {} {}", count, tool_name),
                         Theme::flash_info(),
                     ));
                 }

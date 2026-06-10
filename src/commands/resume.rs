@@ -763,16 +763,19 @@ fn should_preview_resume(
 }
 
 fn validate_resume_operation(tool: &str, fork: bool) -> Result<()> {
+    let tool_lookup = if tool == "claude-pty" { "claude" } else { tool };
+    let parsed = tool_lookup
+        .parse::<crate::tool::Tool>()
+        .map_err(|_| anyhow::anyhow!("Unknown tool '{}' in saved session metadata", tool))?;
+
     if !fork {
         return Ok(());
     }
     // Drive fork support from the spec so help text and validation can't drift.
     // Accepts canonical names + aliases (e.g. `"agy"` → Antigravity).
-    if let Ok(parsed) = tool.parse::<crate::tool::Tool>() {
-        let spec = parsed.spec();
-        if spec.resume.and_then(|r| r.fork).is_none() {
-            bail!("{} does not support session forking (hcom f)", spec.label);
-        }
+    let spec = parsed.spec();
+    if spec.resume.and_then(|r| r.fork).is_none() {
+        bail!("{} does not support session forking (hcom f)", spec.label);
     }
     Ok(())
 }
@@ -1006,20 +1009,25 @@ fn build_resume_args(tool: &str, session_id: &str, fork: bool) -> Vec<String> {
 fn merge_resume_args(tool: &str, original: &[String], resume: &[String]) -> Vec<String> {
     // Resume args take precedence. We strip --resume/--session from original
     // and prepend resume args.
+    let tool_lookup = if tool == "claude-pty" { "claude" } else { tool };
+    let tool = tool_lookup
+        .parse::<crate::tool::Tool>()
+        .expect("resume tool must be validated before argument merging");
+
     match tool {
-        "claude" | "claude-pty" => {
+        crate::tool::Tool::Claude => {
             let orig_spec = claude_args::resolve_claude_args(Some(original), None);
             let resume_spec = claude_args::resolve_claude_args(Some(resume), None);
             let merged = claude_args::merge_claude_args(&orig_spec, &resume_spec);
             merged.rebuild_tokens(true)
         }
-        "gemini" => {
+        crate::tool::Tool::Gemini => {
             let orig_spec = gemini_args::resolve_gemini_args(Some(original), None);
             let resume_spec = gemini_args::resolve_gemini_args(Some(resume), None);
             let merged = gemini_args::merge_gemini_args(&orig_spec, &resume_spec);
             merged.rebuild_tokens(true, true)
         }
-        "codex" => {
+        crate::tool::Tool::Codex => {
             let stripped_original =
                 crate::tools::codex_preprocessing::strip_codex_developer_instructions(original);
             let orig_spec = codex_args::resolve_codex_args(Some(&stripped_original), None);
@@ -1027,15 +1035,16 @@ fn merge_resume_args(tool: &str, original: &[String], resume: &[String]) -> Vec<
             let merged = codex_args::merge_codex_args(&orig_spec, &resume_spec);
             merged.rebuild_tokens(true, true)
         }
-        "opencode" | "kilo" => merge_opencode_args(original, resume),
-        "antigravity" => merge_antigravity_args(original, resume),
-        "cursor" => merge_cursor_args(original, resume),
-        "kimi" => merge_kimi_args(original, resume),
-        "copilot" => merge_copilot_args(original, resume),
-        "pi" => merge_pi_args(original, resume),
-        _ => {
-            // For unknown tools: resume args only.
-            resume.to_vec()
+        crate::tool::Tool::OpenCode | crate::tool::Tool::Kilo => {
+            merge_opencode_args(original, resume)
+        }
+        crate::tool::Tool::Antigravity => merge_antigravity_args(original, resume),
+        crate::tool::Tool::Cursor => merge_cursor_args(original, resume),
+        crate::tool::Tool::Kimi => merge_kimi_args(original, resume),
+        crate::tool::Tool::Copilot => merge_copilot_args(original, resume),
+        crate::tool::Tool::Pi => merge_pi_args(original, resume),
+        crate::tool::Tool::Adhoc => {
+            unreachable!("Adhoc sessions do not support resume argument merging")
         }
     }
 }
@@ -2229,6 +2238,14 @@ mod tests {
     #[test]
     fn test_validate_resume_operation_allows_gemini_resume() {
         assert!(validate_resume_operation("gemini", false).is_ok());
+    }
+
+    #[test]
+    fn test_validate_resume_operation_rejects_unknown_tool() {
+        let err = validate_resume_operation("future-tool", false)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "Unknown tool 'future-tool' in saved session metadata");
     }
 
     #[test]

@@ -23,11 +23,14 @@ fn file_operations_query() -> String {
     )
 }
 
+/// `(transcript_path, tool, session_id)` for a bundle target.
+type BundleTranscriptSource = (Option<String>, String, Option<String>);
+
 fn lookup_bundle_transcript_source(
     db: &HcomDb,
     agent: &str,
-) -> (Option<String>, String, Option<String>) {
-    if let Ok((path, tool, sid)) = db.conn().query_row(
+) -> Result<Option<BundleTranscriptSource>, String> {
+    match db.conn().query_row(
         "SELECT transcript_path, tool, session_id FROM instances WHERE name = ?",
         rusqlite::params![agent],
         |row| {
@@ -38,10 +41,16 @@ fn lookup_bundle_transcript_source(
             ))
         },
     ) {
-        return (path, tool, sid);
+        Ok(source) => return Ok(Some(source)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => {}
+        Err(e) => {
+            return Err(format!(
+                "Failed to read transcript metadata for active agent '{agent}': {e}"
+            ));
+        }
     }
 
-    if let Ok((path, tool, sid)) = db.conn().query_row(
+    match db.conn().query_row(
         "SELECT
             json_extract(data, '$.snapshot.transcript_path'),
             json_extract(data, '$.snapshot.tool'),
@@ -62,10 +71,12 @@ fn lookup_bundle_transcript_source(
             ))
         },
     ) {
-        return (path, tool, sid);
+        Ok(source) => Ok(Some(source)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(format!(
+            "Failed to read transcript metadata for stopped agent '{agent}': {e}"
+        )),
     }
-
-    (None, "claude".into(), None)
 }
 
 /// Parsed arguments for `hcom bundle`.
@@ -777,17 +788,23 @@ fn cmd_bundle_prepare(db: &HcomDb, args: &BundlePrepareArgs, ctx: Option<&Comman
     };
 
     // C5 fix: get transcript text
-    let (transcript_path, tool, bundle_session_id) = lookup_bundle_transcript_source(db, &agent);
+    let transcript_source = match lookup_bundle_transcript_source(db, &agent) {
+        Ok(source) => source,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return 1;
+        }
+    };
 
     let mut transcript_text: Option<String> = None;
     let mut transcript_range: Option<String> = None;
 
-    if let Some(ref tpath) = transcript_path
+    if let Some((Some(tpath), tool, bundle_session_id)) = transcript_source.as_ref()
         && Path::new(tpath).exists()
     {
         let tq = TranscriptQuery {
             path: tpath,
-            agent: &tool,
+            agent: tool,
             last: last_transcript,
             detailed: false,
             session_id: bundle_session_id.as_deref(),
@@ -1541,7 +1558,9 @@ mod tests {
         db.log_life_event("huno", "stopped", "cli", "killed", Some(snapshot))
             .unwrap();
 
-        let (path, tool, sid) = lookup_bundle_transcript_source(&db, "huno");
+        let (path, tool, sid) = lookup_bundle_transcript_source(&db, "huno")
+            .unwrap()
+            .unwrap();
         assert_eq!(
             path.as_deref(),
             Some(transcript_path.to_string_lossy().as_ref())
@@ -1559,5 +1578,14 @@ mod tests {
         let exchanges = get_exchanges_pub(&tq).unwrap();
         assert_eq!(exchanges.len(), 1);
         assert_eq!(exchanges[0]["position"], 1);
+    }
+
+    #[test]
+    fn test_lookup_bundle_transcript_source_does_not_invent_claude_metadata() {
+        let db = test_db();
+        assert_eq!(
+            lookup_bundle_transcript_source(&db, "missing").unwrap(),
+            None
+        );
     }
 }

@@ -490,15 +490,8 @@ impl ToolConfig {
     /// Build a `ToolConfig` from the per-tool [`IntegrationSpec.gates`].
     ///
     /// Gate booleans (and their rationale) live in `integration_spec.rs`.
-    /// `Tool::Adhoc` borrows Claude's gates — preserved as a quirk of the old
-    /// `for_tool` match arm.
     pub fn for_tool(tool: crate::tool::Tool) -> Self {
-        let gates_tool = if matches!(tool, crate::tool::Tool::Adhoc) {
-            crate::tool::Tool::Claude
-        } else {
-            tool
-        };
-        let g = &gates_tool.spec().gates;
+        let g = &tool.spec().gates;
         Self {
             tool: tool.as_str().to_string(),
             require_idle: g.require_idle,
@@ -2454,10 +2447,16 @@ mod tests {
     // ---- ToolConfig ----
 
     #[test]
-    fn tool_config_for_adhoc_defaults_to_claude() {
+    fn tool_config_for_adhoc_uses_adhoc_identity_and_gates() {
         let config = ToolConfig::for_tool(crate::tool::Tool::Adhoc);
-        assert!(config.require_prompt_empty);
-        assert!(!config.require_ready_prompt);
+        let gates = &crate::tool::Tool::Adhoc.spec().gates;
+        assert_eq!(config.tool, "adhoc");
+        assert_eq!(config.require_idle, gates.require_idle);
+        assert_eq!(config.require_ready_prompt, gates.require_ready_prompt);
+        assert_eq!(config.require_prompt_empty, gates.require_prompt_empty);
+        assert_eq!(config.block_on_user_activity, gates.block_on_user_activity);
+        assert_eq!(config.block_on_approval, gates.block_on_approval);
+        assert_eq!(config.launch_requires_ready, gates.launch_requires_ready);
     }
 
     #[test]

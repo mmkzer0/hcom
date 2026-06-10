@@ -94,10 +94,11 @@ pub fn run_pty(args: &[String]) -> Result<()> {
     let tool_str = &args[0];
     let tool_args: Vec<&str> = args[1..].iter().map(|s| s.as_str()).collect();
 
-    // Parse tool - use enum for known tools, raw string for testing arbitrary commands
-    let (ready_pattern, tool_name) = match tool::Tool::from_str(tool_str) {
-        Ok(tool) => (tool.ready_pattern().to_vec(), tool_str.to_string()),
-        Err(_) => (vec![], tool_str.to_string()), // Allow arbitrary commands for testing
+    // Keep arbitrary commands explicit so they cannot inherit a known tool's
+    // delivery behavior merely because parsing failed.
+    let (ready_pattern, target) = match tool::Tool::from_str(tool_str) {
+        Ok(tool) => (tool.ready_pattern().to_vec(), pty::PtyTarget::Known(tool)),
+        Err(_) => (vec![], pty::PtyTarget::AdhocCommand(tool_str.to_string())),
     };
 
     let instance_name = config::Config::get().instance_name;
@@ -133,7 +134,7 @@ pub fn run_pty(args: &[String]) -> Result<()> {
         pty::ProxyConfig {
             ready_pattern,
             instance_name,
-            tool: tool_name,
+            target,
             env_vars: pty_child_env(),
         },
     )

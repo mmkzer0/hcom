@@ -932,8 +932,8 @@ pub static ADHOC: IntegrationSpec = IntegrationSpec {
         shared_hooks_with: None,
         invocation: HookInvocation::None,
     },
-    // Adhoc inherits Claude gates — delivery is manual via `hcom listen` /
-    // hookless CLI unread, so the values are documented but mostly unused.
+    // Adhoc delivery is manual via `hcom listen` / hookless CLI unread, so
+    // these conservative gates are documented but mostly unused.
     gates: GatesSpec {
         require_idle: true,
         require_ready_prompt: false,

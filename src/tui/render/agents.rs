@@ -69,7 +69,7 @@ fn agent_icon(agent: &Agent, tick: u64) -> &'static str {
     if agent.status == AgentStatus::Launching {
         SPINNER_FRAMES[(tick as usize / 2) % SPINNER_FRAMES.len()]
     } else if agent.status != AgentStatus::Listening
-        && let Some(icon) = agent.tool.spec().adhoc_icon
+        && let Some(icon) = agent.tool.spec().and_then(|spec| spec.adhoc_icon)
     {
         icon
     } else {
@@ -77,9 +77,16 @@ fn agent_icon(agent: &Agent, tick: u64) -> &'static str {
     }
 }
 
-/// 4-char tool prefix for multi-tool display.
-fn tool_prefix_str(tool: Tool) -> &'static str {
-    tool.spec().tui_prefix
+/// Compact tool prefix for multi-tool display.
+fn tool_prefix_str(tool: &Tool) -> String {
+    match tool {
+        Tool::Unknown(raw) => raw.chars().take(4).collect(),
+        _ => tool
+            .spec()
+            .expect("known TUI tool must have an integration spec")
+            .tui_prefix
+            .to_string(),
+    }
 }
 
 fn collect_agent_lines(app: &App, width: u16, max_visible: usize) -> Vec<Line<'static>> {
@@ -451,7 +458,7 @@ fn stopped_agent_line(
         Span::styled(cursor_str.to_string(), cursor_style),
     ];
     if multi_tool {
-        left.push(Span::styled(tool_prefix_str(agent.tool).to_string(), dim));
+        left.push(Span::styled(tool_prefix_str(&agent.tool), dim));
     }
     left.extend([
         Span::styled("\u{25cb} ", Style::default().fg(palette::FG_DIM)),
@@ -483,7 +490,7 @@ fn orphan_line(orphan: &OrphanProcess, is_cursor: bool, width: u16) -> Line<'sta
         Span::raw("    "), // extra indent under header
         Span::styled(cursor_str.to_string(), cursor_style),
         Span::styled("\u{2716} ", Style::default().fg(palette::RED)), // ✖
-        Span::styled(tool_prefix_str(orphan.tool).to_string(), Theme::dim()),
+        Span::styled(tool_prefix_str(&orphan.tool), Theme::dim()),
         Span::styled(
             format!("{:<6}", orphan.pid),
             Style::default().fg(palette::FG_DIM),
@@ -528,10 +535,7 @@ fn remote_agent_line(
         Span::styled(cursor_str.to_string(), cursor_style),
     ];
     if multi_tool {
-        left.push(Span::styled(
-            tool_prefix_str(ragent.tool).to_string(),
-            Theme::dim(),
-        ));
+        left.push(Span::styled(tool_prefix_str(&ragent.tool), Theme::dim()));
     }
     left.extend([
         Span::styled(icon.to_string(), ragent.status.style()),
@@ -601,10 +605,7 @@ fn compact_agent_line(
         Span::raw(" "),
     ];
     if multi_tool {
-        spans.push(Span::styled(
-            tool_prefix_str(agent.tool).to_string(),
-            Theme::dim(),
-        ));
+        spans.push(Span::styled(tool_prefix_str(&agent.tool), Theme::dim()));
     }
     spans.extend([
         Span::styled(icon.to_string(), agent.status.style()),

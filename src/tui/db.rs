@@ -234,18 +234,19 @@ fn json_str<'a>(v: &'a serde_json::Value, key: &str, default: &'a str) -> &'a st
 }
 
 fn parse_tool(s: &str) -> Tool {
-    match s {
-        "claude" => Tool::Claude,
-        "gemini" => Tool::Gemini,
-        "codex" => Tool::Codex,
-        "opencode" => Tool::OpenCode,
-        "kilo" => Tool::Kilo,
-        "pi" => Tool::Pi,
-        "antigravity" => Tool::Antigravity,
-        "cursor" => Tool::Cursor,
-        "kimi" => Tool::Kimi,
-        "copilot" => Tool::Copilot,
-        _ => Tool::Adhoc,
+    match s.parse::<crate::tool::Tool>() {
+        Ok(crate::tool::Tool::Claude) => Tool::Claude,
+        Ok(crate::tool::Tool::Gemini) => Tool::Gemini,
+        Ok(crate::tool::Tool::Codex) => Tool::Codex,
+        Ok(crate::tool::Tool::OpenCode) => Tool::OpenCode,
+        Ok(crate::tool::Tool::Kilo) => Tool::Kilo,
+        Ok(crate::tool::Tool::Pi) => Tool::Pi,
+        Ok(crate::tool::Tool::Antigravity) => Tool::Antigravity,
+        Ok(crate::tool::Tool::Cursor) => Tool::Cursor,
+        Ok(crate::tool::Tool::Kimi) => Tool::Kimi,
+        Ok(crate::tool::Tool::Copilot) => Tool::Copilot,
+        Ok(crate::tool::Tool::Adhoc) => Tool::Adhoc,
+        Err(_) => Tool::Unknown(s.to_string()),
     }
 }
 
@@ -1419,7 +1420,7 @@ pub fn get_available_presets() -> Vec<String> {
 mod tests {
     use super::{
         compute_unread_batch, count_gt, load_instances, load_recently_stopped, parse_message_row,
-        parse_status_or_life_row,
+        parse_status_or_life_row, parse_tool,
     };
     use crate::tui::model::{
         ActivityKind, Agent, AgentStatus, EventKind, MessageScope, SenderKind, Tool,
@@ -1444,6 +1445,14 @@ mod tests {
         )
         .unwrap();
         conn
+    }
+
+    #[test]
+    fn parse_tool_preserves_unknown_persisted_value() {
+        assert_eq!(
+            parse_tool("future-tool"),
+            Tool::Unknown("future-tool".to_string())
+        );
     }
 
     fn make_agent(name: &str, last_event_id: u64) -> Agent {

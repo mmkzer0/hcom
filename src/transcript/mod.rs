@@ -98,9 +98,9 @@ pub fn read(path: &Path, kind: ToolKind, opts: &ReadOptions) -> Result<Vec<Excha
     Ok(exchanges)
 }
 
-/// Detect tool kind from a transcript file extension. Returns None for the
-/// ambiguous `.jsonl`/extensionless cases so callers can fall through to their
-/// own default (Claude in the existing CLI flow).
+/// Detect tool kind from a transcript path. Returns `None` for ambiguous
+/// `.jsonl`/extensionless cases; callers must not assign a known parser merely
+/// because detection failed.
 pub fn detect_kind_from_path(path: &str) -> Option<ToolKind> {
     if path.ends_with(".json") {
         Some(ToolKind::Gemini)
@@ -124,21 +124,32 @@ pub fn detect_kind_from_path(path: &str) -> Option<ToolKind> {
     }
 }
 
-/// Map the agent string used elsewhere ("claude" / "gemini" / "codex" /
-/// "opencode") to a `ToolKind`. Falls back to extension inference, then Claude.
-pub fn kind_from_agent_or_path(agent: &str, path: &str) -> ToolKind {
-    match agent {
-        "claude" => ToolKind::Claude,
-        "antigravity" | "agy" => ToolKind::Antigravity,
-        "gemini" => ToolKind::Gemini,
-        "codex" => ToolKind::Codex,
-        "opencode" | "kilo" => ToolKind::OpenCode,
-        "cursor" | "cursor-agent" => ToolKind::Cursor,
-        "kimi" => ToolKind::Kimi,
-        "copilot" => ToolKind::Copilot,
-        "pi" | "pi-agent" => ToolKind::Pi,
-        _ => detect_kind_from_path(path).unwrap_or(ToolKind::Claude),
-    }
+/// Map the agent string used elsewhere to a `ToolKind`, with path inference as
+/// a compatibility aid when the agent value is absent or unknown.
+///
+/// Unknown identities and ambiguous paths are errors rather than silently
+/// selecting Claude's parser.
+pub fn kind_from_agent_or_path(agent: &str, path: &str) -> Result<ToolKind, String> {
+    let kind = match agent {
+        // `claude-pty` is a legacy persisted launch-surface alias for claude.
+        "claude" | "claude-pty" => Some(ToolKind::Claude),
+        "antigravity" | "agy" => Some(ToolKind::Antigravity),
+        "gemini" => Some(ToolKind::Gemini),
+        "codex" => Some(ToolKind::Codex),
+        "opencode" | "kilo" => Some(ToolKind::OpenCode),
+        "cursor" | "cursor-agent" => Some(ToolKind::Cursor),
+        "kimi" => Some(ToolKind::Kimi),
+        "copilot" => Some(ToolKind::Copilot),
+        "pi" | "pi-agent" => Some(ToolKind::Pi),
+        _ => detect_kind_from_path(path),
+    };
+
+    kind.ok_or_else(|| {
+        format!(
+            "Unable to determine transcript parser for agent '{}' and path '{}'",
+            agent, path
+        )
+    })
 }
 
 // ── Public API for other commands (bundle) ──────────────────────────────
@@ -157,7 +168,7 @@ pub struct TranscriptQuery<'a> {
 /// Returns a JSON projection that intentionally drops tools/edits/errors/
 /// ended_on_error — bundle consumers only read user/action/files/timestamp.
 pub fn get_exchanges_pub(q: &TranscriptQuery) -> Result<Vec<Value>, String> {
-    let kind = kind_from_agent_or_path(q.agent, q.path);
+    let kind = kind_from_agent_or_path(q.agent, q.path)?;
     let opts = ReadOptions {
         last: q.last,
         detailed: q.detailed,
@@ -185,7 +196,7 @@ pub fn format_exchanges_pub(
     instance: &str,
     full: bool,
 ) -> Result<String, String> {
-    let kind = kind_from_agent_or_path(q.agent, q.path);
+    let kind = kind_from_agent_or_path(q.agent, q.path)?;
     let opts = ReadOptions {
         last: q.last,
         detailed: q.detailed,
@@ -209,7 +220,7 @@ mod tests {
             detect_kind_from_path("/h/.cursor/projects/r/agent-transcripts/u/u.jsonl"),
             Some(ToolKind::Cursor)
         );
-        // A plain Claude `.jsonl` stays ambiguous (None → caller defaults).
+        // A plain Claude `.jsonl` stays ambiguous.
         assert_eq!(detect_kind_from_path("/h/.claude/projects/r/u.jsonl"), None);
         assert_eq!(
             detect_kind_from_path("/x/session.json"),
@@ -218,6 +229,29 @@ mod tests {
         assert_eq!(
             detect_kind_from_path("/x/opencode.db"),
             Some(ToolKind::OpenCode)
+        );
+    }
+
+    #[test]
+    fn unknown_agent_and_ambiguous_path_is_an_error() {
+        let err = kind_from_agent_or_path("future-tool", "/tmp/session.jsonl").unwrap_err();
+        assert!(err.contains("future-tool"));
+        assert!(err.contains("session.jsonl"));
+    }
+
+    #[test]
+    fn legacy_claude_pty_agent_maps_to_claude() {
+        assert_eq!(
+            kind_from_agent_or_path("claude-pty", "/h/.claude/projects/r/u.jsonl").unwrap(),
+            ToolKind::Claude
+        );
+    }
+
+    #[test]
+    fn unknown_agent_can_use_unambiguous_path_detection() {
+        assert_eq!(
+            kind_from_agent_or_path("future-tool", "/tmp/session.json").unwrap(),
+            ToolKind::Gemini
         );
     }
 }

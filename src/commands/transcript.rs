@@ -202,7 +202,7 @@ fn get_exchanges(
     session_id: Option<&str>,
     retry_codex: bool,
 ) -> Result<Vec<Exchange>, String> {
-    let kind = transcript::kind_from_agent_or_path(agent, path);
+    let kind = transcript::kind_from_agent_or_path(agent, path)?;
     let opts = ReadOptions {
         last,
         detailed,
