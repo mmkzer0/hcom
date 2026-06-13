@@ -7,8 +7,6 @@ use anyhow::{Result, bail};
 
 use crate::paths;
 
-use super::codex_args::{merge_codex_args, resolve_codex_args};
-
 const BYPASS_HOOK_TRUST_FLAG: &str = "--dangerously-bypass-hook-trust";
 const BYPASS_HOOK_TRUST_MIN_VERSION: (u64, u64, u64) = (0, 131, 0);
 
@@ -63,6 +61,27 @@ pub fn get_sandbox_flags(mode: &str) -> Vec<String> {
     }
 }
 
+fn has_explicit_sandbox_or_approval(tokens: &[String]) -> bool {
+    const POLICY_FLAGS: &[&str] = &[
+        "--sandbox",
+        "-s",
+        "--ask-for-approval",
+        "-a",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--full-auto",
+        "--yolo",
+    ];
+
+    tokens.iter().any(|token| {
+        POLICY_FLAGS.iter().any(|flag| {
+            token == flag
+                || token
+                    .strip_prefix(flag)
+                    .is_some_and(|suffix| suffix.starts_with('='))
+        })
+    })
+}
+
 /// Ensure --add-dir ~/.hcom is present so hcom can write to its DB.
 ///
 /// Codex's --add-dir flag is IGNORED in read-only sandbox mode, but required
@@ -71,38 +90,38 @@ pub fn get_sandbox_flags(mode: &str) -> Vec<String> {
 /// If no sandbox flags are present (mode="none"), skip adding --add-dir
 /// since user is using codex's own folder settings.
 pub fn ensure_hcom_writable(tokens: &[String]) -> Vec<String> {
-    let spec = resolve_codex_args(Some(tokens), None);
-
-    // If no sandbox flags, assume mode="none" — skip --add-dir
-    let has_sandbox = spec.has_flag(
-        &[
-            "--sandbox",
-            "-s",
-            "--dangerously-bypass-approvals-and-sandbox",
-            "--full-auto",
-            "--yolo",
-        ],
-        &["--sandbox=", "-s="],
-    );
+    let has_sandbox = tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "--sandbox"
+                | "-s"
+                | "--dangerously-bypass-approvals-and-sandbox"
+                | "--full-auto"
+                | "--yolo"
+        ) || token.starts_with("--sandbox=")
+            || token.starts_with("-s=")
+    });
     if !has_sandbox {
         return tokens.to_vec();
     }
 
     let hcom_dir = paths::hcom_dir().to_string_lossy().to_string();
 
-    // Check if --add-dir with hcom path already exists
-    for (i, token) in spec.clean_tokens.iter().enumerate() {
-        if token == "--add-dir"
-            && i + 1 < spec.clean_tokens.len()
-            && spec.clean_tokens[i + 1] == hcom_dir
+    for (i, token) in tokens.iter().enumerate() {
+        if token == "--add-dir" && i + 1 < tokens.len() && tokens[i + 1] == hcom_dir {
+            return tokens.to_vec();
+        }
+        if token
+            .strip_prefix("--add-dir=")
+            .is_some_and(|value| value == hcom_dir)
         {
-            return tokens.to_vec(); // Already present
+            return tokens.to_vec();
         }
     }
 
-    let add_dir_tokens = vec!["--add-dir".to_string(), hcom_dir];
-    let add_dir_spec = resolve_codex_args(Some(&add_dir_tokens), None);
-    merge_codex_args(&add_dir_spec, &spec).rebuild_tokens(true, true)
+    let mut result = tokens.to_vec();
+    result.extend(["--add-dir".to_string(), hcom_dir]);
+    result
 }
 
 fn parse_codex_cli_version(output: &str) -> Option<(u64, u64, u64)> {
@@ -224,6 +243,9 @@ pub fn add_hook_trust_bypass_if_supported(codex_args: &[String]) -> Vec<String> 
     if !codex_supports_bypass_hook_trust() {
         return codex_args.to_vec();
     }
+    if codex_args.iter().any(|arg| arg == BYPASS_HOOK_TRUST_FLAG) {
+        return codex_args.to_vec();
+    }
 
     // This is the launch-time guardrail. Cheap status/verify paths only inspect
     // local metadata, but before opening Codex we ask Codex for authoritative
@@ -246,10 +268,9 @@ pub fn add_hook_trust_bypass_if_supported(codex_args: &[String]) -> Vec<String> 
 
     // Codex's bypass flag is invocation-wide for unmanaged hooks, not scoped
     // to hcom's hooks. Prefer exact trust state and use this only as fallback.
-    let bypass_flag = vec![BYPASS_HOOK_TRUST_FLAG.to_string()];
-    let bypass_spec = resolve_codex_args(Some(&bypass_flag), None);
-    let cli_spec = resolve_codex_args(Some(codex_args), None);
-    merge_codex_args(&bypass_spec, &cli_spec).rebuild_tokens(true, true)
+    let mut result = codex_args.to_vec();
+    result.push(BYPASS_HOOK_TRUST_FLAG.to_string());
+    result
 }
 
 /// Add hcom bootstrap to codex developer_instructions.
@@ -262,75 +283,42 @@ pub fn add_codex_developer_instructions(
     codex_args: &[String],
     bootstrap_text: &str,
 ) -> Vec<String> {
-    let spec = resolve_codex_args(Some(codex_args), None);
-
-    // Check if developer_instructions already exists in -c flags
     let mut existing_dev_instructions: Option<String> = None;
-    let mut skip_indexes = std::collections::HashSet::new();
-
+    let mut remaining = Vec::with_capacity(codex_args.len() + 2);
     let mut i = 0;
-    while i < spec.clean_tokens.len() {
-        let token = &spec.clean_tokens[i];
-        // Handle -c=developer_instructions=value or --config=developer_instructions=value
-        if token.starts_with("-c=developer_instructions=")
-            || token.starts_with("--config=developer_instructions=")
+    while i < codex_args.len() {
+        let token = &codex_args[i];
+        if let Some(value) = token
+            .strip_prefix("-c=developer_instructions=")
+            .or_else(|| token.strip_prefix("--config=developer_instructions="))
         {
-            let eq_count = token.matches('=').count();
-            existing_dev_instructions = Some(if eq_count >= 2 {
-                token.splitn(3, '=').nth(2).unwrap_or("").to_string()
-            } else {
-                String::new()
-            });
-            skip_indexes.insert(i);
-            break;
+            existing_dev_instructions = Some(value.to_string());
+            i += 1;
+            continue;
         }
-        // Handle -c developer_instructions=value (space syntax)
-        if (token == "-c" || token == "--config") && i + 1 < spec.clean_tokens.len() {
-            let next = &spec.clean_tokens[i + 1];
-            if next.starts_with("developer_instructions=") {
-                existing_dev_instructions =
-                    Some(next.split_once('=').map_or("", |(_, v)| v).to_string());
-                skip_indexes.insert(i);
-                skip_indexes.insert(i + 1);
-                break;
-            }
+        if (token == "-c" || token == "--config")
+            && i + 1 < codex_args.len()
+            && let Some(value) = codex_args[i + 1].strip_prefix("developer_instructions=")
+        {
+            existing_dev_instructions = Some(value.to_string());
+            i += 2;
+            continue;
         }
+        remaining.push(token.clone());
         i += 1;
     }
 
-    // Build combined developer instructions
     let combined = if let Some(existing) = existing_dev_instructions {
         format!("{}\n---\n{}", bootstrap_text, existing)
     } else {
         bootstrap_text.to_string()
     };
 
-    let positional_set: std::collections::HashSet<usize> =
-        spec.positional_indexes.iter().copied().collect();
-    let remaining_tokens: Vec<String> = spec
-        .clean_tokens
-        .iter()
-        .enumerate()
-        .filter(|(idx, _)| !skip_indexes.contains(idx))
-        .filter(|(idx, _)| {
-            !matches!(spec.subcommand.as_deref(), Some("resume" | "fork"))
-                || !positional_set.contains(idx)
-        })
-        .map(|(_, token)| token.clone())
-        .collect();
-
-    let mut result = Vec::new();
-    if let Some(ref sub) = spec.subcommand {
-        result.push(sub.clone());
-        if matches!(sub.as_str(), "resume" | "fork") {
-            result.extend(spec.positional_tokens.iter().cloned());
-        }
-    }
-    result.push("-c".to_string());
-    result.push(format!("developer_instructions={}", combined));
-    result.extend(remaining_tokens);
-
-    result
+    remaining.extend([
+        "-c".to_string(),
+        format!("developer_instructions={combined}"),
+    ]);
+    remaining
 }
 
 /// Remove any Codex `developer_instructions=...` config entries.
@@ -339,12 +327,11 @@ pub fn add_codex_developer_instructions(
 /// block because it hard-codes the original instance name. A fresh bootstrap is
 /// injected later for the new instance.
 pub fn strip_codex_developer_instructions(codex_args: &[String]) -> Vec<String> {
-    let spec = resolve_codex_args(Some(codex_args), None);
     let mut result = Vec::new();
     let mut i = 0;
 
-    while i < spec.clean_tokens.len() {
-        let token = &spec.clean_tokens[i];
+    while i < codex_args.len() {
+        let token = &codex_args[i];
 
         if token.starts_with("-c=developer_instructions=")
             || token.starts_with("--config=developer_instructions=")
@@ -353,8 +340,8 @@ pub fn strip_codex_developer_instructions(codex_args: &[String]) -> Vec<String> 
             continue;
         }
 
-        if (token == "-c" || token == "--config") && i + 1 < spec.clean_tokens.len() {
-            let next = &spec.clean_tokens[i + 1];
+        if (token == "-c" || token == "--config") && i + 1 < codex_args.len() {
+            let next = &codex_args[i + 1];
             if next.starts_with("developer_instructions=") {
                 i += 2;
                 continue;
@@ -365,13 +352,7 @@ pub fn strip_codex_developer_instructions(codex_args: &[String]) -> Vec<String> 
         i += 1;
     }
 
-    if let Some(ref sub) = spec.subcommand {
-        let mut with_sub = vec![sub.clone()];
-        with_sub.extend(result);
-        with_sub
-    } else {
-        result
-    }
+    result
 }
 
 /// Preprocess Codex CLI arguments for hcom integration.
@@ -390,25 +371,24 @@ pub fn preprocess_codex_args(
     // 1. Strip stale developer_instructions for resume/fork only.
     //    Fresh launches may have user system_prompt in developer_instructions
     //    that add_codex_developer_instructions will merge with bootstrap.
-    let spec = resolve_codex_args(Some(codex_args), None);
-    let codex_args = if matches!(spec.subcommand.as_deref(), Some("resume" | "fork")) {
+    let codex_args = if codex_args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "resume" | "fork"))
+    {
         strip_codex_developer_instructions(codex_args)
     } else {
         codex_args.to_vec()
     };
 
-    // 2. Inject sandbox flags based on mode. Treat hcom's profile as the
-    // lower-precedence side of the normal Codex arg merge so a user-provided
-    // sandbox/approval flag overrides the whole sandbox group without
-    // dropping repeatable hcom config such as the network seatbelt tweak.
-    let sandbox_flags = get_sandbox_flags(sandbox_mode);
-    let mut args: Vec<String> = if !sandbox_flags.is_empty() {
-        let sandbox_spec = resolve_codex_args(Some(&sandbox_flags), None);
-        let cli_spec = resolve_codex_args(Some(&codex_args), None);
-        merge_codex_args(&sandbox_spec, &cli_spec).rebuild_tokens(true, true)
-    } else {
-        codex_args
-    };
+    let mut args = codex_args;
+
+    // 2. Inject the configured policy only as a default. An explicit user
+    // sandbox, approval, or bypass selector owns the complete Codex policy;
+    // appending hcom's profile would make clap's last-value-wins behavior
+    // silently override it.
+    if !has_explicit_sandbox_or_approval(&args) {
+        args.extend(get_sandbox_flags(sandbox_mode));
+    }
 
     // 3. Codex 0.131.0+ requires unmanaged hooks to be trusted. hcom's Codex
     // hooks are launch-managed by hcom, but Codex sees them as user hooks, so
@@ -559,7 +539,8 @@ mod tests {
         // back-compat with user-provided args, even though hcom no longer emits it.
         let tokens = s(&["--full-auto"]);
         let result = ensure_hcom_writable(&tokens);
-        assert_eq!(result[0], "--add-dir");
+        assert_eq!(result[0], "--full-auto");
+        assert_eq!(result[result.len() - 2], "--add-dir");
         assert!(result.len() > 2);
     }
 
@@ -569,7 +550,8 @@ mod tests {
         init_config();
         let tokens = s(&["--yolo"]);
         let result = ensure_hcom_writable(&tokens);
-        assert_eq!(result[0], "--add-dir");
+        assert_eq!(result[0], "--yolo");
+        assert_eq!(result[result.len() - 2], "--add-dir");
         assert!(result.contains(&"--yolo".to_string()));
     }
 
@@ -765,9 +747,10 @@ mod tests {
     fn test_add_developer_instructions_basic() {
         let args = s(&["-m", "o3"]);
         let result = add_codex_developer_instructions(&args, "BOOTSTRAP");
-        assert_eq!(result[0], "-c");
-        assert_eq!(result[1], "developer_instructions=BOOTSTRAP");
-        assert!(result.contains(&"-m".to_string()));
+        assert_eq!(
+            result,
+            s(&["-m", "o3", "-c", "developer_instructions=BOOTSTRAP"])
+        );
     }
 
     #[test]
@@ -785,10 +768,10 @@ mod tests {
         let result = add_codex_developer_instructions(&args, "BOOTSTRAP");
         assert_eq!(result[0], "resume");
         assert_eq!(result[1], "thread-1");
-        assert_eq!(result[2], "-c");
-        assert_eq!(result[3], "developer_instructions=BOOTSTRAP");
-        assert_eq!(result[4], "--model");
-        assert_eq!(result[5], "gpt-5");
+        assert_eq!(result[2], "--model");
+        assert_eq!(result[3], "gpt-5");
+        assert_eq!(result[4], "-c");
+        assert_eq!(result[5], "developer_instructions=BOOTSTRAP");
     }
 
     #[test]
@@ -804,20 +787,21 @@ mod tests {
         let result = add_codex_developer_instructions(&args, "BOOTSTRAP");
         assert_eq!(result[0], "fork");
         assert_eq!(result[1], "thread-1");
-        assert_eq!(result[2], "-c");
-        assert!(result[3].contains("BOOTSTRAP"));
-        assert!(result[3].contains("OLD"));
-        assert_eq!(result[4], "--model");
-        assert_eq!(result[5], "gpt-5");
+        assert_eq!(result[2], "--model");
+        assert_eq!(result[3], "gpt-5");
+        assert_eq!(result[4], "-c");
+        assert!(result[5].contains("BOOTSTRAP"));
+        assert!(result[5].contains("OLD"));
     }
 
     #[test]
     fn test_add_developer_instructions_merge_existing() {
         let args = s(&["-c", "developer_instructions=USER_NOTES", "-m", "o3"]);
         let result = add_codex_developer_instructions(&args, "BOOTSTRAP");
-        assert!(result[1].contains("BOOTSTRAP"));
-        assert!(result[1].contains("USER_NOTES"));
-        assert!(result[1].contains("---"));
+        let injected = result.last().unwrap();
+        assert!(injected.contains("BOOTSTRAP"));
+        assert!(injected.contains("USER_NOTES"));
+        assert!(injected.contains("---"));
         let di_count = result
             .iter()
             .filter(|t| t.starts_with("developer_instructions="))
@@ -830,7 +814,7 @@ mod tests {
         let args = s(&["fork", "-m", "o3"]);
         let result = add_codex_developer_instructions(&args, "BOOTSTRAP");
         assert_eq!(result[0], "fork");
-        assert_eq!(result[1], "-c");
+        assert_eq!(result[result.len() - 2], "-c");
     }
 
     #[test]
@@ -884,20 +868,21 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_preprocess_user_sandbox_overrides_hcom_default() {
+    fn test_preprocess_user_sandbox_suppresses_hcom_policy_defaults() {
         init_config();
-        let args = s(&["--sandbox", "danger-full-access", "-m", "o3"]);
+        let args = s(&["--sandbox", "read-only", "-m", "o3"]);
         let result = preprocess_codex_args(&args, "BOOTSTRAP", "workspace");
+        let sandbox_position = result.iter().position(|t| t == "--sandbox").unwrap();
+        assert_eq!(result[sandbox_position + 1], "read-only");
         assert_eq!(result.iter().filter(|t| *t == "--sandbox").count(), 1);
-        assert!(result.contains(&"danger-full-access".to_string()));
         assert!(!result.contains(&"workspace-write".to_string()));
         assert!(result.contains(&"--add-dir".to_string()));
-        assert!(result.contains(&"sandbox_workspace_write.network_access=true".to_string()));
+        assert!(!result.contains(&"sandbox_workspace_write.network_access=true".to_string()));
     }
 
     #[test]
     #[serial]
-    fn test_preprocess_yolo_overrides_hcom_default_sandbox() {
+    fn test_preprocess_yolo_suppresses_hcom_policy_defaults() {
         init_config();
         let args = s(&["--yolo", "-m", "o3"]);
         let result = preprocess_codex_args(&args, "BOOTSTRAP", "workspace");
@@ -905,20 +890,57 @@ mod tests {
         assert!(result.contains(&"--yolo".to_string()));
         assert!(!result.contains(&"--sandbox".to_string()));
         assert!(!result.contains(&"workspace-write".to_string()));
-        assert!(result.contains(&"sandbox_workspace_write.network_access=true".to_string()));
+        assert!(!result.contains(&"sandbox_workspace_write.network_access=true".to_string()));
         assert!(result.contains(&"--add-dir".to_string()));
     }
 
     #[test]
     #[serial]
-    fn test_preprocess_user_approval_overrides_hcom_approval_default() {
+    fn test_preprocess_user_approval_suppresses_hcom_policy_defaults() {
         init_config();
         let args = s(&["-a", "on-request", "-m", "o3"]);
         let result = preprocess_codex_args(&args, "BOOTSTRAP", "untrusted");
+        let approval_position = result.iter().position(|t| t == "-a").unwrap();
+        assert_eq!(result[approval_position + 1], "on-request");
         assert_eq!(result.iter().filter(|t| *t == "-a").count(), 1);
-        assert!(result.contains(&"on-request".to_string()));
         assert!(!result.contains(&"untrusted".to_string()));
-        assert!(result.contains(&"sandbox_workspace_write.network_access=true".to_string()));
+        assert!(!result.contains(&"--sandbox".to_string()));
+        assert!(!result.contains(&"sandbox_workspace_write.network_access=true".to_string()));
+        assert!(!result.contains(&"--add-dir".to_string()));
+    }
+
+    #[test]
+    #[serial]
+    fn test_preprocess_bypass_suppresses_hcom_policy_defaults() {
+        init_config();
+        let args = s(&["--dangerously-bypass-approvals-and-sandbox", "-m", "o3"]);
+        let result = preprocess_codex_args(&args, "BOOTSTRAP", "untrusted");
+
+        assert_eq!(
+            result
+                .iter()
+                .filter(|t| *t == "--dangerously-bypass-approvals-and-sandbox")
+                .count(),
+            1
+        );
+        assert!(!result.contains(&"--sandbox".to_string()));
+        assert!(!result.contains(&"-a".to_string()));
+        assert!(!result.contains(&"sandbox_workspace_write.network_access=true".to_string()));
+        assert!(result.contains(&"--add-dir".to_string()));
+    }
+
+    #[test]
+    #[serial]
+    fn test_preprocess_equals_policy_flags_suppress_hcom_defaults() {
+        init_config();
+        let args = s(&["--sandbox=read-only", "-a=on-request", "-m", "o3"]);
+        let result = preprocess_codex_args(&args, "BOOTSTRAP", "workspace");
+
+        assert!(result.contains(&"--sandbox=read-only".to_string()));
+        assert!(result.contains(&"-a=on-request".to_string()));
+        assert!(!result.contains(&"--sandbox".to_string()));
+        assert!(!result.contains(&"workspace-write".to_string()));
+        assert!(!result.contains(&"sandbox_workspace_write.network_access=true".to_string()));
     }
 
     #[test]

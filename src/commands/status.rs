@@ -121,6 +121,35 @@ struct AgentCounts {
     total: i64,
 }
 
+fn recent_launch_failures(db: &HcomDb, limit: usize) -> Vec<(String, String)> {
+    let Ok(mut stmt) = db.conn().prepare(
+        "SELECT name, status_detail
+         FROM instances
+         WHERE status_context = 'launch_failed'
+         ORDER BY status_time DESC
+         LIMIT ?1",
+    ) else {
+        return Vec::new();
+    };
+    let Ok(rows) = stmt.query_map([limit as i64], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    }) else {
+        return Vec::new();
+    };
+    rows.filter_map(Result::ok).collect()
+}
+
+fn finalize_timed_out_launches(db: &HcomDb) {
+    if let Ok(instances) = db.iter_instances_full() {
+        for instance in instances {
+            if crate::instances::is_launching_placeholder(&instance) {
+                let _ =
+                    crate::instance_lifecycle::get_or_finalize_launch_failure_detail(db, &instance);
+            }
+        }
+    }
+}
+
 fn get_agent_counts(db: &HcomDb) -> AgentCounts {
     let mut c = AgentCounts {
         active: 0,
@@ -174,8 +203,10 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
         false
     };
 
+    finalize_timed_out_launches(db);
     let tools = get_tool_statuses();
     let counts = get_agent_counts(db);
+    let launch_failures = recent_launch_failures(db, 5);
     let dev_root = crate::router::resolve_effective_dev_root(db.path());
 
     // Check config validity
@@ -242,6 +273,10 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
                 "launching": counts.launching,
                 "inactive": counts.inactive,
                 "total": counts.total,
+                "launch_failures": launch_failures.iter().map(|(name, detail)| json!({
+                    "name": name,
+                    "detail": detail,
+                })).collect::<Vec<_>>(),
             },
             "relay": {
                 "configured": relay.configured,
@@ -359,6 +394,10 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
             parts.push(format!("{} inactive", counts.inactive));
         }
         println!("agents:    {}", parts.join(", "));
+    }
+    for (name, detail) in &launch_failures {
+        let first_line = detail.lines().next().unwrap_or(detail);
+        println!("failure:   {name}: {first_line}");
     }
 
     // Relay summary + worker process line both branch on the canonical

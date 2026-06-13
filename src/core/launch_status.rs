@@ -1211,14 +1211,14 @@ mod tests {
         let details = get_batch_failure_details_for_ids(&db, &["batch-456".to_string()]);
         assert_eq!(
             details,
-            vec!["mari: launch probably failed - check logs or hcom list -v".to_string()]
+            vec!["mari: exited before binding (observed after 31s)".to_string()]
         );
 
         let stored = db.get_instance_full("mari").unwrap().unwrap();
         assert_eq!(stored.status_context, "launch_failed");
         assert_eq!(
             stored.status_detail,
-            "launch probably failed - check logs or hcom list -v"
+            "exited before binding (observed after 31s)"
         );
     }
 }

@@ -50,28 +50,6 @@ pub static BIND_MARKER_RE: LazyLock<Regex> =
 // Released-tool lists moved to `crate::integration_spec` —
 // see `released_tool_names()` / `released_background_tool_names()`.
 
-/// Tool detection markers — set by AI tools, cleared to prevent inheritance.
-pub const TOOL_MARKER_VARS: &[&str] = &[
-    "CLAUDECODE",
-    "ANTIGRAVITY_AGENT",
-    "GEMINI_CLI",
-    "GEMINI_SYSTEM_MD",
-    "CODEX_SANDBOX",
-    "CODEX_SANDBOX_NETWORK_DISABLED",
-    "CODEX_MANAGED_BY_NPM",
-    "CODEX_MANAGED_BY_BUN",
-    "CODEX_THREAD_ID",
-    "OPENCODE",
-    "KILO",
-    "HCOM_PI",
-    "PI_CODING_AGENT",
-    "PI_CODING_AGENT_SESSION_DIR",
-    "CURSOR_AGENT",
-    "CURSOR_PROJECT_DIR",
-    "KIMI_CODE_CLI",
-    "KIMI_SESSION_ID",
-];
-
 /// HCOM identity vars — set per-instance, cleared to prevent parent identity leakage.
 pub const HCOM_IDENTITY_VARS: &[&str] = &[
     "HCOM_PROCESS_ID",

@@ -9,10 +9,14 @@ const COPILOT_PRINT_FLAGS: &[&str] = &["-p", "--prompt", "--continue"];
 
 /// Reject one-shot/resume shortcuts that would break hcom's PTY delivery model.
 pub(crate) fn validate_copilot_args(tokens: &[String]) -> Vec<String> {
-    let found: Vec<&str> = tokens
+    let found: Vec<&str> = COPILOT_PRINT_FLAGS
         .iter()
-        .map(String::as_str)
-        .filter(|token| COPILOT_PRINT_FLAGS.contains(token))
+        .copied()
+        .filter(|flag| {
+            tokens
+                .iter()
+                .any(|token| crate::tools::launch_arg_validation::long_flag_matches(token, flag))
+        })
         .collect();
     if found.is_empty() {
         return Vec::new();
@@ -170,5 +174,13 @@ mod tests {
         let errors = validate_copilot_args(&tokens);
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("-p, --prompt, --continue"));
+    }
+
+    #[test]
+    fn validate_copilot_args_rejects_equals_form_prompt() {
+        let tokens = vec!["--prompt=do the thing".to_string()];
+        let errors = validate_copilot_args(&tokens);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("--prompt"));
     }
 }

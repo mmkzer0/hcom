@@ -330,9 +330,27 @@ pub(crate) fn finalize_launch_failure_detail(
         }
     }
 
-    let detail = extract_launch_failure_detail(data)
-        .or_else(|| fallback_detail.map(ToString::to_string))
-        .unwrap_or_else(|| "launch probably failed - check logs or hcom list -v".to_string());
+    let created_at = data.created_at as i64;
+    let age = if created_at > 0 {
+        (now_epoch_i64() - created_at).max(0)
+    } else {
+        0
+    };
+    let process_state = data.pid.and_then(|pid| {
+        let alive = unsafe { libc::kill(pid as libc::pid_t, 0) == 0 };
+        alive.then(|| format!("process alive {age}s, never bound"))
+    });
+    let mut detail = fallback_detail
+        .map(ToString::to_string)
+        .or(process_state)
+        .unwrap_or_else(|| format!("exited before binding (observed after {age}s)"));
+    if !detail.contains("PTY output:")
+        && let Some(evidence) = extract_launch_failure_detail(data)
+        && !detail.contains(&evidence)
+    {
+        detail.push('\n');
+        detail.push_str(&evidence);
+    }
 
     let mut updates = serde_json::Map::new();
     updates.insert("status".into(), serde_json::json!(ST_INACTIVE));
@@ -356,6 +374,12 @@ pub(crate) fn finalize_launch_failure_detail(
 }
 
 fn extract_launch_failure_detail(data: &InstanceRow) -> Option<String> {
+    if !data.background_log_file.is_empty()
+        && let Some(tail) = read_launch_log_tail(&data.background_log_file)
+    {
+        return Some(format!("PTY output:\n{tail}"));
+    }
+
     let info = crate::terminal::resolve_terminal_info(
         data.terminal_preset_effective.as_deref(),
         data.launch_context.as_deref(),
@@ -365,6 +389,28 @@ fn extract_launch_failure_detail(data: &InstanceRow) -> Option<String> {
         "tmux" | "tmux-split" => capture_tmux_launch_failure(&info.pane_id, &data.tool),
         _ => None,
     }
+}
+
+fn read_launch_log_tail(path: &str) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let mut lines: Vec<&str> = content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    if lines.len() > 8 {
+        lines = lines.split_off(lines.len() - 8);
+    }
+    let mut tail = lines.join("\n");
+    if tail.chars().count() > 1000 {
+        tail = tail.chars().rev().take(1000).collect::<String>();
+        tail = tail.chars().rev().collect();
+        tail.insert_str(0, "...");
+    }
+    Some(tail)
 }
 
 fn capture_tmux_launch_failure(pane_id: &str, tool: &str) -> Option<String> {

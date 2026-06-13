@@ -108,77 +108,17 @@ pub fn shorten_path_max(path: &str, max_width: usize) -> String {
 /// Uses the same env vars as HcomContext::from_env() for tool detection.
 /// For code that already has an HcomContext, prefer `ctx.is_inside_ai_tool()`.
 pub fn is_inside_ai_tool() -> bool {
-    use std::env;
-    let is_set = |k: &str| env::var(k).is_ok();
-    let is_eq = |k: &str, v: &str| env::var(k).ok().as_deref() == Some(v);
-    let nonempty = |k: &str| env::var(k).ok().filter(|v| !v.is_empty()).is_some();
-    // Claude (matches HcomContext: CLAUDECODE=1 || CLAUDE_ENV_FILE non-empty)
-    is_eq("CLAUDECODE", "1") || nonempty("CLAUDE_ENV_FILE")
-        // Antigravity
-        || is_set("ANTIGRAVITY_AGENT")
-        // Gemini
-        || is_eq("GEMINI_CLI", "1")
-        // Codex (all 5 markers from HcomContext)
-        || is_set("CODEX_SANDBOX")
-        || is_set("CODEX_SANDBOX_NETWORK_DISABLED")
-        || is_set("CODEX_MANAGED_BY_NPM")
-        || is_set("CODEX_MANAGED_BY_BUN")
-        || is_set("CODEX_THREAD_ID")
-        // OpenCode
-        || is_eq("OPENCODE", "1")
-        // Kilo Code
-        || is_eq("KILO", "1")
-        // Cursor Agent
-        || is_set("CURSOR_AGENT")
-        || is_set("CURSOR_PROJECT_DIR")
-        // Kimi Code
-        || is_eq("KIMI_CODE_CLI", "1")
-        || is_set("KIMI_SESSION_ID")
-        // Copilot (hcom-launched; no stable native marker documented)
-        || is_eq("HCOM_TOOL", "copilot")
-        // Pi Coding Agent (hcom-launched marker)
-        || is_eq("HCOM_PI", "1")
-        || is_eq("HCOM_TOOL", "pi")
-        // hcom-launched
-        || is_eq("HCOM_LAUNCHED", "1")
+    let env = std::env::vars().collect();
+    crate::shared::tool_detection::detect_tool(&env) != crate::tool::Tool::Adhoc
+        || std::env::var("HCOM_LAUNCHED").ok().as_deref() == Some("1")
 }
 
 /// Detect current AI tool from environment (no HcomContext needed).
 ///
 /// Uses the same env vars as HcomContext::from_env() for tool detection.
 pub fn detect_current_tool_from_env() -> &'static str {
-    use std::env;
-    let is_set = |k: &str| env::var(k).is_ok();
-    let is_eq = |k: &str, v: &str| env::var(k).ok().as_deref() == Some(v);
-    let nonempty = |k: &str| env::var(k).ok().filter(|v| !v.is_empty()).is_some();
-    if is_eq("CLAUDECODE", "1") || nonempty("CLAUDE_ENV_FILE") {
-        "claude"
-    } else if is_set("ANTIGRAVITY_AGENT") {
-        "antigravity"
-    } else if is_eq("GEMINI_CLI", "1") {
-        "gemini"
-    } else if is_set("CODEX_SANDBOX")
-        || is_set("CODEX_SANDBOX_NETWORK_DISABLED")
-        || is_set("CODEX_MANAGED_BY_NPM")
-        || is_set("CODEX_MANAGED_BY_BUN")
-        || is_set("CODEX_THREAD_ID")
-    {
-        "codex"
-    } else if is_eq("OPENCODE", "1") {
-        "opencode"
-    } else if is_eq("KILO", "1") {
-        "kilo"
-    } else if is_set("CURSOR_AGENT") || is_set("CURSOR_PROJECT_DIR") {
-        "cursor"
-    } else if is_eq("KIMI_CODE_CLI", "1") || is_set("KIMI_SESSION_ID") {
-        "kimi"
-    } else if is_eq("HCOM_TOOL", "copilot") {
-        "copilot"
-    } else if is_eq("HCOM_PI", "1") || is_eq("HCOM_TOOL", "pi") {
-        "pi"
-    } else {
-        "adhoc"
-    }
+    let env = std::env::vars().collect();
+    crate::shared::tool_detection::detect_tool(&env).as_str()
 }
 
 fn resolve_target_dir_path(base: &Path, value: &str) -> Option<PathBuf> {

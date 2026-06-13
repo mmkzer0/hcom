@@ -1270,30 +1270,27 @@ impl Proxy {
             }
         }
 
-        // PTY exited before delivery started — finalize placeholder as launch_failed.
-        if !delivery_started && !EXIT_WAS_KILLED.load(Ordering::Acquire) {
-            self.finalize_early_launch_failure();
+        // Reap first so EOF/HUP races cannot make try_wait() miss a fast child
+        // exit. drain_and_wait_child also feeds trailing PTY bytes into the
+        // screen model, preserving the tool's final error for launch failure
+        // diagnostics even after the terminal pane closes.
+        let exit_code = self.drain_and_wait_child()?;
+
+        if !EXIT_WAS_KILLED.load(Ordering::Acquire) {
+            self.finalize_launch_failure_after_exit(startup_time.elapsed(), exit_code);
         }
 
-        // Stop delivery thread
+        // Stop delivery after precise child-exit finalization. The shared
+        // launch_phase flag prevents delivery cleanup from emitting a generic
+        // duplicate failure after this path records the real evidence.
         self.running.store(false, Ordering::Release);
 
-        // Kill child process group (child is session leader via setsid(), so PID = PGID)
-        // This ensures claude and all its children are killed, not just the launch script
-        let pgid = Pid::from_raw(-(self.child.id() as i32));
-        let _ = kill(pgid, Signal::SIGTERM);
-
-        self.drain_and_wait_child()
+        Ok(exit_code)
     }
 
-    fn finalize_early_launch_failure(&mut self) {
+    fn finalize_launch_failure_after_exit(&mut self, elapsed: Duration, exit_code: i32) {
         let Some(instance_name) = self.config.instance_name.as_deref() else {
             return;
-        };
-
-        let exit_status = match self.child.try_wait() {
-            Ok(Some(status)) => status,
-            _ => return,
         };
 
         let Ok(db) = HcomDb::open() else {
@@ -1310,20 +1307,28 @@ impl Proxy {
             return;
         }
 
-        let exit_code = exit_code_from_status(exit_status);
-        let fallback = format!("process exited before startup completed (exit code {exit_code})");
-        // finalize emits the launch_failed life event itself (which carries
-        // both the event log entry and the launcher-side batch notification),
-        // so the early-exit path only needs to clean up its own bookkeeping.
-        if crate::instance_lifecycle::finalize_launch_failure_detail(
+        let elapsed_secs = elapsed.as_secs();
+        let mut fallback =
+            format!("exited {elapsed_secs}s after spawn before binding (exit code {exit_code})");
+        if let Some(tail) = self.screen.visible_tail(8, 1000) {
+            fallback.push_str("\nPTY output:\n");
+            fallback.push_str(&tail);
+        }
+        let Some(detail) = crate::instance_lifecycle::finalize_launch_failure_detail(
             &db,
             &instance,
             Some(&fallback),
-        )
-        .is_none()
-        {
+        ) else {
             return;
-        }
+        };
+        let _ = db.emit_launch_failed_event(
+            instance_name,
+            crate::shared::ST_INACTIVE,
+            "launch_failed",
+            "exited_before_bind",
+            &detail,
+        );
+        self.launch_phase_active.store(false, Ordering::Release);
 
         if let Ok(process_id) = std::env::var("HCOM_PROCESS_ID")
             && !process_id.is_empty()
@@ -1371,17 +1376,57 @@ impl Proxy {
     /// shutdown. If nobody reads the PTY master, the kernel buffer fills and the
     /// child blocks on write() — deadlocking with our waitpid(). We drain the
     /// master in a poll loop with non-blocking try_wait, escalating to SIGKILL
-    /// after a timeout.
+    /// after a timeout. Drained bytes are still processed by ScreenTracker so
+    /// launch failures retain the child's final stderr/stdout.
     fn drain_and_wait_child(&mut self) -> Result<i32> {
         let mut buf = [0u8; 65536];
         let deadline = Instant::now() + Duration::from_secs(5);
 
         loop {
+            let mut saw_eof = false;
+            loop {
+                match nix_read(&self.pty_master, &mut buf) {
+                    Ok(0) => {
+                        saw_eof = true;
+                        break;
+                    }
+                    Ok(n) => self.screen.process(&buf[..n]),
+                    Err(Errno::EAGAIN) => break,
+                    Err(Errno::EIO) => {
+                        saw_eof = true;
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
+
             // Non-blocking child check
             match self.child.try_wait() {
-                Ok(Some(status)) => return Ok(exit_code_from_status(status)),
+                Ok(Some(status)) => {
+                    // A final PTY fragment can become readable just after
+                    // waitpid observes exit. Give it a few milliseconds.
+                    for _ in 0..3 {
+                        match nix_read(&self.pty_master, &mut buf) {
+                            Ok(n) if n > 0 => self.screen.process(&buf[..n]),
+                            Ok(_) | Err(Errno::EIO) => break,
+                            Err(Errno::EAGAIN) => {
+                                std::thread::sleep(Duration::from_millis(10));
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    return Ok(exit_code_from_status(status));
+                }
                 Ok(None) => {} // Still running
                 Err(e) => bail!("wait failed: {}", e),
+            }
+
+            if saw_eof {
+                return self
+                    .child
+                    .wait()
+                    .map(exit_code_from_status)
+                    .map_err(|e| anyhow::anyhow!("wait failed: {e}"));
             }
 
             // Timeout — escalate to SIGKILL
@@ -1401,31 +1446,7 @@ impl Proxy {
                 return Ok(1);
             }
 
-            // Drain PTY master (non-blocking, discard output)
-            match nix_read(&self.pty_master, &mut buf) {
-                Ok(0) => {
-                    // EOF — child closed its side, do blocking wait
-                    match self.child.wait() {
-                        Ok(status) => return Ok(exit_code_from_status(status)),
-                        Err(e) => bail!("wait failed: {}", e),
-                    }
-                }
-                Ok(_) => {} // Drained some data, loop again
-                Err(Errno::EAGAIN) => {
-                    // Nothing to read — sleep briefly before next try_wait
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                Err(Errno::EIO) => {
-                    // PTY gone — child side closed, do blocking wait
-                    match self.child.wait() {
-                        Ok(status) => return Ok(exit_code_from_status(status)),
-                        Err(e) => bail!("wait failed: {}", e),
-                    }
-                }
-                Err(_) => {
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-            }
+            std::thread::sleep(Duration::from_millis(50));
         }
     }
 

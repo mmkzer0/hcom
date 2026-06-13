@@ -13,7 +13,6 @@ use crate::commands::launch::{
 };
 use crate::commands::transcript::{claude_config_dir, detect_agent_type};
 use crate::db::HcomDb;
-use crate::hooks::claude_args;
 use crate::hooks::codex::derive_codex_transcript_path;
 use crate::hooks::gemini::derive_gemini_transcript_path;
 use crate::hooks::kimi::derive_kimi_transcript_path;
@@ -21,7 +20,6 @@ use crate::launcher::{self, LaunchParams, LaunchResult};
 use crate::log::log_info;
 use crate::router::GlobalFlags;
 use crate::shared::ST_INACTIVE;
-use crate::tools::{codex_args, gemini_args};
 
 /// Where to load the resume/fork plan from.
 enum ResumeSource<'a> {
@@ -420,15 +418,17 @@ fn prepare_resume_plan_from_source(
             .unwrap_or_else(|_| ".".to_string())
     };
 
-    let mut cli_tool_args = build_resume_args(&tool, &session_id, fork);
-    cli_tool_args.extend(clean_extra);
-
     // Merge with original launch args (only applicable for tracked instances).
     let original_args: Vec<String> = if !launch_args_str.is_empty() {
         serde_json::from_str(&launch_args_str).unwrap_or_default()
     } else {
         Vec::new()
     };
+    let mut persisted_args = original_args.clone();
+    persisted_args.extend(clean_extra.iter().cloned());
+
+    let mut cli_tool_args = build_resume_args(&tool, &session_id, fork);
+    cli_tool_args.extend(clean_extra);
 
     let merged_cli_args = if !original_args.is_empty() {
         merge_resume_args(&tool, &original_args, &cli_tool_args)
@@ -442,20 +442,26 @@ fn prepare_resume_plan_from_source(
         bail!("--headless is only supported for Claude and Kimi resume/fork launches");
     }
 
+    let launch_tool = crate::launcher::LaunchTool::from_str(&tool)?;
     let is_headless =
-        launch_flags.headless || is_background_from_args(&tool, &merged_args) || background;
+        launch_flags.headless || is_background_from_args(&launch_tool, &merged_args) || background;
 
     // Claude background defaults to the live PTY session; only an explicit
     // `-p`/`--print` (NativePrint) gets the detached print-mode defaults. This
     // mirrors `prepare_launch_execution` on the launch path so resume/fork and
     // launch share one execution-mode policy. `-p` is opt-in because, from
     // 2026-06-15, `claude -p` draws from a separate Agent SDK credit pool.
-    if tool == "claude" && is_headless {
-        let spec = claude_args::resolve_claude_args(Some(&merged_args), None);
-        if spec.is_background {
-            let updated = claude_args::add_background_defaults(&spec);
-            merged_args = updated.rebuild_tokens(true);
-        }
+    if tool == "claude"
+        && is_headless
+        && merged_args
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "-p" | "--print"))
+    {
+        merged_args.extend([
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+            "--verbose".to_string(),
+        ]);
     }
 
     crate::commands::launch::validate_claude_headless_launch(
@@ -529,6 +535,10 @@ fn prepare_resume_plan_from_source(
             tool: tool.clone(),
             count: 1,
             args: merged_args,
+            persisted_args: Some(persisted_args),
+            // Forks start a new session on first turn; only plain resume
+            // inherits the prior id so kill-before-bind stays resumable.
+            prior_session_id: (!fork).then(|| session_id.clone()),
             tag: launch_tag,
             system_prompt: effective_system_prompt,
             initial_prompt: fork_initial_prompt,
@@ -1007,33 +1017,18 @@ fn build_resume_args(tool: &str, session_id: &str, fork: bool) -> Vec<String> {
 
 /// Merge original launch args with resume-specific args.
 fn merge_resume_args(tool: &str, original: &[String], resume: &[String]) -> Vec<String> {
-    // Resume args take precedence. We strip --resume/--session from original
-    // and prepend resume args.
+    // Claude/Gemini/Codex stay grammar-free: preserve the stored user/config
+    // vector verbatim and append hcom's resume injection.
     let tool_lookup = if tool == "claude-pty" { "claude" } else { tool };
     let tool = tool_lookup
         .parse::<crate::tool::Tool>()
         .expect("resume tool must be validated before argument merging");
 
     match tool {
-        crate::tool::Tool::Claude => {
-            let orig_spec = claude_args::resolve_claude_args(Some(original), None);
-            let resume_spec = claude_args::resolve_claude_args(Some(resume), None);
-            let merged = claude_args::merge_claude_args(&orig_spec, &resume_spec);
-            merged.rebuild_tokens(true)
-        }
-        crate::tool::Tool::Gemini => {
-            let orig_spec = gemini_args::resolve_gemini_args(Some(original), None);
-            let resume_spec = gemini_args::resolve_gemini_args(Some(resume), None);
-            let merged = gemini_args::merge_gemini_args(&orig_spec, &resume_spec);
-            merged.rebuild_tokens(true, true)
-        }
-        crate::tool::Tool::Codex => {
-            let stripped_original =
-                crate::tools::codex_preprocessing::strip_codex_developer_instructions(original);
-            let orig_spec = codex_args::resolve_codex_args(Some(&stripped_original), None);
-            let resume_spec = codex_args::resolve_codex_args(Some(resume), None);
-            let merged = codex_args::merge_codex_args(&orig_spec, &resume_spec);
-            merged.rebuild_tokens(true, true)
+        crate::tool::Tool::Claude | crate::tool::Tool::Gemini | crate::tool::Tool::Codex => {
+            let mut merged = original.to_vec();
+            merged.extend_from_slice(resume);
+            merged
         }
         crate::tool::Tool::OpenCode | crate::tool::Tool::Kilo => {
             merge_opencode_args(original, resume)
@@ -2786,6 +2781,51 @@ mod tests {
                 .as_deref()
                 .unwrap_or("")
                 .contains(&format!("[hcom:{reserved_name}]"))
+        );
+    }
+
+    #[test]
+    fn test_resume_inherits_prior_session_id_fork_does_not() {
+        let db = test_db();
+        let mut data = serde_json::Map::new();
+        data.insert("session_id".into(), json!("session-123"));
+        data.insert("tool".into(), json!("codex"));
+        data.insert("status".into(), json!(ST_INACTIVE));
+        data.insert("created_at".into(), json!(1.0));
+        db.save_instance_named("luna", &data).unwrap();
+
+        // Inactive rows resolve via the stopped-snapshot life event.
+        let snapshot = serde_json::json!({
+            "action": "stopped",
+            "snapshot": {
+                "tool": "codex",
+                "session_id": "session-123",
+                "launch_args": "[]",
+                "tag": "",
+                "background": 0,
+                "last_event_id": 0,
+                "directory": "/tmp"
+            }
+        });
+        db.conn()
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data) VALUES (?, 'life', 'luna', ?)",
+                rusqlite::params!["2026-01-01T00:00:00Z", snapshot.to_string()],
+            )
+            .unwrap();
+
+        let resume = prepare_resume_plan(&db, "luna", false, &[], &GlobalFlags::default()).unwrap();
+        assert_eq!(
+            resume.launch.prior_session_id.as_deref(),
+            Some("session-123"),
+            "plain resume must pre-seed the recreated row with the prior session id \
+             so a kill before the first turn (no hook re-bind) stays resumable"
+        );
+
+        let fork = prepare_resume_plan(&db, "luna", true, &[], &GlobalFlags::default()).unwrap();
+        assert_eq!(
+            fork.launch.prior_session_id, None,
+            "forks bind a fresh session on first turn; must not inherit the parent's"
         );
     }
 

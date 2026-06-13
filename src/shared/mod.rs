@@ -8,6 +8,7 @@ pub mod identity;
 pub mod platform;
 pub mod terminal_presets;
 pub mod time;
+pub mod tool_detection;
 
 // Re-export key types at module level for convenience.
 pub use crate::tool::Tool;

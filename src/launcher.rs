@@ -20,8 +20,13 @@ use crate::instance_binding;
 use crate::instance_names;
 use crate::instances;
 use crate::paths;
-use crate::shared::constants::{HCOM_IDENTITY_VARS, TOOL_MARKER_VARS};
+use crate::shared::constants::HCOM_IDENTITY_VARS;
+use crate::shared::tool_detection::tool_marker_vars;
 use crate::terminal;
+use crate::tools::launch_arg_validation::{
+    ANTIGRAVITY_REJECTED_ARGS, GEMINI_REJECTED_ARGS, KILO_REJECTED_ARGS, KIMI_REJECTED_ARGS,
+    OPENCODE_REJECTED_ARGS, PI_REJECTED_ARGS, validate_rejected_args,
+};
 use crate::tools::{
     codex_preprocessing, copilot_preprocessing, cursor_preprocessing, opencode_preprocessing,
 };
@@ -172,6 +177,11 @@ pub struct LaunchParams {
     pub tool: String,
     pub count: usize,
     pub args: Vec<String>,
+    /// Raw user/config args to persist for future resume, before hcom injections.
+    pub persisted_args: Option<Vec<String>>,
+    /// Session id being resumed, inherited by the recreated instance row so a
+    /// kill before the tool's first turn (no hook re-bind yet) stays resumable.
+    pub prior_session_id: Option<String>,
     pub tag: Option<String>,
     pub system_prompt: Option<String>,
     pub initial_prompt: Option<String>,
@@ -193,6 +203,8 @@ impl Default for LaunchParams {
             tool: "claude".to_string(),
             count: 1,
             args: Vec::new(),
+            persisted_args: None,
+            prior_session_id: None,
             tag: None,
             system_prompt: None,
             initial_prompt: None,
@@ -367,7 +379,7 @@ fn run_here_env_strip_set() -> std::collections::HashSet<String> {
     for v in crate::shared::constants::HCOM_IDENTITY_VARS {
         strip.insert((*v).to_string());
     }
-    for v in crate::shared::constants::TOOL_MARKER_VARS {
+    for v in tool_marker_vars() {
         strip.insert((*v).to_string());
     }
     strip.insert("HCOM_LAUNCHED_PRESET".to_string());
@@ -728,7 +740,7 @@ pub fn create_runner_script(
         .filter(|(k, _)| k.starts_with("HCOM_"))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
-    let sidecar_strip: std::collections::HashSet<&str> = TOOL_MARKER_VARS
+    let sidecar_strip: std::collections::HashSet<&str> = tool_marker_vars()
         .iter()
         .chain(HCOM_IDENTITY_VARS.iter())
         .chain(instance_state_env.iter())
@@ -827,7 +839,7 @@ pub fn create_runner_script(
         instance_name,
         native_bin_str,
         crate::tools::args_common::shell_quote(cwd),
-        TOOL_MARKER_VARS.join(" "),
+        tool_marker_vars().join(" "),
         HCOM_IDENTITY_VARS.join(" "),
         instance_state_env.join(" "),
         env_block,
@@ -955,7 +967,10 @@ fn finalize_background_launch(
     instances::update_instance_position(
         ctx.db,
         ctx.instance_name,
-        &serde_json::Map::from_iter([("pid".to_string(), json!(pid))]),
+        &serde_json::Map::from_iter([
+            ("pid".to_string(), json!(pid)),
+            ("background_log_file".to_string(), json!(&log_file)),
+        ]),
     );
     crate::pidtrack::record_pid(&crate::pidtrack::PidRecord {
         process_id: ctx.process_id,
@@ -1213,8 +1228,14 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
     // PTY hosts the live TUI, print mode loops via the stop hook. `-p` is gated
     // behind explicit opt-in because, from 2026-06-15, `claude -p` draws from a
     // separate Agent SDK credit pool on subscription plans.
+    // Exact-token match is intentional: `--print` is a boolean flag, so an
+    // equals form (`--print=x`) is malformed for claude and surfaces as a
+    // launch failure rather than being silently mis-routed to the PTY surface.
     let claude_print = (params.tool == "claude" || params.tool == "claude-pty")
-        && crate::hooks::claude_args::resolve_claude_args(Some(&params.args), None).is_background;
+        && params
+            .args
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "-p" | "--print"));
 
     // `claude-pty` is the PTY surface; `-p`/`--print` selects the NativePrint
     // surface. The two are mutually exclusive: passing both would route print
@@ -1373,6 +1394,17 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
     if hcom_config.auto_trust_workspace && matches!(normalized, LaunchTool::Copilot) {
         copilot_preprocessing::ensure_copilot_workspace_trusted(&canonical_dir)?;
     }
+
+    // Capture the persistable args BEFORE any hcom launch injection below.
+    // Resume replays only user/config args; workspace-trust injection
+    // (gemini `--skip-trust`, codex `-c projects=…trust_level`) and the
+    // `--hcom-prompt` translation are session/path-specific and must not be
+    // baked into launch_args, or they would replay stale state on resume/fork.
+    let stored_launch_args = params
+        .persisted_args
+        .clone()
+        .unwrap_or_else(|| params.args.clone());
+
     inject_workspace_trust_args(
         &normalized,
         &canonical_dir,
@@ -1503,7 +1535,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
             instance_binding::initialize_instance_in_position_file(
                 db,
                 &instance_name,
-                None,            // session_id
+                params.prior_session_id.as_deref(),
                 None,            // parent_session_id
                 None,            // parent_name
                 None,            // agent_id
@@ -1523,7 +1555,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
             db.set_process_binding(&process_id, "", &instance_name)?;
             Ok(())
         })() {
-            errors.push(json!({"tool": normalized.as_str(), "error": e.to_string()}));
+            errors.push(json!({"tool": base_tool, "error": e.to_string()}));
             continue;
         }
 
@@ -1539,7 +1571,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                         &instance_name,
                         &serde_json::Map::from_iter([(
                             "launch_args".to_string(),
-                            json!(params.args),
+                            json!(&stored_launch_args),
                         )]),
                     );
 
@@ -1631,7 +1663,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                         &instance_name,
                         &serde_json::Map::from_iter([(
                             "launch_args".to_string(),
-                            json!(params.args),
+                            json!(&stored_launch_args),
                         )]),
                     );
                     // Same background/foreground split as gemini/codex/opencode:
@@ -1664,7 +1696,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                         &instance_name,
                         &serde_json::Map::from_iter([(
                             "launch_args".to_string(),
-                            json!(params.args),
+                            json!(&stored_launch_args),
                         )]),
                     );
                     launch_pty_or_background(
@@ -1733,7 +1765,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                         &instance_name,
                         &serde_json::Map::from_iter([(
                             "launch_args".to_string(),
-                            json!(effective_args),
+                            json!(&stored_launch_args),
                         )]),
                     );
 
@@ -1771,7 +1803,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                         &instance_name,
                         &serde_json::Map::from_iter([(
                             "launch_args".to_string(),
-                            json!(params.args),
+                            json!(&stored_launch_args),
                         )]),
                     );
 
@@ -1803,7 +1835,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                         &instance_name,
                         &serde_json::Map::from_iter([(
                             "launch_args".to_string(),
-                            json!(params.args),
+                            json!(&stored_launch_args),
                         )]),
                     );
                     launch_pty_or_background(
@@ -1830,7 +1862,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                         &instance_name,
                         &serde_json::Map::from_iter([(
                             "launch_args".to_string(),
-                            json!(params.args),
+                            json!(&stored_launch_args),
                         )]),
                     );
                     launch_pty_or_background(
@@ -1858,7 +1890,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                         &instance_name,
                         &serde_json::Map::from_iter([(
                             "launch_args".to_string(),
-                            json!(params.args),
+                            json!(&stored_launch_args),
                         )]),
                     );
                     launch_pty_or_background(
@@ -1885,7 +1917,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                         &instance_name,
                         &serde_json::Map::from_iter([(
                             "launch_args".to_string(),
-                            json!(params.args),
+                            json!(&stored_launch_args),
                         )]),
                     );
                     launch_pty_or_background(
@@ -1916,7 +1948,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
             }
             Err(e) => {
                 cleanup_instance(db, &instance_name, &process_id);
-                errors.push(json!({"tool": normalized.as_str(), "error": e.to_string()}));
+                errors.push(json!({"tool": base_tool, "error": e.to_string()}));
             }
         }
     }
@@ -1949,7 +1981,9 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
             "action": "batch_launched",
             "by": &launcher_name,
             "batch_id": batch_id,
-            "tool": normalized.as_str(),
+            // User-facing tool identity (`claude`, not the `claude-pty` launch
+            // surface) — consistent with per-instance events and LaunchResult.
+            "tool": base_tool,
             "count_requested": params.count,
             "launched": launched,
             "failed": failed,
@@ -1975,7 +2009,9 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
     }
 
     Ok(LaunchResult {
-        tool: normalized.as_str().to_string(),
+        // User-facing identity. The PTY-vs-print backend distinction lives in
+        // `LaunchBackend`, not the tool string, so consumers see `claude`.
+        tool: base_tool.to_string(),
         batch_id,
         launched,
         failed,
@@ -1987,29 +2023,25 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
 }
 
 /// Validate tool args (pure parsing, no mutation).
-fn validate_tool_args(tool: &LaunchTool, args: &[String]) -> Vec<String> {
+pub(crate) fn validate_tool_args(tool: &LaunchTool, args: &[String]) -> Vec<String> {
     match tool {
-        LaunchTool::Claude | LaunchTool::ClaudePty => {
-            let spec = crate::hooks::claude_args::resolve_claude_args(Some(args), None);
-            spec.errors.clone()
-        }
+        LaunchTool::Claude | LaunchTool::ClaudePty | LaunchTool::Codex => Vec::new(),
         LaunchTool::Gemini => {
-            let spec = crate::tools::gemini_args::resolve_gemini_args(Some(args), None);
-            let mut errs = spec.errors.clone();
-            errs.extend(crate::tools::gemini_args::validate_conflicts(&spec));
-            errs
-        }
-        LaunchTool::Codex => {
-            let spec = crate::tools::codex_args::resolve_codex_args(Some(args), None);
-            let mut errs = spec.errors.clone();
-            errs.extend(crate::tools::codex_args::validate_conflicts(&spec));
-            errs
+            validate_rejected_args("Gemini", "hcom gemini", args, GEMINI_REJECTED_ARGS)
         }
         LaunchTool::Cursor => crate::tools::cursor_preprocessing::validate_cursor_args(args),
-        LaunchTool::Kimi => Vec::new(),
-        LaunchTool::OpenCode | LaunchTool::Kilo | LaunchTool::Pi | LaunchTool::Antigravity => {
-            Vec::new()
+        LaunchTool::Kimi => validate_rejected_args("Kimi", "hcom kimi", args, KIMI_REJECTED_ARGS),
+        LaunchTool::OpenCode => {
+            validate_rejected_args("OpenCode", "hcom opencode", args, OPENCODE_REJECTED_ARGS)
         }
+        LaunchTool::Kilo => validate_rejected_args("Kilo", "hcom kilo", args, KILO_REJECTED_ARGS),
+        LaunchTool::Pi => validate_rejected_args("Pi", "hcom pi", args, PI_REJECTED_ARGS),
+        LaunchTool::Antigravity => validate_rejected_args(
+            "Antigravity",
+            "hcom antigravity",
+            args,
+            ANTIGRAVITY_REJECTED_ARGS,
+        ),
         LaunchTool::Copilot => crate::tools::copilot_preprocessing::validate_copilot_args(args),
     }
 }
@@ -2151,10 +2183,111 @@ mod tests {
     }
 
     #[test]
+    fn initial_prompt_flag_shape_appends_after_native_prompt() {
+        let mut args = vec!["--prompt".to_string(), "native prompt".to_string()];
+        append_initial_prompt_args(&LaunchTool::OpenCode, &mut args, "hcom prompt".into()).unwrap();
+        assert_eq!(
+            args,
+            vec!["--prompt", "native prompt", "--prompt", "hcom prompt"]
+        );
+    }
+
+    #[test]
+    fn initial_prompt_positional_shape_appends_after_native_prompt() {
+        let mut args = vec!["native prompt".to_string()];
+        append_initial_prompt_args(&LaunchTool::Gemini, &mut args, "hcom prompt".into()).unwrap();
+        assert_eq!(args, vec!["native prompt", "hcom prompt"]);
+    }
+
+    #[test]
+    fn initial_prompt_dash_dash_shape_appends_after_native_prompt() {
+        let mut args = vec!["--".to_string(), "native prompt".to_string()];
+        append_initial_prompt_args(&LaunchTool::Claude, &mut args, "hcom prompt".into()).unwrap();
+        assert_eq!(args, vec!["--", "native prompt", "--", "hcom prompt"]);
+    }
+
+    #[test]
+    fn hcom_prompt_alone_is_injected_for_every_shape() {
+        for (tool, expected) in [
+            (
+                LaunchTool::OpenCode,
+                vec!["--prompt".to_string(), "hcom".to_string()],
+            ),
+            (LaunchTool::Gemini, vec!["hcom".to_string()]),
+            (
+                LaunchTool::Claude,
+                vec!["--".to_string(), "hcom".to_string()],
+            ),
+        ] {
+            let mut args = Vec::new();
+            append_initial_prompt_args(&tool, &mut args, "hcom".into()).unwrap();
+            assert_eq!(args, expected);
+        }
+    }
+
+    #[test]
+    fn positional_shape_does_not_treat_model_value_as_prompt() {
+        let mut args = vec!["--model".to_string(), "safe-model".to_string()];
+        append_initial_prompt_args(&LaunchTool::Gemini, &mut args, "hcom".into()).unwrap();
+        assert_eq!(args.last().map(String::as_str), Some("hcom"));
+    }
+
+    #[test]
     fn validate_cursor_print_mode_fails_fast() {
         let errors = validate_tool_args(&LaunchTool::Cursor, &["--print".to_string()]);
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("not supported"));
+    }
+
+    #[test]
+    fn validate_kimi_rejects_prompt_mode_but_allows_resume() {
+        let errors = validate_tool_args(&LaunchTool::Kimi, &["--prompt".to_string()]);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("--prompt"));
+        assert!(validate_tool_args(&LaunchTool::Kimi, &["--session".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn validate_opencode_rejects_run_but_allows_session() {
+        let errors = validate_tool_args(&LaunchTool::OpenCode, &["run".to_string()]);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("run"));
+        assert!(validate_tool_args(&LaunchTool::OpenCode, &["--session".to_string()]).is_empty());
+        assert!(validate_tool_args(&LaunchTool::OpenCode, &["--prompt".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn validate_kilo_rejects_serve_but_allows_continue() {
+        let errors = validate_tool_args(&LaunchTool::Kilo, &["serve".to_string()]);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("serve"));
+        assert!(validate_tool_args(&LaunchTool::Kilo, &["--continue".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn validate_pi_rejects_print_but_allows_fork() {
+        let errors = validate_tool_args(&LaunchTool::Pi, &["--print".to_string()]);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("--print"));
+        assert!(validate_tool_args(&LaunchTool::Pi, &["--fork".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn validate_antigravity_rejects_print_alias_but_allows_conversation() {
+        let errors = validate_tool_args(&LaunchTool::Antigravity, &["--prompt".to_string()]);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("--prompt"));
+        assert!(
+            validate_tool_args(&LaunchTool::Antigravity, &["--conversation".to_string()])
+                .is_empty()
+        );
+        assert!(
+            validate_tool_args(
+                &LaunchTool::Antigravity,
+                &["--prompt-interactive".to_string()]
+            )
+            .is_empty()
+        );
     }
 
     #[test]
@@ -2351,9 +2484,11 @@ mod tests {
         assert!(strip.contains("HCOM_LAUNCHED"));
         // Tool markers
         assert!(strip.contains("CLAUDECODE"));
+        assert!(strip.contains("CLAUDE_ENV_FILE"));
         assert!(strip.contains("CODEX_SANDBOX"));
         assert!(strip.contains("CODEX_THREAD_ID"));
         assert!(strip.contains("GEMINI_SYSTEM_MD"));
+        assert!(strip.contains("HCOM_TOOL"));
         assert!(strip.contains("HCOM_PI"));
         assert!(!strip.contains("PI_CODING_AGENT_DIR"));
         // Terminal context

@@ -692,8 +692,10 @@ fn prepare_remote_launch(
     request: &RemoteLaunchRequest,
     config: &HcomConfig,
 ) -> PreparedRemoteLaunch {
+    let tool = crate::launcher::LaunchTool::from_str(&request.tool)
+        .unwrap_or_else(|_| panic!("validated remote launch tool: {}", request.tool));
     let (args, background) = crate::commands::launch::prepare_launch_execution(
-        &request.tool,
+        &tool,
         &request.args,
         config,
         request.background,
@@ -747,6 +749,8 @@ fn handle_remote_launch(
             tool: request.tool.clone(),
             count: request.count,
             args: prepared.args,
+            persisted_args: None,
+            prior_session_id: None,
             tag: request.tag,
             system_prompt: request.system_prompt,
             initial_prompt: request.initial_prompt,
@@ -1482,10 +1486,14 @@ mod tests {
         .unwrap();
         let prepared = prepare_remote_launch(&request, &HcomConfig::default());
         assert!(prepared.background);
-        let spec = crate::hooks::claude_args::resolve_claude_args(Some(&prepared.args), None);
-        assert!(spec.is_background);
-        assert!(spec.has_flag(&["--output-format"], &["--output-format="]));
-        assert!(spec.has_flag(&["--verbose"], &[]));
+        assert!(prepared.args.iter().any(|arg| arg == "-p"));
+        assert!(
+            prepared
+                .args
+                .windows(2)
+                .any(|w| w == ["--output-format", "stream-json"])
+        );
+        assert!(prepared.args.iter().any(|arg| arg == "--verbose"));
     }
 
     #[test]
@@ -1502,14 +1510,16 @@ mod tests {
         .unwrap();
         let prepared = prepare_remote_launch(&request, &HcomConfig::default());
         assert!(prepared.background);
-        let spec = crate::hooks::claude_args::resolve_claude_args(Some(&prepared.args), None);
-        assert!(!spec.is_background, "no -p → live PTY session, not print");
+        assert!(
+            !prepared
+                .args
+                .iter()
+                .any(|arg| matches!(arg.as_str(), "-p" | "--print"))
+        );
     }
 
     #[test]
-    fn test_remote_launch_rejects_claude_print_without_prompt() {
-        // Remote `claude -p` with no prompt must be rejected, matching the local
-        // CLI path's validate_claude_headless_launch invariant.
+    fn test_remote_launch_defers_claude_print_prompt_validation() {
         let request = RemoteLaunchRequest::from_params(&json!({
             "tool": "claude",
             "count": 1,
@@ -1519,14 +1529,15 @@ mod tests {
         .unwrap();
         let prepared = prepare_remote_launch(&request, &HcomConfig::default());
         assert!(prepared.background);
-        let err = crate::commands::launch::validate_claude_headless_launch(
-            &request.tool,
-            prepared.background,
-            &prepared.args,
-            request.initial_prompt.as_deref(),
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("requires a prompt/task"));
+        assert!(
+            crate::commands::launch::validate_claude_headless_launch(
+                &request.tool,
+                prepared.background,
+                &prepared.args,
+                request.initial_prompt.as_deref(),
+            )
+            .is_ok()
+        );
     }
 
     #[test]

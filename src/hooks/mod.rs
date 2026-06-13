@@ -2,7 +2,6 @@
 
 pub mod antigravity;
 pub mod claude;
-pub mod claude_args;
 pub mod codex;
 pub mod codex_file_edits;
 pub mod common;

@@ -8,13 +8,11 @@ use crate::config::HcomConfig;
 use crate::core::launch_status::{self, LaunchStatus};
 use crate::core::tips::{self, LaunchTipsContext};
 use crate::db::HcomDb;
-use crate::hooks::claude_args;
 use crate::identity;
-use crate::launcher::{self, LaunchParams, LaunchResult};
+use crate::launcher::{self, LaunchParams, LaunchResult, LaunchTool};
 use crate::log::log_info;
 use crate::router::GlobalFlags;
 use crate::shared::HcomContext;
-use crate::tools::{codex_args, gemini_args};
 use anyhow::{Result, bail};
 use serde_json::json;
 use std::time::Instant;
@@ -24,15 +22,13 @@ pub(crate) const INLINE_SINGLE_LAUNCH_WAIT_SECS: u64 = 10;
 /// Run the launch command. `argv` is the full argv[1..] including count/tool.
 pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
     let (count, tool, hcom_flags, tool_args) = parse_launch_argv(argv)?;
+    let launch_tool = LaunchTool::from_str(&tool)?;
 
     // Count validation
     if count == 0 {
         bail!("Count must be positive.");
     }
-    let max_count: usize = tool
-        .parse::<crate::tool::Tool>()
-        .map(|t| t.spec().launch.max_launch_count)
-        .unwrap_or(10);
+    let max_count = launch_tool.spec().launch.max_launch_count;
     if count > max_count {
         bail!("Too many agents requested (max {}).", max_count);
     }
@@ -46,7 +42,7 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
     let terminal_for_output = terminal.clone();
 
     let hcom_config = load_hcom_config();
-    let preview_background = headless || is_background_from_args(&tool, &tool_args);
+    let preview_background = headless || is_background_from_args(&launch_tool, &tool_args);
 
     let ctx = HcomContext::from_os();
     if ctx.is_inside_ai_tool() && !flags.go && (!tool_args.is_empty() || count > 5) {
@@ -141,7 +137,7 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
 
     // Merge env config args with CLI args
     let (merged_args, background) =
-        prepare_launch_execution(&tool, &tool_args, &hcom_config, headless);
+        prepare_launch_execution(&launch_tool, &tool_args, &hcom_config, headless);
 
     validate_claude_headless_launch(&tool, background, &merged_args, initial_prompt.as_deref())?;
 
@@ -175,6 +171,8 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
             tool: tool.clone(),
             count,
             args: merged_args,
+            persisted_args: None,
+            prior_session_id: None,
             tag,
             system_prompt,
             initial_prompt,
@@ -223,7 +221,7 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
 }
 
 pub(crate) fn prepare_launch_execution(
-    tool: &str,
+    tool: &LaunchTool,
     cli_args: &[String],
     config: &HcomConfig,
     headless: bool,
@@ -231,18 +229,18 @@ pub(crate) fn prepare_launch_execution(
     let mut merged_args = merge_tool_args(tool, cli_args, config);
     let background = headless || is_background_from_args(tool, &merged_args);
 
-    // Claude background defaults to the live PTY-hosted TUI session (the
-    // launcher's `ClaudePty` surface) — no arg rewriting needed. Print mode
-    // (`NativePrint`) is opt-in via an explicit `-p`/`--print`; only then do we
-    // apply the detached print-mode defaults. `-p` is gated behind explicit
-    // opt-in because, from 2026-06-15, `claude -p` draws from a separate Agent
-    // SDK credit pool on subscription plans.
-    if tool == "claude" && background {
-        let spec = claude_args::resolve_claude_args(Some(&merged_args), None);
-        if spec.is_background {
-            let updated = claude_args::add_background_defaults(&spec);
-            merged_args = updated.rebuild_tokens(true);
-        }
+    // Print mode needs stream-json for the stop-hook loop. Keep this deliberately
+    // grammar-free: hcom appends its required defaults and lets Claude resolve
+    // duplicates or reject incompatible combinations.
+    if matches!(tool, LaunchTool::Claude | LaunchTool::ClaudePty)
+        && background
+        && args_contain_any(&merged_args, &["-p", "--print"])
+    {
+        merged_args.extend([
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+            "--verbose".to_string(),
+        ]);
     }
 
     (merged_args, background)
@@ -258,26 +256,17 @@ pub(crate) fn validate_claude_headless_launch(
         return Ok(());
     }
 
-    let spec = claude_args::resolve_claude_args(Some(merged_args), None);
-
-    // Default background claude is a PTY-hosted live TUI session that stays
-    // alive waiting for hcom inject, so a starting prompt is optional. Only
-    // `-p`/`--print` mode needs a starting prompt to kick off its first run
-    // (it then stays alive across turns via the stop-hook loop).
-    if !spec.is_background {
+    if !args_contain_any(merged_args, &["-p", "--print"]) {
         return Ok(());
     }
 
-    let has_cli_prompt = spec.positional_tokens.iter().any(|t| !t.trim().is_empty());
     let has_hcom_prompt = initial_prompt.is_some_and(|p| !p.trim().is_empty());
-
-    if has_cli_prompt || has_hcom_prompt {
+    if has_hcom_prompt {
         return Ok(());
     }
-
-    bail!(
-        "Claude `-p`/`--print` mode requires a prompt/task. Try `hcom claude -p 'say hi in hcom'`, or drop `-p` for a live `hcom claude --headless` session that needs no starting prompt."
-    )
+    // User positionals cannot be identified without duplicating Claude's flag
+    // grammar. Let Claude validate whether print mode received a prompt.
+    Ok(())
 }
 
 pub(crate) fn launch_result_to_json(result: &LaunchResult) -> serde_json::Value {
@@ -387,6 +376,7 @@ pub(crate) fn print_launch_preview(preview: LaunchPreview<'_>) {
             "kilo" | "kilocode" => preview.config.kilo_args.as_str(),
             "pi" | "pi-agent" => preview.config.pi_args.as_str(),
             "cursor" | "cursor-agent" => preview.config.cursor_args.as_str(),
+            "copilot" => preview.config.copilot_args.as_str(),
             "kimi" => preview.config.kimi_args.as_str(),
             _ => "",
         }
@@ -429,7 +419,9 @@ pub(crate) fn print_launch_preview(preview: LaunchPreview<'_>) {
             println!("  From CLI: {}", preview.args.join(" "));
         }
         if !env_args.is_empty() && !preview.args.is_empty() {
-            println!("  (CLI overrides config per-flag)");
+            println!(
+                "  (config args are passed first, then CLI args; the tool resolves duplicates)"
+            );
         }
     }
 }
@@ -500,111 +492,71 @@ fn parse_launch_argv(argv: &[String]) -> Result<(usize, String, HcomLaunchFlags,
 }
 
 /// Merge env config args with CLI args via tool-specific parsers.
-pub(crate) fn merge_tool_args(tool: &str, cli_args: &[String], config: &HcomConfig) -> Vec<String> {
+fn append_config_args(config_args: &str, cli_args: &[String]) -> Vec<String> {
+    let mut tokens = if config_args.is_empty() {
+        Vec::new()
+    } else {
+        // Don't silently drop hand-edited config args on a parse error (e.g. an
+        // unterminated quote) — surface it so the launch isn't quietly missing
+        // flags the user configured.
+        crate::tools::args_common::shell_split(config_args).unwrap_or_else(|err| {
+            eprintln!("hcom: ignoring malformed configured args ({err}): {config_args}");
+            Vec::new()
+        })
+    };
+    tokens.extend(cli_args.iter().cloned());
+    tokens
+}
+
+pub(crate) fn merge_tool_args(
+    tool: &LaunchTool,
+    cli_args: &[String],
+    config: &HcomConfig,
+) -> Vec<String> {
     match tool {
-        "claude" | "claude-pty" => {
-            let env_str = &config.claude_args;
-            if env_str.is_empty() {
-                return cli_args.to_vec();
-            }
-            let env_tokens: Vec<String> =
-                crate::tools::args_common::shell_split(env_str).unwrap_or_default();
-            let env_spec = claude_args::resolve_claude_args(Some(&env_tokens), None);
-            let cli_spec = claude_args::resolve_claude_args(Some(cli_args), None);
-            let merged = claude_args::merge_claude_args(&env_spec, &cli_spec);
-            merged.rebuild_tokens(true)
+        LaunchTool::Claude | LaunchTool::ClaudePty => {
+            append_config_args(&config.claude_args, cli_args)
         }
-        "gemini" => {
-            let env_str = &config.gemini_args;
-            if env_str.is_empty() {
-                return cli_args.to_vec();
-            }
-            let env_tokens: Vec<String> =
-                crate::tools::args_common::shell_split(env_str).unwrap_or_default();
-            let env_spec = gemini_args::resolve_gemini_args(Some(&env_tokens), None);
-            let cli_spec = gemini_args::resolve_gemini_args(Some(cli_args), None);
-            let merged = gemini_args::merge_gemini_args(&env_spec, &cli_spec);
-            merged.rebuild_tokens(true, true)
-        }
-        "codex" => {
-            let env_str = &config.codex_args;
-            if env_str.is_empty() {
-                return cli_args.to_vec();
-            }
-            let env_tokens: Vec<String> =
-                crate::tools::args_common::shell_split(env_str).unwrap_or_default();
-            let env_spec = codex_args::resolve_codex_args(Some(&env_tokens), None);
-            let cli_spec = codex_args::resolve_codex_args(Some(cli_args), None);
-            let merged = codex_args::merge_codex_args(&env_spec, &cli_spec);
-            merged.rebuild_tokens(true, true)
-        }
-        "cursor" | "cursor-agent" => {
+        LaunchTool::Gemini => append_config_args(&config.gemini_args, cli_args),
+        LaunchTool::Codex => append_config_args(&config.codex_args, cli_args),
+        LaunchTool::Cursor => {
             // env config args first, explicit CLI args last (CLI wins under
             // commander.js last-wins). Print-mode conflicts are rejected by the
             // unified launcher so their meaning is never silently changed.
-            let env_str = &config.cursor_args;
-            let mut tokens: Vec<String> = if env_str.is_empty() {
-                Vec::new()
-            } else {
-                crate::tools::args_common::shell_split(env_str).unwrap_or_default()
-            };
-            tokens.extend(cli_args.iter().cloned());
-            tokens
+            append_config_args(&config.cursor_args, cli_args)
         }
-        "copilot" => {
-            let env_str = &config.copilot_args;
-            let mut tokens: Vec<String> = if env_str.is_empty() {
-                Vec::new()
-            } else {
-                crate::tools::args_common::shell_split(env_str).unwrap_or_default()
-            };
-            tokens.extend(cli_args.iter().cloned());
-            tokens
+        LaunchTool::Copilot => append_config_args(&config.copilot_args, cli_args),
+        LaunchTool::Pi => append_config_args(&config.pi_args, cli_args),
+        LaunchTool::OpenCode => append_config_args(&config.opencode_args, cli_args),
+        LaunchTool::Kilo => append_config_args(&config.kilo_args, cli_args),
+        LaunchTool::Kimi => append_config_args(&config.kimi_args, cli_args),
+        LaunchTool::Antigravity => {
+            // IntegrationSpec.launch.args_env is explicitly None: Antigravity
+            // has no persisted *_args config to merge.
+            cli_args.to_vec()
         }
-        "pi" | "pi-agent" => {
-            let env_str = &config.pi_args;
-            let mut tokens: Vec<String> = if env_str.is_empty() {
-                Vec::new()
-            } else {
-                crate::tools::args_common::shell_split(env_str).unwrap_or_default()
-            };
-            tokens.extend(cli_args.iter().cloned());
-            tokens
-        }
-        // OpenCode-family + Kimi: env config args first, explicit CLI args last
-        // (CLI wins on last-wins parsers). Without this they fell to the
-        // pass-through `_` arm and the `*_args` config was silently dropped at
-        // launch.
-        "opencode" | "kilo" | "kilocode" | "kimi" => {
-            let env_str = match tool {
-                "kilo" | "kilocode" => &config.kilo_args,
-                "kimi" => &config.kimi_args,
-                _ => &config.opencode_args,
-            };
-            let mut tokens: Vec<String> = if env_str.is_empty() {
-                Vec::new()
-            } else {
-                crate::tools::args_common::shell_split(env_str).unwrap_or_default()
-            };
-            tokens.extend(cli_args.iter().cloned());
-            tokens
-        }
-        _ => cli_args.to_vec(),
     }
 }
 
+fn args_contain_any(args: &[String], needles: &[&str]) -> bool {
+    args.iter().any(|arg| needles.contains(&arg.as_str()))
+}
+
 /// Check if args indicate background/headless mode.
-pub(crate) fn is_background_from_args(tool: &str, args: &[String]) -> bool {
+pub(crate) fn is_background_from_args(tool: &LaunchTool, args: &[String]) -> bool {
     match tool {
-        "claude" | "claude-pty" => {
-            let spec = claude_args::resolve_claude_args(Some(args), None);
-            spec.is_background
-        }
-        "gemini" => {
-            let spec = gemini_args::resolve_gemini_args(Some(args), None);
-            spec.is_headless
-        }
-        _ => false,
+        LaunchTool::Claude | LaunchTool::ClaudePty => args_contain_any(args, &["-p", "--print"]),
+        // These tools are always hosted in hcom's PTY. Their native
+        // non-interactive modes are rejected by validate_tool_args.
+        LaunchTool::Gemini
+        | LaunchTool::Codex
+        | LaunchTool::OpenCode
+        | LaunchTool::Kilo
+        | LaunchTool::Pi
+        | LaunchTool::Antigravity
+        | LaunchTool::Cursor
+        | LaunchTool::Kimi
+        | LaunchTool::Copilot => false,
     }
 }
 
@@ -912,6 +864,10 @@ mod tests {
         items.iter().map(|i| i.to_string()).collect()
     }
 
+    fn lt(tool: &str) -> LaunchTool {
+        LaunchTool::from_str(tool).unwrap()
+    }
+
     #[test]
     fn test_parse_launch_argv_simple() {
         let (count, tool, _flags, args) = parse_launch_argv(&s(&["claude"])).unwrap();
@@ -990,11 +946,26 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_tool_args_passthrough() {
-        let config = HcomConfig::default();
-        let args = s(&["--model", "haiku"]);
-        let merged = merge_tool_args("claude", &args, &config);
-        assert_eq!(merged, args);
+    fn test_primary_tool_args_are_concatenated_verbatim() {
+        for (tool, field) in [
+            ("claude", "claude_args"),
+            ("gemini", "gemini_args"),
+            ("codex", "codex_args"),
+        ] {
+            let mut config = HcomConfig::default();
+            config.set_field(field, "--future-config value").unwrap();
+            let cli = s(&["--future-upstream-flag", "raw-value"]);
+            let merged = merge_tool_args(&lt(tool), &cli, &config);
+            assert_eq!(
+                merged,
+                s(&[
+                    "--future-config",
+                    "value",
+                    "--future-upstream-flag",
+                    "raw-value"
+                ])
+            );
+        }
     }
 
     #[test]
@@ -1009,7 +980,7 @@ mod tests {
         ] {
             let mut config = HcomConfig::default();
             config.set_field(field, "--model from-config").unwrap();
-            let merged = merge_tool_args(tool, &cli, &config);
+            let merged = merge_tool_args(&lt(tool), &cli, &config);
             assert_eq!(
                 merged,
                 s(&["--model", "from-config", "--yolo"]),
@@ -1101,12 +1072,15 @@ mod tests {
     fn test_prepare_launch_execution_claude_print_adds_background_defaults() {
         // Explicit `-p` opts into print mode → detached print-mode defaults applied.
         let config = HcomConfig::default();
-        let (args, background) = prepare_launch_execution("claude", &s(&["-p"]), &config, true);
+        let (args, background) =
+            prepare_launch_execution(&lt("claude"), &s(&["-p"]), &config, true);
         assert!(background);
 
-        let spec = crate::hooks::claude_args::resolve_claude_args(Some(&args), None);
-        assert!(spec.has_flag(&["--output-format"], &["--output-format="]));
-        assert!(spec.has_flag(&["--verbose"], &[]));
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--output-format", "stream-json"])
+        );
+        assert!(args.iter().any(|arg| arg == "--verbose"));
     }
 
     #[test]
@@ -1114,11 +1088,14 @@ mod tests {
         // `hcom claude --headless` (no -p) is the live PTY session now — no -p is
         // injected and no print-mode defaults are added.
         let config = HcomConfig::default();
-        let (args, background) = prepare_launch_execution("claude", &s(&[]), &config, true);
+        let (args, background) = prepare_launch_execution(&lt("claude"), &s(&[]), &config, true);
         assert!(background);
-        let spec = crate::hooks::claude_args::resolve_claude_args(Some(&args), None);
-        assert!(!spec.is_background, "no -p → live PTY session, not print");
-        assert!(!spec.has_flag(&["--output-format"], &["--output-format="]));
+        assert!(
+            !args
+                .iter()
+                .any(|arg| matches!(arg.as_str(), "-p" | "--print"))
+        );
+        assert!(!args.iter().any(|arg| arg == "--output-format"));
     }
 
     #[test]
@@ -1126,17 +1103,15 @@ mod tests {
         // `hcom claude --headless "task text"` — positional prompt, no -p → PTY.
         let config = HcomConfig::default();
         let (args, _background) =
-            prepare_launch_execution("claude", &s(&["task text"]), &config, true);
-        let spec = crate::hooks::claude_args::resolve_claude_args(Some(&args), None);
-        assert!(!spec.is_background);
-        assert!(spec.positional_tokens.iter().any(|t| t == "task text"));
+            prepare_launch_execution(&lt("claude"), &s(&["task text"]), &config, true);
+        assert_eq!(args, s(&["task text"]));
     }
 
     #[test]
     fn test_prepare_launch_execution_headless_only_applies_to_claude() {
         // --headless on other tools must not grow a -p; that flag is Claude-specific.
         let config = HcomConfig::default();
-        let (args, _bg) = prepare_launch_execution("codex", &s(&[]), &config, true);
+        let (args, _bg) = prepare_launch_execution(&lt("codex"), &s(&[]), &config, true);
         assert!(!args.iter().any(|t| t == "-p"));
     }
 
@@ -1144,19 +1119,14 @@ mod tests {
     fn test_prepare_launch_execution_interactive_claude_unchanged() {
         // Foreground `hcom claude` (no --headless, no -p) stays untouched.
         let config = HcomConfig::default();
-        let (args, background) = prepare_launch_execution("claude", &s(&[]), &config, false);
+        let (args, background) = prepare_launch_execution(&lt("claude"), &s(&[]), &config, false);
         assert!(!background);
         assert!(args.is_empty());
     }
 
     #[test]
-    fn test_validate_claude_print_requires_prompt() {
-        // `-p` with no prompt → rejected (print mode needs a starting task).
-        let err = validate_claude_headless_launch("claude", true, &s(&["-p"]), None).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("`-p`/`--print` mode requires a prompt/task")
-        );
+    fn test_validate_claude_print_defers_prompt_validation_to_claude() {
+        assert!(validate_claude_headless_launch("claude", true, &s(&["-p"]), None).is_ok());
     }
 
     #[test]
@@ -1343,7 +1313,7 @@ mod tests {
     #[test]
     fn test_is_background_claude_headless() {
         assert!(is_background_from_args(
-            "claude",
+            &lt("claude"),
             &s(&["-p", "fix tests", "--output-format", "json"])
         ));
     }
@@ -1351,7 +1321,7 @@ mod tests {
     #[test]
     fn test_is_background_claude_interactive() {
         assert!(!is_background_from_args(
-            "claude",
+            &lt("claude"),
             &s(&["--model", "haiku"])
         ));
     }

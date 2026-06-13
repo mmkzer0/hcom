@@ -41,10 +41,14 @@ const CURSOR_PRINT_FLAGS: &[&str] = &["-p", "--print", "--stream-partial-output"
 
 /// Reject print/headless flags that would break hcom's PTY delivery model.
 pub(crate) fn validate_cursor_args(tokens: &[String]) -> Vec<String> {
-    let found: Vec<&str> = tokens
+    let found: Vec<&str> = CURSOR_PRINT_FLAGS
         .iter()
-        .map(String::as_str)
-        .filter(|token| CURSOR_PRINT_FLAGS.contains(token))
+        .copied()
+        .filter(|flag| {
+            tokens
+                .iter()
+                .any(|token| crate::tools::launch_arg_validation::long_flag_matches(token, flag))
+        })
         .collect();
     if found.is_empty() {
         return Vec::new();
@@ -165,6 +169,13 @@ mod tests {
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("-p, --print, --stream-partial-output"));
         assert!(errors[0].contains("not supported"));
+    }
+
+    #[test]
+    fn validate_cursor_args_rejects_equals_form_print() {
+        let errors = validate_cursor_args(&["--print=json".to_string()]);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("--print"));
     }
 
     #[test]

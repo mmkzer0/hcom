@@ -17,9 +17,10 @@ use std::process::Command;
 use anyhow::{Context, Result, anyhow, bail};
 
 use crate::paths;
-use crate::shared::constants::{HCOM_IDENTITY_VARS, TOOL_MARKER_VARS};
+use crate::shared::constants::HCOM_IDENTITY_VARS;
 use crate::shared::platform;
 use crate::shared::terminal_presets::TERMINAL_ENV_MAP;
+use crate::shared::tool_detection::tool_marker_vars;
 
 /// Result of kill_process().
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -716,7 +717,7 @@ pub fn create_bash_script(
     writeln!(f, "echo \"Starting {}...\"", tool_name)?;
 
     // Unset tool markers and identity vars to prevent inheritance
-    writeln!(f, "unset {}", TOOL_MARKER_VARS.join(" "))?;
+    writeln!(f, "unset {}", tool_marker_vars().join(" "))?;
     writeln!(f, "unset {}", HCOM_IDENTITY_VARS.join(" "))?;
 
     // Discover paths for minimal environments (kitty splits, etc.)
@@ -787,10 +788,13 @@ pub fn create_bash_script(
     writeln!(f, "{}", final_command)?;
 
     if opens_new_window {
-        writeln!(
-            f,
-            "unset HCOM_PROCESS_ID HCOM_LAUNCHED HCOM_PTY_MODE HCOM_TAG HCOM_CODEX_SANDBOX_MODE"
-        )?;
+        // Clear hcom state from the interactive shell left open after the tool
+        // exits. Derive from HCOM_IDENTITY_VARS (so new identity/batch vars are
+        // covered automatically) plus the non-identity per-launch vars exported
+        // above that aren't in that list.
+        let mut leftover_vars: Vec<&str> = HCOM_IDENTITY_VARS.to_vec();
+        leftover_vars.extend(["HCOM_TAG", "HCOM_CODEX_SANDBOX_MODE"]);
+        writeln!(f, "unset {}", leftover_vars.join(" "))?;
         writeln!(f, "rm -f {}", shell_quote(&script_file.to_string_lossy()))?;
         writeln!(f, "exec bash -l")?;
     } else if !background {
@@ -817,7 +821,7 @@ where
     I: IntoIterator<Item = (String, String)>,
 {
     let mut strip: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for v in TOOL_MARKER_VARS {
+    for v in tool_marker_vars() {
         strip.insert(v);
     }
     for v in HCOM_IDENTITY_VARS {
@@ -1675,7 +1679,7 @@ pub fn launch_terminal(
 fn build_full_env(config_env: &HashMap<String, String>) -> HashMap<String, String> {
     let mut full = config_env.clone();
     for (k, v) in std::env::vars() {
-        if TOOL_MARKER_VARS.contains(&k.as_str()) {
+        if tool_marker_vars().contains(&k.as_str()) {
             continue;
         }
         if k == "HCOM_TERMINAL" {

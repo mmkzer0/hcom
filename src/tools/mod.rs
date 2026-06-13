@@ -1,13 +1,8 @@
-//! Tool-specific argument parsing and launch preprocessing.
-//!
-//! Each AI CLI tool (Claude, Gemini, Codex, OpenCode) has its own argument
-//! parsing semantics. This module provides shared infrastructure and
-//! tool-specific parsers used by the launcher.
+//! Tool-specific launch preprocessing.
 
 pub mod args_common;
-pub mod codex_args;
 pub mod codex_preprocessing;
 pub mod copilot_preprocessing;
 pub mod cursor_preprocessing;
-pub mod gemini_args;
+pub mod launch_arg_validation;
 pub mod opencode_preprocessing;

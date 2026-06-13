@@ -12,8 +12,8 @@
 //! Not included on purpose:
 //! - `HOOK_REGISTRY` (Claude-only; lives in `hooks/utils.rs` as its own
 //!   registry — already a single source of truth, no drift across tools).
-//! - `TOOL_MARKER_VARS` (flat list; current callers want the union, not the
-//!   per-tool grouping).
+//! - Tool environment detection (owned by `shared::tool_detection`, including
+//!   precedence and child-env clearing).
 //! - Transcript parser dispatch (already abstracted by `transcript::ToolKind`).
 //! - System-prompt env var keys (typed fields on `HcomConfig`; lookup goes
 //!   through `config.rs::FIELD_TO_ENV`).
@@ -1335,6 +1335,39 @@ mod tests {
                     env_var
                 );
             }
+        }
+    }
+
+    #[test]
+    fn drift_released_tools_with_args_env_merge_their_config_field() {
+        use crate::commands::launch::merge_tool_args;
+        use crate::config::HcomConfig;
+        use crate::launcher::LaunchTool;
+
+        for spec in ALL {
+            let Some(args_env) = spec.launch.args_env else {
+                continue;
+            };
+            if !spec.released {
+                continue;
+            }
+
+            let field = args_env
+                .strip_prefix("HCOM_")
+                .expect("args env uses HCOM_ prefix")
+                .to_ascii_lowercase();
+            let mut config = HcomConfig::default();
+            config
+                .set_field(&field, "--model config-model")
+                .unwrap_or_else(|e| panic!("{} config field {field}: {e}", spec.name));
+            let launch_tool = LaunchTool::from_str(spec.name).unwrap();
+            let merged = merge_tool_args(&launch_tool, &[], &config);
+
+            assert!(
+                merged.iter().any(|arg| arg == "config-model"),
+                "{} must consume config field {field} declared by {args_env}",
+                spec.name
+            );
         }
     }
 

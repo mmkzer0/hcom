@@ -834,7 +834,10 @@ fn emit_launch_failed_if_needed(
     outcome: &mut LaunchOutcome,
     reason: &str,
 ) {
-    if !outcome.is_pending() || std::env::var("HCOM_LAUNCHED").as_deref() != Ok("1") {
+    if !outcome.is_pending()
+        || !state.launch_phase_active.load(Ordering::Acquire)
+        || std::env::var("HCOM_LAUNCHED").as_deref() != Ok("1")
+    {
         return;
     }
     let detail = "launch failed: readiness was never observed before the PTY delivery loop exited";

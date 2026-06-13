@@ -12,6 +12,7 @@ use crate::db::DEV_ROOT_KV_KEY;
 use crate::db::HcomDb;
 use crate::identity;
 use crate::instances;
+use crate::launcher::{LaunchTool, validate_tool_args};
 use crate::shared::CommandContext;
 
 /// Parsed arguments for `hcom config`.
@@ -96,6 +97,7 @@ pub const CONFIG_KEYS: &[(&str, &str, &str)] = &[
         "Default args for kilo on launch",
         "string",
     ),
+    ("HCOM_PI_ARGS", "Default args for pi on launch", "string"),
     (
         "HCOM_CURSOR_ARGS",
         "Default args for cursor-agent on launch",
@@ -104,6 +106,11 @@ pub const CONFIG_KEYS: &[(&str, &str, &str)] = &[
     (
         "HCOM_KIMI_ARGS",
         "Default args for kimi on launch",
+        "string",
+    ),
+    (
+        "HCOM_COPILOT_ARGS",
+        "Default args for copilot on launch",
         "string",
     ),
     (
@@ -201,8 +208,10 @@ fn toml_path_for_key(field_name: &str) -> Option<&'static str> {
         "codex_system_prompt" => Some("launch.codex.system_prompt"),
         "opencode_args" => Some("launch.opencode.args"),
         "kilo_args" => Some("launch.kilo.args"),
+        "pi_args" => Some("launch.pi.args"),
         "cursor_args" => Some("launch.cursor.args"),
         "kimi_args" => Some("launch.kimi.args"),
+        "copilot_args" => Some("launch.copilot.args"),
         "relay" => Some("relay.url"),
         "relay_id" => Some("relay.id"),
         "relay_token" => Some("relay.token"),
@@ -290,7 +299,48 @@ fn get_nested_toml(table: &toml::Table, dotted_path: &str) -> Option<toml::Value
 /// Uses nested TOML paths
 pub fn config_set(key: &str, value: &str) -> Result<(), String> {
     let path = config_path();
-    let content = std::fs::read_to_string(&path).unwrap_or_default();
+    config_set_at_path(&path, key, value)
+}
+
+fn launch_tool_for_args_field(field_name: &str) -> Option<LaunchTool> {
+    // Derive the field → tool map from the spec's `args_env` (the single source
+    // of truth, e.g. `HCOM_CLAUDE_ARGS` → `claude_args`) so a new tool's config
+    // args are validated as soon as its spec declares `args_env` — no parallel
+    // match to keep in sync. See `drift_released_tools_with_args_env_merge_...`.
+    let spec = crate::integration_spec::ALL.iter().find(|s| {
+        s.launch.args_env.is_some_and(|env| {
+            env.strip_prefix("HCOM_")
+                .map(str::to_ascii_lowercase)
+                .as_deref()
+                == Some(field_name)
+        })
+    })?;
+    LaunchTool::from_str(spec.name).ok()
+}
+
+fn validate_config_args(field_name: &str, value: &str) -> Result<(), String> {
+    let Some(tool) = launch_tool_for_args_field(field_name) else {
+        return Ok(());
+    };
+    if value.is_empty() {
+        return Ok(());
+    }
+
+    let tokens = crate::tools::args_common::shell_split(value)
+        .map_err(|e| format!("invalid {field_name} from config: {e}"))?;
+    let errors = validate_tool_args(&tool, &tokens);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "invalid {field_name} from config: {}",
+            errors.join("; ")
+        ))
+    }
+}
+
+fn config_set_at_path(path: &Path, key: &str, value: &str) -> Result<(), String> {
+    let content = std::fs::read_to_string(path).unwrap_or_default();
 
     let mut doc: toml_edit::DocumentMut = content
         .parse()
@@ -298,6 +348,7 @@ pub fn config_set(key: &str, value: &str) -> Result<(), String> {
 
     // Map HCOM_KEY to field name, then to nested TOML path
     let field_name = key.strip_prefix("HCOM_").unwrap_or(key).to_lowercase();
+    validate_config_args(&field_name, value)?;
 
     if field_name == "codex_sandbox_mode" && !value.is_empty() {
         let normalized = if value == "full-auto" {
@@ -328,7 +379,7 @@ pub fn config_set(key: &str, value: &str) -> Result<(), String> {
         }
     }
 
-    crate::config::write_config_toml_path(&path, &doc.to_string())
+    crate::config::write_config_toml_path(path, &doc.to_string())
         .map_err(|e| format!("Failed to write config.toml: {e}"))?;
 
     Ok(())
@@ -2241,6 +2292,34 @@ mod tests {
         let unset_args = ConfigArgs::try_parse_from(["config", "dev_root", "--unset"]).unwrap();
         assert_eq!(cmd_config(&db, &unset_args, None), 0);
         assert_eq!(db.kv_get(DEV_ROOT_KV_KEY).unwrap(), None);
+    }
+
+    #[test]
+    fn test_config_set_accepts_unknown_upstream_args() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[launch.claude]\nargs = \"--model keep\"\n").unwrap();
+
+        config_set_at_path(&path, "HCOM_CLAUDE_ARGS", "--future-upstream-flag").unwrap();
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("--future-upstream-flag")
+        );
+    }
+
+    #[test]
+    fn test_config_set_saves_valid_args() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        config_set_at_path(&path, "HCOM_PI_ARGS", "--model safe-model").unwrap();
+
+        let parsed: toml::Table = std::fs::read_to_string(path).unwrap().parse().unwrap();
+        assert_eq!(
+            parsed["launch"]["pi"]["args"].as_str(),
+            Some("--model safe-model")
+        );
     }
 
     #[test]
