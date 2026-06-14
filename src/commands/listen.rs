@@ -322,24 +322,6 @@ fn listen_loop(
             return 130;
         }
 
-        let elapsed = start_time.elapsed().as_secs_f64();
-        if elapsed >= timeout {
-            // Timeout
-            if instance_data.get("tool").and_then(|v| v.as_str()) == Some("adhoc") {
-                set_status(
-                    db,
-                    instance_name,
-                    ST_INACTIVE,
-                    "exit:timeout",
-                    Default::default(),
-                );
-            }
-            if !json_output {
-                eprintln!("\n[Timeout: no messages after {timeout}s]");
-            }
-            return 0;
-        }
-
         // Check if instance was stopped externally
         if db.get_instance_full(instance_name).ok().flatten().is_none() {
             if !json_output {
@@ -396,6 +378,26 @@ fn listen_loop(
             } else {
                 let formatted = format_messages_json(db, &messages, instance_name);
                 println!("\n{formatted}");
+            }
+            return 0;
+        }
+
+        // Always perform at least one unread check before honoring the timeout.
+        // Quick-check mode uses a 100 ms budget, and command/setup overhead can
+        // consume that budget under load even when a message is already queued.
+        let elapsed = start_time.elapsed().as_secs_f64();
+        if elapsed >= timeout {
+            if instance_data.get("tool").and_then(|v| v.as_str()) == Some("adhoc") {
+                set_status(
+                    db,
+                    instance_name,
+                    ST_INACTIVE,
+                    "exit:timeout",
+                    Default::default(),
+                );
+            }
+            if !json_output {
+                eprintln!("\n[Timeout: no messages after {timeout}s]");
             }
             return 0;
         }
