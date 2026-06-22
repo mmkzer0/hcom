@@ -424,6 +424,7 @@ Issues and PRs welcome. The codebase is Rust.
 cargo build && cargo test
 hcom config dev_root $(pwd)
 hcom status
+just ci  # run the CI gate locally
 ```
 
 ---
