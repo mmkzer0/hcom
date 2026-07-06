@@ -163,8 +163,36 @@ pub fn atomic_write_io(filepath: &Path, content: &str) -> std::io::Result<()> {
     tmp.as_file().sync_all()?;
 
     // Persist atomically (temp file → target path via rename)
-    tmp.persist(filepath).map_err(|e| e.error)?;
+    persist_temp_file(tmp, filepath)?;
     Ok(())
+}
+
+#[cfg(not(windows))]
+fn persist_temp_file(tmp: tempfile::NamedTempFile, filepath: &Path) -> std::io::Result<()> {
+    tmp.persist(filepath).map(|_| ()).map_err(|e| e.error)
+}
+
+#[cfg(windows)]
+fn persist_temp_file(mut tmp: tempfile::NamedTempFile, filepath: &Path) -> std::io::Result<()> {
+    // MoveFileExW can transiently return ERROR_ACCESS_DENIED while antivirus,
+    // indexing, or another reader briefly holds the destination. Preserve the
+    // same temp file and retry the atomic replacement for a short bounded
+    // window instead of failing a config update immediately.
+    const MAX_ATTEMPTS: u64 = 6;
+    for attempt in 1..=MAX_ATTEMPTS {
+        match tmp.persist(filepath) {
+            Ok(_) => return Ok(()),
+            Err(err)
+                if err.error.kind() == std::io::ErrorKind::PermissionDenied
+                    && attempt < MAX_ATTEMPTS =>
+            {
+                tmp = err.file;
+                std::thread::sleep(std::time::Duration::from_millis(10 * attempt));
+            }
+            Err(err) => return Err(err.error),
+        }
+    }
+    unreachable!("persist loop returns on success or final error")
 }
 
 /// Write content to file atomically (temp file + rename).
