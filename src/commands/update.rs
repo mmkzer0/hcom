@@ -17,8 +17,8 @@ pub struct UpdateArgs {
 fn print_dev_root_notice(db: &HcomDb) {
     if let Some((path, source)) = crate::router::resolve_effective_dev_root(db.path()) {
         println!("Using local build: {} [{}]", path.display(), source);
-        println!("`hcom update` updates the installed hcom, not this local checkout.");
-        println!("Unset with `hcom config dev_root --unset` to update the installed binary.");
+        println!("`hcom update` bypasses dev_root and updates the binary you invoked.");
+        println!("The local checkout is not changed.");
         println!();
     }
 }

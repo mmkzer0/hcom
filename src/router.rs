@@ -421,6 +421,14 @@ fn is_config_dev_root_invocation(argv: &[String]) -> bool {
     )
 }
 
+/// `hcom update` must run from the binary the user invoked. Re-executing a
+/// configured dev-root binary would compare the checkout version and inspect
+/// the checkout executable path instead of updating the installed binary.
+fn is_update_invocation(argv: &[String]) -> bool {
+    let (positional, _, _) = extract_global_flags_full(argv);
+    positional.first().is_some_and(|arg| arg == "update")
+}
+
 pub(crate) fn resolve_effective_dev_root(db_path: &Path) -> Option<(PathBuf, &'static str)> {
     if let Ok(r) = env::var("HCOM_DEV_ROOT")
         && !r.is_empty()
@@ -492,8 +500,9 @@ pub fn dispatch() -> anyhow::Result<()> {
     let argv = &args[1..]; // strip binary name
 
     // Skip dev_root re-exec for `config dev_root` so a stale pointer can't
-    // trap the user — the invoked binary owns its own dev_root setting.
-    if !is_config_dev_root_invocation(argv) {
+    // trap the user. Also keep `update` on the invoked (installed) binary;
+    // otherwise the checkout's version and path would drive update decisions.
+    if !is_config_dev_root_invocation(argv) && !is_update_invocation(argv) {
         maybe_reexec_dev_root();
     }
 
@@ -995,6 +1004,21 @@ mod tests {
         ])));
         assert!(!is_config_dev_root_invocation(&sv(&["list"])));
         assert!(!is_config_dev_root_invocation(&[]));
+    }
+
+    #[test]
+    fn is_update_invocation_matches_expected_shapes() {
+        assert!(is_update_invocation(&sv(&["update"])));
+        assert!(is_update_invocation(&sv(&["update", "--check"])));
+        assert!(is_update_invocation(&sv(&["--go", "update"])));
+        assert!(is_update_invocation(&sv(&[
+            "--name", "lovi", "update", "--check"
+        ])));
+        assert!(!is_update_invocation(&sv(&["config", "update"])));
+        assert!(!is_update_invocation(&sv(&[
+            "send", "@lovi", "--", "update"
+        ])));
+        assert!(!is_update_invocation(&[]));
     }
 
     // ── resolve_action tests ────────────────────────────────────────────
