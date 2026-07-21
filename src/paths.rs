@@ -222,12 +222,65 @@ pub fn ensure_hcom_directories() -> bool {
 
 /// Ensure directories under a given base (testable without global config).
 pub fn ensure_hcom_directories_at(base: &Path) -> bool {
+    if ensure_private_directory(base).is_err() {
+        return false;
+    }
     for dir_name in [LOGS_DIR, LAUNCH_DIR, FLAGS_DIR, LAUNCHES_DIR, ARCHIVE_DIR] {
         if fs::create_dir_all(base.join(dir_name)).is_err() {
             return false;
         }
     }
     true
+}
+
+/// Create an hcom-owned directory and keep it private on POSIX (`0o700`).
+pub(crate) fn ensure_private_directory(path: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(path)?;
+    crate::sys::fs::set_private_dir(path)
+}
+
+/// SQLite sidecar path (`-wal` / `-shm`), appending the suffix to the *full*
+/// database filename so custom names like `state.sqlite` map to
+/// `state.sqlite-wal`, not `state.db-wal`.
+pub(crate) fn sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
+    let mut os = db_path.as_os_str().to_os_string();
+    os.push(suffix);
+    os.into()
+}
+
+/// Keep an hcom SQLite database and any WAL/SHM sidecars owner-private on POSIX
+/// (`0o600`). No-op on `:memory:` and on Windows.
+///
+/// This secures the *files* only; the containing directory's `0o700` mode is
+/// owned by the caller that creates the hcom directory (`ensure_private_db` is
+/// also handed arbitrary temp paths under a shared, sometimes un-chmoddable
+/// parent, so it must not touch the parent's mode).
+///
+/// Newly created sidecars inherit `0o600` from the main file via SQLite's Unix
+/// VFS, but a pre-existing broad `-wal`/`-shm` (legacy install) is not
+/// re-chmodded by SQLite on reopen — so we repair existing ones explicitly.
+pub(crate) fn ensure_private_db(db_path: &Path) -> std::io::Result<()> {
+    if db_path == Path::new(":memory:") {
+        return Ok(());
+    }
+    if let Some(parent) = db_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)?;
+    }
+    // Create the main db private, or repair an existing broad mode.
+    match crate::sys::fs::create_private_new(db_path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            crate::sys::fs::set_private(db_path)?;
+        }
+        Err(e) => return Err(e),
+    }
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = sidecar_path(db_path, suffix);
+        if sidecar.exists() {
+            crate::sys::fs::set_private(&sidecar)?;
+        }
+    }
+    Ok(())
 }
 
 /// Write content to file atomically (temp file + rename).
@@ -354,6 +407,36 @@ mod tests {
 
         // Idempotent — second call succeeds too
         assert!(ensure_hcom_directories_at(tmp.path()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_hcom_directories_creates_private_base_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join("state").join(".hcom");
+
+        assert!(ensure_hcom_directories_at(&base));
+
+        let mode = fs::metadata(&base).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_hcom_directories_restricts_existing_base_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join(".hcom");
+        fs::create_dir(&base).unwrap();
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(ensure_hcom_directories_at(&base));
+
+        let mode = fs::metadata(&base).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
     }
 
     #[test]

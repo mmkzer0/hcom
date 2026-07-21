@@ -97,6 +97,26 @@ fn assert_isolated_db_path(db_path: &std::path::Path) {
 }
 
 impl HcomDb {
+    /// Open a hardened connection: secure the directory and database files to
+    /// owner-only modes (see `paths::ensure_private_db`), then open with the
+    /// standard hcom PRAGMAs. The single write path for opening the DB.
+    fn open_connection(db_path: &std::path::Path) -> Result<Connection> {
+        crate::paths::ensure_private_db(db_path)
+            .with_context(|| format!("Failed to secure database: {}", db_path.display()))?;
+
+        let conn = Connection::open(db_path)
+            .with_context(|| format!("Failed to open database: {}", db_path.display()))?;
+        // busy_timeout first: converting a fresh db to WAL takes a brief
+        // exclusive lock, so with a 0 timeout a concurrent first-open (or heavy
+        // load) fails instantly with SQLITE_BUSY. Setting the timeout up front
+        // makes the WAL conversion retry instead.
+        conn.execute_batch(
+            "PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;",
+        )?;
+
+        Ok(conn)
+    }
+
     /// Access the underlying SQLite connection (for direct queries).
     pub fn conn(&self) -> &Connection {
         &self.conn
@@ -109,8 +129,10 @@ impl HcomDb {
 
     /// Open the hcom database at ~/.hcom/hcom.db with schema migration/compat.
     pub fn open() -> Result<Self> {
-        let db_path = crate::paths::db_path();
-        Self::open_at(&db_path)
+        let hcom_dir = crate::paths::hcom_dir();
+        crate::paths::ensure_private_directory(&hcom_dir)
+            .with_context(|| format!("Failed to secure hcom directory: {}", hcom_dir.display()))?;
+        Self::open_at(&hcom_dir.join("hcom.db"))
     }
 
     /// Open the hcom database at a specific path with schema migration/compat.
@@ -124,17 +146,7 @@ impl HcomDb {
     pub fn open_raw(db_path: &std::path::Path) -> Result<Self> {
         #[cfg(test)]
         assert_isolated_db_path(db_path);
-        if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create db directory: {}", parent.display()))?;
-        }
-        let conn = Connection::open(db_path)
-            .with_context(|| format!("Failed to open database: {}", db_path.display()))?;
-
-        // Enable WAL mode for concurrent access + foreign keys for CASCADE
-        conn.execute_batch(
-            "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;",
-        )?;
+        let conn = Self::open_connection(db_path)?;
 
         let inode = get_inode(db_path);
 
@@ -156,10 +168,21 @@ impl HcomDb {
         }
         // DB file replaced — reconnect
         use crate::log::{log_error, log_info};
+        // Best-effort re-harden: the replacement was written by another hcom
+        // process (reset/archive) that already secured it, so failing here must
+        // not wedge a live delivery/listener loop — log and continue.
+        if let Err(e) = crate::paths::ensure_private_db(&self.db_path) {
+            use crate::log::log_warn;
+            log_warn(
+                "native",
+                "db.secure_fail",
+                &format!("Failed to re-secure DB after replacement: {}", e),
+            );
+        }
         match Connection::open(&self.db_path) {
             Ok(new_conn) => {
                 if let Err(e) = new_conn.execute_batch(
-                    "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;",
+                    "PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;",
                 ) {
                     use crate::log::log_warn;
                     log_warn(
@@ -415,15 +438,12 @@ impl HcomDb {
                 }
 
                 // Reconnect to fresh DB file
-                let new_conn = Connection::open(&self.db_path).with_context(|| {
+                let new_conn = Self::open_connection(&self.db_path).with_context(|| {
                     format!(
                         "Failed to reopen DB after archive: {}",
                         self.db_path.display()
                     )
                 })?;
-                new_conn.execute_batch(
-                    "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;",
-                )?;
                 self.conn = new_conn;
                 self.db_inode = get_inode(&self.db_path);
 
@@ -860,6 +880,125 @@ pub(super) mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(PathBuf::from(format!("{}-wal", path.display())));
         let _ = std::fs::remove_file(PathBuf::from(format!("{}-shm", path.display())));
+    }
+
+    #[cfg(unix)]
+    fn mode(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_raw_creates_private_database_files() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("hcom.db");
+
+        let db = HcomDb::open_raw(&db_path).unwrap();
+        db.conn()
+            .execute("CREATE TABLE permission_probe (id INTEGER)", [])
+            .unwrap();
+        db.conn()
+            .execute("INSERT INTO permission_probe VALUES (1)", [])
+            .unwrap();
+
+        assert_eq!(mode(&db_path), 0o600);
+        assert_eq!(mode(&crate::paths::sidecar_path(&db_path, "-wal")), 0o600);
+        assert_eq!(mode(&crate::paths::sidecar_path(&db_path, "-shm")), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_raw_restricts_existing_database_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("hcom.db");
+        let first = HcomDb::open_raw(&db_path).unwrap();
+        first
+            .conn()
+            .execute("CREATE TABLE permission_probe (id INTEGER)", [])
+            .unwrap();
+        first
+            .conn()
+            .execute("INSERT INTO permission_probe VALUES (1)", [])
+            .unwrap();
+
+        for path in [
+            db_path.clone(),
+            crate::paths::sidecar_path(&db_path, "-wal"),
+            crate::paths::sidecar_path(&db_path, "-shm"),
+        ] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        let _second = HcomDb::open_raw(&db_path).unwrap();
+
+        assert_eq!(mode(&db_path), 0o600);
+        assert_eq!(mode(&crate::paths::sidecar_path(&db_path, "-wal")), 0o600);
+        assert_eq!(mode(&crate::paths::sidecar_path(&db_path, "-shm")), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_raw_restricts_sidecars_for_non_db_filename() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("state.sqlite");
+
+        let db = HcomDb::open_raw(&db_path).unwrap();
+        db.conn()
+            .execute("CREATE TABLE permission_probe (id INTEGER)", [])
+            .unwrap();
+        db.conn()
+            .execute("INSERT INTO permission_probe VALUES (1)", [])
+            .unwrap();
+
+        let wal_path = tmp.path().join("state.sqlite-wal");
+        let shm_path = tmp.path().join("state.sqlite-shm");
+        std::fs::set_permissions(&wal_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(&shm_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let _second = HcomDb::open_raw(&db_path).unwrap();
+
+        assert_eq!(mode(&wal_path), 0o600);
+        assert_eq!(mode(&shm_path), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_restricts_the_configured_hcom_directory_and_database() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_tmp, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        std::fs::set_permissions(&hcom_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let db = HcomDb::open().unwrap();
+
+        assert_eq!(mode(&hcom_dir), 0o700);
+        assert_eq!(mode(db.path()), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconnect_if_stale_resecures_replaced_database() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("hcom.db");
+        let mut db = HcomDb::open_raw(&db_path).unwrap();
+
+        // Simulate another process replacing the DB with a broad-mode file
+        // (new inode), as reset/schema-archive does.
+        std::fs::remove_file(&db_path).unwrap();
+        let _ = std::fs::remove_file(crate::paths::sidecar_path(&db_path, "-wal"));
+        let _ = std::fs::remove_file(crate::paths::sidecar_path(&db_path, "-shm"));
+        drop(HcomDb::open_raw(&db_path).unwrap());
+        std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(db.reconnect_if_stale());
+        assert_eq!(mode(&db_path), 0o600);
     }
 
     #[test]
