@@ -56,7 +56,7 @@ pub struct TranscriptArgs {
     /// Full output (no streamlining)
     #[arg(long)]
     pub full: bool,
-    /// Detailed output (include tool details)
+    /// Show tool inputs/outputs, file edits, and errors
     #[arg(long)]
     pub detailed: bool,
     /// Last N exchanges
@@ -1587,6 +1587,7 @@ mod tests {
             is_error: false,
             file: None,
             command: Some("pwd".to_string()),
+            output: None,
         }];
         assert_eq!(
             finalize_action_text("", &tools, &[], false),
@@ -1790,12 +1791,14 @@ mod tests {
                 is_error: true,
                 file: Some("a.rs".to_string()),
                 command: None,
+                output: None,
             },
             ToolUse {
                 name: "Edit".to_string(),
                 is_error: false,
                 file: Some("a.rs".to_string()),
                 command: None,
+                output: None,
             },
         ];
         let errors = vec![json!({"tool": "Edit", "content": "old failure"})];
