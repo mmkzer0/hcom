@@ -1081,7 +1081,51 @@ fn stop_instance_inner(
         "last_event_id": instance_data.last_event_id,
     });
 
-    // Clean session bindings + process bindings + stop subagents for this session
+    // Snapshot both child sets before deleting the parent. Only the teardown
+    // winner processes them, but it still needs relationships that may be
+    // cascaded or otherwise obscured by the parent deletion.
+    let session_subagents: Vec<String> = instance_data
+        .session_id
+        .as_ref()
+        .map(|session_id| {
+            db.conn()
+                .prepare("SELECT name FROM instances WHERE parent_session_id = ?")
+                .and_then(|mut stmt| {
+                    stmt.query_map(params![session_id], |row| row.get::<_, String>(0))
+                        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                })
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+
+    let native_children: Vec<String> = db
+        .conn()
+        .prepare("SELECT name FROM instances WHERE parent_name = ?")
+        .and_then(|mut stmt| {
+            stmt.query_map(params![instance_name], |row| row.get::<_, String>(0))
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        })
+        .unwrap_or_default();
+
+    // Deleting the row is the ownership CAS for teardown. Concurrent callers
+    // may all have read the same snapshot, but only the caller that actually
+    // removes the row may perform destructive cleanup, publish the stopped
+    // event, or wake listeners. A deletion error leaves all state retryable.
+    match db.delete_instance(instance_name) {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(e) => {
+            log::log_warn(
+                "hooks",
+                "finalize.delete_failed",
+                &format!("delete_instance failed for {instance_name}: {e}"),
+            );
+            return;
+        }
+    }
+
+    // Clean session and process bindings, then recursively stop subagents for
+    // this session. Some bindings may already be gone through FK cascades.
     if let Some(ref session_id) = instance_data.session_id {
         let _ = db.conn().execute(
             "DELETE FROM session_bindings WHERE session_id = ?",
@@ -1091,58 +1135,35 @@ fn stop_instance_inner(
             "DELETE FROM process_bindings WHERE session_id = ?",
             params![session_id],
         );
-
-        // Recursively stop subagents whose parent_session_id matches this session
-        let subagents: Vec<String> = db
-            .conn()
-            .prepare("SELECT name FROM instances WHERE parent_session_id = ?")
-            .and_then(|mut stmt| {
-                stmt.query_map(params![session_id], |row| row.get::<_, String>(0))
-                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            })
-            .unwrap_or_default();
-        for sub_name in subagents {
-            stop_instance_inner(
-                db,
-                &sub_name,
-                initiated_by,
-                "parent_stopped",
-                false,
-                depth + 1,
-            );
-        }
+    }
+    for sub_name in session_subagents {
+        stop_instance_inner(
+            db,
+            &sub_name,
+            initiated_by,
+            "parent_stopped",
+            false,
+            depth + 1,
+        );
     }
 
-    // Recursively stop native subagents whose immediate parent is this
-    // instance. Native subagent rows carry session_id=NULL and inherit the
-    // *root* session as their parent_session_id, so the session-keyed cascade
-    // above never links a nested parent to its own children — only parent_name
-    // does. Without this, stopping a nested parent leaves its children alive and
-    // reparented to a name that can later be reused. MAX_STOP_DEPTH guards
-    // against a parent_name cycle; a row already stopped above is a no-op here.
-    let native_children: Vec<String> = db
-        .conn()
-        .prepare("SELECT name FROM instances WHERE parent_name = ?")
-        .and_then(|mut stmt| {
-            stmt.query_map(params![instance_name], |row| row.get::<_, String>(0))
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        })
-        .unwrap_or_default();
+    // Native subagent rows carry session_id=NULL and inherit the root session
+    // as parent_session_id, so only parent_name links nested children. A row
+    // already stopped via the session set is a no-op here.
     for child in native_children {
         stop_instance_inner(db, &child, initiated_by, "parent_stopped", false, depth + 1);
     }
 
-    // Clean notify endpoints and process bindings for this instance
+    // These normally disappear through FK cascades; explicit cleanup keeps
+    // the behavior correct for older or partially migrated databases.
     let _ = db.delete_notify_endpoints(instance_name);
     let _ = db.conn().execute(
         "DELETE FROM process_bindings WHERE instance_name = ?",
         params![instance_name],
     );
-
-    // Clean event subscriptions
     let _ = db.cleanup_subscriptions(instance_name);
 
-    // Log life event with snapshot BEFORE delete
+    // Preserve the winner's pre-delete snapshot in the life event.
     let mut event_data = serde_json::json!({
         "action": "stopped",
         "by": initiated_by,
@@ -1157,15 +1178,6 @@ fn stop_instance_inner(
             "hooks",
             "finalize.life_event_failed",
             &format!("log_life_event failed for {instance_name}: {e}"),
-        );
-    }
-
-    // Delete instance row (CASCADE cleans remaining FK references)
-    if let Err(e) = db.delete_instance(instance_name) {
-        log::log_warn(
-            "hooks",
-            "finalize.delete_failed",
-            &format!("delete_instance failed for {instance_name}: {e}"),
         );
     }
 
@@ -1781,6 +1793,60 @@ mod tests {
 
         // Should be a no-op, not panic
         stop_instance(&db, "nonexistent", "test", "test");
+    }
+
+    #[test]
+    fn test_stop_instance_does_not_publish_until_delete_wins() {
+        crate::config::Config::init();
+        let (_dir, db) = make_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, tool, status, status_context, status_time, created_at)
+                 VALUES ('inst', 'sess-1', 'claude', 'active', 'running', 0, 0)",
+                [],
+            )
+            .unwrap();
+        db.set_session_binding("sess-1", "inst").unwrap();
+        // RAISE(IGNORE) makes DELETE report zero affected rows, modeling a
+        // contender that lost the teardown ownership CAS.
+        db.conn()
+            .execute_batch(
+                "CREATE TRIGGER suppress_inst_delete BEFORE DELETE ON instances
+                 WHEN OLD.name = 'inst' BEGIN SELECT RAISE(IGNORE); END;",
+            )
+            .unwrap();
+
+        stop_instance(&db, "inst", "test", "first");
+        assert!(db.get_instance("inst").unwrap().is_some());
+        assert_eq!(
+            db.get_session_binding("sess-1").unwrap().as_deref(),
+            Some("inst"),
+            "a failed ownership delete must leave bindings retryable"
+        );
+        let stopped: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'life' AND instance = 'inst'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stopped, 0, "a losing teardown must not publish stopped");
+
+        db.conn()
+            .execute_batch("DROP TRIGGER suppress_inst_delete;")
+            .unwrap();
+        stop_instance(&db, "inst", "test", "retry");
+        assert!(db.get_instance("inst").unwrap().is_none());
+        let stopped: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'life' AND instance = 'inst'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stopped, 1, "the retry winner publishes exactly once");
     }
 
     #[test]

@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::LazyLock;
 
@@ -1571,21 +1572,20 @@ fn handle_sessionend(
     // Root session is over: no more children can spawn under any of its
     // prompt_id mappings (see `spawn_owner_kv_key`), no further resumes can
     // arrive for its agent_ids (see `agent_owner_kv_key`), and no further
-    // SubagentStop invocations can fire for it (see `subagent_stop_claim_key`).
+    // SubagentStop invocations can fire for it (see `subagent_stop_inflight_key`).
     // None of these can be cleaned up incrementally as they're used (parallel
     // siblings sharing one prompt_id would race a later SubagentStart against
     // an earlier sibling's cleanup — see `end_task`; a resumed agent_id needs
-    // its mapping to *outlive* its own stop; a stop claim needs to survive
-    // exactly as long as its invocation could possibly be duplicated), so the
-    // whole session's worth of each is swept here instead. A session that
-    // ends without this hook firing (crash, `hcom kill`) just leaves harmless
-    // unreachable entries.
+    // its mapping to *outlive* its own stop), so the whole session's worth of
+    // each is swept here instead. Inflight stop records are transient and
+    // self-recover when their owning process dies, but sweeping them avoids
+    // retaining unreachable session data.
     for (label, prefix) in [
         ("spawn_owner", spawn_owner_kv_prefix(session_id)),
         ("agent_owner", agent_owner_kv_prefix(session_id)),
         (
-            "subagent_stop_claim",
-            subagent_stop_claim_prefix(session_id),
+            "subagent_stop_inflight",
+            subagent_stop_inflight_prefix(session_id),
         ),
     ] {
         if let Err(e) = db.kv_delete_prefix(&prefix) {
@@ -1933,51 +1933,108 @@ fn hash_raw_payload(raw: &Value) -> String {
 /// any real difference between invocations (delivered message content,
 /// background/transcript state) changes the hash and gets its own key.
 /// `prompt_id` is folded in only as a readable, non-load-bearing component.
-fn subagent_stop_claim_key(root_session_id: &str, agent_id: &str, raw: &Value) -> String {
+fn subagent_stop_inflight_key(root_session_id: &str, agent_id: &str, raw: &Value) -> String {
     let prompt_id = raw.get("prompt_id").and_then(|v| v.as_str()).unwrap_or("");
     format!(
-        "subagent_stop_claimed:{root_session_id}:{agent_id}:{prompt_id}:{}",
+        "subagent_stop_inflight:{root_session_id}:{agent_id}:{prompt_id}:{}",
         hash_raw_payload(raw)
     )
 }
 
 /// kv-table key prefix covering every SubagentStop claim for one root
 /// session. See `handle_sessionend`.
-fn subagent_stop_claim_prefix(root_session_id: &str) -> String {
-    format!("subagent_stop_claimed:{root_session_id}:")
+fn subagent_stop_inflight_prefix(root_session_id: &str) -> String {
+    format!("subagent_stop_inflight:{root_session_id}:")
 }
 
 /// Transient claim that prevents concurrent duplicate SubagentStop hooks from
-/// polling or tearing down the same actor at the same time. The claim is
-/// released on drop so a later, distinct stop with identical content can run.
+/// polling or tearing down the same actor at the same time. Persisting the PID
+/// plus its start identity makes a claim recoverable after SIGKILL without
+/// mistaking a reused PID for the original owner.
+#[derive(Deserialize, Serialize)]
+struct SubagentStopOwner {
+    owner_token: String,
+    pid: u32,
+    process_start: String,
+}
+
 struct SubagentStopClaim<'a> {
     db: &'a HcomDb,
     key: String,
+    value: String,
 }
 
 impl<'a> SubagentStopClaim<'a> {
     fn acquire(db: &'a HcomDb, root_session_id: &str, agent_id: &str, raw: &Value) -> Option<Self> {
-        let key = subagent_stop_claim_key(root_session_id, agent_id, raw);
-        let claimed = db
-            .conn()
-            .execute(
-                "INSERT OR IGNORE INTO kv (key, value) VALUES (?, '1')",
-                rusqlite::params![key],
-            )
-            // Fail open rather than leave a stopped actor wedged by a DB error.
-            .map(|inserted| inserted > 0)
-            .unwrap_or(true);
+        let key = subagent_stop_inflight_key(root_session_id, agent_id, raw);
+        let pid = std::process::id();
+        let process_start = match crate::sys::process::identity(pid) {
+            Some(identity) => identity,
+            None => {
+                log::log_warn(
+                    "hooks",
+                    "subagent_stop.claim_identity_failed",
+                    &format!("pid={pid}"),
+                );
+                return None;
+            }
+        };
+        let owner = SubagentStopOwner {
+            owner_token: uuid::Uuid::new_v4().to_string(),
+            pid,
+            process_start,
+        };
+        let value = serde_json::to_string(&owner).ok()?;
 
-        claimed.then_some(Self { db, key })
+        match db.conn().execute(
+            "INSERT OR IGNORE INTO kv (key, value) VALUES (?, ?)",
+            rusqlite::params![key, value],
+        ) {
+            Ok(1) => return Some(Self { db, key, value }),
+            Ok(_) => {}
+            Err(e) => {
+                log::log_warn(
+                    "hooks",
+                    "subagent_stop.claim_insert_failed",
+                    &format!("key={key} err={e}"),
+                );
+                return None;
+            }
+        }
+
+        let old_value = db.kv_get(&key).ok()??;
+        if serde_json::from_str::<SubagentStopOwner>(&old_value)
+            .is_ok_and(|old| crate::sys::process::has_identity(old.pid, &old.process_start))
+        {
+            return None;
+        }
+
+        // Replace a dead owner's record only if it is still the exact value we
+        // inspected. Another contender may have recovered it first.
+        match db.conn().execute(
+            "UPDATE kv SET value = ? WHERE key = ? AND value = ?",
+            rusqlite::params![value, key, old_value],
+        ) {
+            Ok(1) => Some(Self { db, key, value }),
+            Ok(_) => None,
+            Err(e) => {
+                log::log_warn(
+                    "hooks",
+                    "subagent_stop.claim_replace_failed",
+                    &format!("key={key} err={e}"),
+                );
+                None
+            }
+        }
     }
 }
 
 impl Drop for SubagentStopClaim<'_> {
     fn drop(&mut self) {
-        let _ = self
-            .db
-            .conn()
-            .execute("DELETE FROM kv WHERE key = ?", rusqlite::params![self.key]);
+        let _ = self.db.conn().execute(
+            "DELETE FROM kv WHERE key = ? AND value = ?",
+            rusqlite::params![self.key, self.value],
+        );
     }
 }
 
@@ -5190,27 +5247,27 @@ mod tests {
     /// established Claude changes `prompt_id` for that re-fire), and must
     /// not collapse a genuinely different `prompt_id` either.
     #[test]
-    fn test_subagent_stop_claim_key_semantics() {
+    fn test_subagent_stop_inflight_key_semantics() {
         let raw = serde_json::json!({"agent_id": "a1", "prompt_id": "p1", "x": 1});
         let raw_dup = serde_json::json!({"agent_id": "a1", "prompt_id": "p1", "x": 1});
         assert_eq!(
-            subagent_stop_claim_key("sess-1", "a1", &raw),
-            subagent_stop_claim_key("sess-1", "a1", &raw_dup),
+            subagent_stop_inflight_key("sess-1", "a1", &raw),
+            subagent_stop_inflight_key("sess-1", "a1", &raw_dup),
             "byte-identical payloads must collapse to the same key"
         );
 
         let raw_same_prompt_diff_payload =
             serde_json::json!({"agent_id": "a1", "prompt_id": "p1", "x": 2});
         assert_ne!(
-            subagent_stop_claim_key("sess-1", "a1", &raw),
-            subagent_stop_claim_key("sess-1", "a1", &raw_same_prompt_diff_payload),
+            subagent_stop_inflight_key("sess-1", "a1", &raw),
+            subagent_stop_inflight_key("sess-1", "a1", &raw_same_prompt_diff_payload),
             "same prompt_id with different payload content must not collapse"
         );
 
         let raw_diff_prompt = serde_json::json!({"agent_id": "a1", "prompt_id": "p2", "x": 1});
         assert_ne!(
-            subagent_stop_claim_key("sess-1", "a1", &raw),
-            subagent_stop_claim_key("sess-1", "a1", &raw_diff_prompt),
+            subagent_stop_inflight_key("sess-1", "a1", &raw),
+            subagent_stop_inflight_key("sess-1", "a1", &raw_diff_prompt),
             "different prompt_id must not collapse"
         );
     }
@@ -5253,7 +5310,7 @@ mod tests {
             "prompt_id": "p1",
             "last_assistant_message": "Done.",
         });
-        let key = subagent_stop_claim_key("sess-1", "agent-x", &raw);
+        let key = subagent_stop_inflight_key("sess-1", "agent-x", &raw);
 
         let first_claim = SubagentStopClaim::acquire(&db, "sess-1", "agent-x", &raw)
             .expect("first invocation claims");
@@ -5268,6 +5325,48 @@ mod tests {
         );
         let _later_claim = SubagentStopClaim::acquire(&db, "sess-1", "agent-x", &raw)
             .expect("a later, genuinely distinct stop with a byte-identical payload must re-claim");
+    }
+
+    #[test]
+    #[serial]
+    fn test_stop_claim_atomically_replaces_dead_owner() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        let raw = serde_json::json!({"agent_id": "agent-x", "prompt_id": "p1"});
+        let key = subagent_stop_inflight_key("sess-1", "agent-x", &raw);
+        let dead_owner = serde_json::to_string(&SubagentStopOwner {
+            owner_token: "crashed-owner".to_string(),
+            pid: u32::MAX,
+            process_start: "dead-process".to_string(),
+        })
+        .unwrap();
+        db.kv_set(&key, Some(&dead_owner)).unwrap();
+
+        let claim = SubagentStopClaim::acquire(&db, "sess-1", "agent-x", &raw)
+            .expect("a dead process must not leave a permanent tombstone");
+        let replacement = db.kv_get(&key).unwrap().unwrap();
+        assert_ne!(replacement, dead_owner);
+        assert_eq!(replacement, claim.value);
+    }
+
+    #[test]
+    #[serial]
+    fn test_stop_claim_drop_deletes_only_its_own_token() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        let raw = serde_json::json!({"agent_id": "agent-x", "prompt_id": "p1"});
+        let key = subagent_stop_inflight_key("sess-1", "agent-x", &raw);
+        let claim = SubagentStopClaim::acquire(&db, "sess-1", "agent-x", &raw)
+            .expect("first invocation claims");
+
+        let replacement = r#"{"owner_token":"replacement","pid":1,"process_start":"other"}"#;
+        db.kv_set(&key, Some(replacement)).unwrap();
+        drop(claim);
+        assert_eq!(
+            db.kv_get(&key).unwrap().as_deref(),
+            Some(replacement),
+            "an old guard must not delete a newer owner's token"
+        );
     }
 
     /// `subagent_stop` must release its claim so it cannot outlive the
@@ -5304,7 +5403,7 @@ mod tests {
         let _ = subagent_stop(&db, "sess-1", &raw);
 
         assert!(
-            db.kv_get(&subagent_stop_claim_key("sess-1", "agent-x", &raw))
+            db.kv_get(&subagent_stop_inflight_key("sess-1", "agent-x", &raw))
                 .unwrap()
                 .is_none(),
             "subagent_stop must not leave its claim behind as a permanent tombstone"
@@ -5426,12 +5525,12 @@ mod tests {
         );
     }
 
-    /// Property: SessionEnd sweeps agent_owner and subagent_stop_claim
+    /// Property: SessionEnd sweeps agent_owner and subagent_stop_inflight
     /// entries the same way it sweeps spawn_owner — only for its own
     /// session.
     #[test]
     #[serial]
-    fn test_sessionend_cleans_agent_owner_and_stop_claim_keys_too() {
+    fn test_sessionend_cleans_agent_owner_and_stop_inflight_keys_too() {
         crate::config::Config::init();
         let (_dir, _guard, db) = make_isolated_test_db();
         db.conn()
@@ -5450,12 +5549,12 @@ mod tests {
             .unwrap();
         let stop_raw = serde_json::json!({"agent_id": "agent-x", "prompt_id": "p1"});
         db.kv_set(
-            &subagent_stop_claim_key("sess-1", "agent-x", &stop_raw),
+            &subagent_stop_inflight_key("sess-1", "agent-x", &stop_raw),
             Some("1"),
         )
         .unwrap();
         db.kv_set(
-            &subagent_stop_claim_key("sess-other", "agent-x", &stop_raw),
+            &subagent_stop_inflight_key("sess-other", "agent-x", &stop_raw),
             Some("1"),
         )
         .unwrap();
@@ -5470,7 +5569,7 @@ mod tests {
                 .is_none()
         );
         assert!(
-            db.kv_get(&subagent_stop_claim_key("sess-1", "agent-x", &stop_raw))
+            db.kv_get(&subagent_stop_inflight_key("sess-1", "agent-x", &stop_raw))
                 .unwrap()
                 .is_none()
         );
@@ -5481,8 +5580,12 @@ mod tests {
             "a different session's agent_owner keys must survive"
         );
         assert_eq!(
-            db.kv_get(&subagent_stop_claim_key("sess-other", "agent-x", &stop_raw))
-                .unwrap(),
+            db.kv_get(&subagent_stop_inflight_key(
+                "sess-other",
+                "agent-x",
+                &stop_raw
+            ))
+            .unwrap(),
             Some("1".to_string()),
             "a different session's stop-claim keys must survive"
         );
