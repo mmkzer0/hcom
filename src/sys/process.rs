@@ -16,10 +16,16 @@ pub fn identity(pid: u32) -> Option<String> {
 #[cfg(any(target_os = "android", target_os = "linux"))]
 fn process_identity_platform(pid: u32) -> Option<String> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    let boot_id = boot_id.trim();
+    if boot_id.is_empty() {
+        return None;
+    }
     // Fields after the final `) ` begin at field 3 (`state`). Linux's process
-    // start time is field 22, hence index 19 in this slice.
+    // start time is field 22, hence index 19 in this slice. Boot ID keeps the
+    // boot-relative tick count unique across restarts.
     let start_ticks = stat.rsplit_once(") ")?.1.split_whitespace().nth(19)?;
-    Some(format!("linux:{start_ticks}"))
+    Some(format!("linux:{boot_id}:{start_ticks}"))
 }
 
 #[cfg(any(target_os = "ios", target_os = "macos"))]
@@ -655,6 +661,14 @@ mod tests {
     #[test]
     fn test_process_identity_is_absent_for_dead_pid() {
         assert!(identity(u32::MAX).is_none());
+    }
+
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    #[test]
+    fn test_linux_process_identity_includes_boot_id() {
+        let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
+        let identity = identity(std::process::id()).unwrap();
+        assert!(identity.contains(boot_id.trim()));
     }
 
     // Reproduces the bug fixed above: the process object stays valid (and

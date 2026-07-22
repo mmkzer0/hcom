@@ -3,7 +3,7 @@
 use anyhow::Result;
 use rusqlite::{OptionalExtension, params};
 
-use super::HcomDb;
+use super::{HcomDb, chrono_now_iso, subscriptions};
 use crate::shared::constants::ST_LISTENING;
 use crate::shared::time::now_epoch_i64;
 
@@ -395,6 +395,75 @@ impl HcomDb {
             .conn
             .execute("DELETE FROM instances WHERE name = ?", params![name])?;
         Ok(rows > 0)
+    }
+
+    /// Atomically publish a stopped event and remove its live instance state.
+    ///
+    /// The instance delete is the ownership CAS. Cleanup and event insertion
+    /// share its transaction, so an error restores the row for a later retry.
+    pub fn finalize_instance_stop(
+        &self,
+        name: &str,
+        created_at: f64,
+        session_id: Option<&str>,
+        agent_id: Option<&str>,
+        event_data: &serde_json::Value,
+    ) -> Result<bool> {
+        let timestamp = chrono_now_iso();
+        let data = serde_json::to_string(event_data)?;
+        let mut event_id = None;
+
+        let won = self.with_immediate_transaction(|tx| {
+            let deleted = tx.execute(
+                "DELETE FROM instances
+                 WHERE name = ? AND created_at = ?
+                   AND session_id IS ? AND agent_id IS ?",
+                params![name, created_at, session_id, agent_id],
+            )?;
+            if deleted == 0 {
+                return Ok(false);
+            }
+
+            if let Some(session_id) = session_id {
+                tx.execute(
+                    "DELETE FROM session_bindings WHERE session_id = ?",
+                    params![session_id],
+                )?;
+                tx.execute(
+                    "DELETE FROM process_bindings WHERE session_id = ?",
+                    params![session_id],
+                )?;
+            }
+            tx.execute(
+                "DELETE FROM notify_endpoints WHERE instance = ?",
+                params![name],
+            )?;
+            tx.execute(
+                "DELETE FROM process_bindings WHERE instance_name = ?",
+                params![name],
+            )?;
+            tx.execute(
+                "DELETE FROM kv
+                 WHERE key LIKE 'events_sub:%'
+                   AND json_extract(value, '$.caller') = ?
+                   AND COALESCE(json_extract(value, '$.delivery_only'), 0) != 1",
+                params![name],
+            )?;
+            tx.execute(
+                "INSERT INTO events (timestamp, type, instance, data)
+                 VALUES (?, 'life', ?, ?)",
+                params![timestamp, name, data],
+            )?;
+            event_id = Some(tx.last_insert_rowid());
+            Ok(true)
+        })?;
+
+        // Subscription notifications are best-effort external effects. Run
+        // them only after the stopped event and deletion are durable.
+        if let Some(event_id) = event_id {
+            subscriptions::process_logged_event(self, event_id, "life", name, event_data);
+        }
+        Ok(won)
     }
 
     /// Check whether `name`'s *current* identity is a subagent slot.

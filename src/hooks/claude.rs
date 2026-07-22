@@ -1964,8 +1964,19 @@ struct SubagentStopClaim<'a> {
     value: String,
 }
 
+enum SubagentStopClaimResult<'a> {
+    Acquired(SubagentStopClaim<'a>),
+    Duplicate,
+    RetryableError(String),
+}
+
 impl<'a> SubagentStopClaim<'a> {
-    fn acquire(db: &'a HcomDb, root_session_id: &str, agent_id: &str, raw: &Value) -> Option<Self> {
+    fn acquire(
+        db: &'a HcomDb,
+        root_session_id: &str,
+        agent_id: &str,
+        raw: &Value,
+    ) -> SubagentStopClaimResult<'a> {
         let key = subagent_stop_inflight_key(root_session_id, agent_id, raw);
         let pid = std::process::id();
         let process_start = match crate::sys::process::identity(pid) {
@@ -1976,7 +1987,9 @@ impl<'a> SubagentStopClaim<'a> {
                     "subagent_stop.claim_identity_failed",
                     &format!("pid={pid}"),
                 );
-                return None;
+                return SubagentStopClaimResult::RetryableError(
+                    "could not identify the stop-hook process".to_string(),
+                );
             }
         };
         let owner = SubagentStopOwner {
@@ -1984,48 +1997,85 @@ impl<'a> SubagentStopClaim<'a> {
             pid,
             process_start,
         };
-        let value = serde_json::to_string(&owner).ok()?;
-
-        match db.conn().execute(
-            "INSERT OR IGNORE INTO kv (key, value) VALUES (?, ?)",
-            rusqlite::params![key, value],
-        ) {
-            Ok(1) => return Some(Self { db, key, value }),
-            Ok(_) => {}
+        let value = match serde_json::to_string(&owner) {
+            Ok(value) => value,
             Err(e) => {
-                log::log_warn(
-                    "hooks",
-                    "subagent_stop.claim_insert_failed",
-                    &format!("key={key} err={e}"),
-                );
-                return None;
+                return SubagentStopClaimResult::RetryableError(format!(
+                    "could not encode stop ownership: {e}"
+                ));
+            }
+        };
+
+        // A claim can disappear or change between INSERT, read, and stale-owner
+        // replacement. Retry those benign CAS races locally before asking
+        // Claude to keep the subagent alive and invoke SubagentStop again.
+        for _ in 0..3 {
+            match db.conn().execute(
+                "INSERT OR IGNORE INTO kv (key, value) VALUES (?, ?)",
+                rusqlite::params![key, value],
+            ) {
+                Ok(1) => {
+                    return SubagentStopClaimResult::Acquired(Self { db, key, value });
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    log::log_warn(
+                        "hooks",
+                        "subagent_stop.claim_insert_failed",
+                        &format!("key={key} err={e}"),
+                    );
+                    return SubagentStopClaimResult::RetryableError(format!(
+                        "could not write stop ownership: {e}"
+                    ));
+                }
+            }
+
+            let old_value = match db.kv_get(&key) {
+                Ok(Some(value)) => value,
+                Ok(None) => continue,
+                Err(e) => {
+                    log::log_warn(
+                        "hooks",
+                        "subagent_stop.claim_read_failed",
+                        &format!("key={key} err={e}"),
+                    );
+                    return SubagentStopClaimResult::RetryableError(format!(
+                        "could not read stop ownership: {e}"
+                    ));
+                }
+            };
+            if serde_json::from_str::<SubagentStopOwner>(&old_value)
+                .is_ok_and(|old| crate::sys::process::has_identity(old.pid, &old.process_start))
+            {
+                return SubagentStopClaimResult::Duplicate;
+            }
+
+            // Replace a dead owner's record only if it is still the exact
+            // value we inspected. Another contender may recover it first.
+            match db.conn().execute(
+                "UPDATE kv SET value = ? WHERE key = ? AND value = ?",
+                rusqlite::params![value, key, old_value],
+            ) {
+                Ok(1) => {
+                    return SubagentStopClaimResult::Acquired(Self { db, key, value });
+                }
+                Ok(_) => continue,
+                Err(e) => {
+                    log::log_warn(
+                        "hooks",
+                        "subagent_stop.claim_replace_failed",
+                        &format!("key={key} err={e}"),
+                    );
+                    return SubagentStopClaimResult::RetryableError(format!(
+                        "could not replace stale stop ownership: {e}"
+                    ));
+                }
             }
         }
 
-        let old_value = db.kv_get(&key).ok()??;
-        if serde_json::from_str::<SubagentStopOwner>(&old_value)
-            .is_ok_and(|old| crate::sys::process::has_identity(old.pid, &old.process_start))
-        {
-            return None;
-        }
-
-        // Replace a dead owner's record only if it is still the exact value we
-        // inspected. Another contender may have recovered it first.
-        match db.conn().execute(
-            "UPDATE kv SET value = ? WHERE key = ? AND value = ?",
-            rusqlite::params![value, key, old_value],
-        ) {
-            Ok(1) => Some(Self { db, key, value }),
-            Ok(_) => None,
-            Err(e) => {
-                log::log_warn(
-                    "hooks",
-                    "subagent_stop.claim_replace_failed",
-                    &format!("key={key} err={e}"),
-                );
-                None
-            }
-        }
+        SubagentStopClaimResult::RetryableError(
+            "stop ownership changed repeatedly during acquisition".to_string(),
+        )
     }
 }
 
@@ -2042,6 +2092,17 @@ impl Drop for SubagentStopClaim<'_> {
 ///
 /// Returns (exit_code, stdout). exit_code=2 means message delivered
 /// (SubagentStop fires again). exit_code=0 means cleanup and stop.
+fn block_subagent_stop(error: impl std::fmt::Display) -> (i32, String) {
+    // Exit 0 with a documented Stop decision: Claude processes the JSON and
+    // keeps the subagent alive. Exit 1 would be non-blocking, while exit 2
+    // would ignore this stdout reason.
+    let output = serde_json::json!({
+        "decision": "block",
+        "reason": format!("hcom could not finish SubagentStop: {error}. Please stop again."),
+    });
+    (0, output.to_string())
+}
+
 fn subagent_stop(db: &HcomDb, root_session_id: &str, raw: &Value) -> (i32, String) {
     let agent_id = match raw.get("agent_id").and_then(|v| v.as_str()) {
         Some(id) if !id.is_empty() => id,
@@ -2051,27 +2112,30 @@ fn subagent_stop(db: &HcomDb, root_session_id: &str, raw: &Value) -> (i32, Strin
     // Claim before reading the row. Otherwise duplicate hook processes can all
     // observe the row, wait for the first claim to be released, and then each
     // perform a second teardown against their stale copy of that row.
-    let Some(_stop_claim) = SubagentStopClaim::acquire(db, root_session_id, agent_id, raw) else {
-        return (0, String::new());
+    let _stop_claim = match SubagentStopClaim::acquire(db, root_session_id, agent_id, raw) {
+        SubagentStopClaimResult::Acquired(claim) => claim,
+        SubagentStopClaimResult::Duplicate => return (0, String::new()),
+        SubagentStopClaimResult::RetryableError(error) => return block_subagent_stop(error),
     };
 
     // Query subagent instance by agent_id
-    let row: Option<(String, String, Option<String>, i64)> = db
-        .conn()
-        .query_row(
-            "SELECT name, transcript_path, parent_name, name_announced \
+    let row: Option<(String, String, Option<String>, i64)> = match db.conn().query_row(
+        "SELECT name, transcript_path, parent_name, name_announced \
              FROM instances WHERE agent_id = ?",
-            rusqlite::params![agent_id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, Option<i64>>(3)?.unwrap_or(0),
-                ))
-            },
-        )
-        .ok();
+        rusqlite::params![agent_id],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<i64>>(3)?.unwrap_or(0),
+            ))
+        },
+    ) {
+        Ok(row) => Some(row),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(e) => return block_subagent_stop(format!("could not read subagent state: {e}")),
+    };
 
     let Some((subagent_name, existing_transcript, parent_name, name_announced)) = row else {
         // No instance = SubagentStart never allocated one (shouldn't happen for
@@ -2109,10 +2173,14 @@ fn subagent_stop(db: &HcomDb, root_session_id: &str, raw: &Value) -> (i32, Strin
             "exit:idle",
             Default::default(),
         );
-        if let Some(ref pn) = parent_name {
-            remove_subagent_from_parent(db, pn, agent_id);
+        match common::stop_instance(db, &subagent_name, "subagent", "idle") {
+            common::StopOutcome::RetryableError(error) => return block_subagent_stop(error),
+            common::StopOutcome::Stopped | common::StopOutcome::AlreadyStopped => {
+                if let Some(ref pn) = parent_name {
+                    remove_subagent_from_parent(db, pn, agent_id);
+                }
+            }
         }
-        common::stop_instance(db, &subagent_name, "subagent", "idle");
         return (0, String::new());
     }
 
@@ -2196,10 +2264,14 @@ fn subagent_stop(db: &HcomDb, root_session_id: &str, raw: &Value) -> (i32, Strin
             &format!("exit:{}", reason),
             Default::default(),
         );
-        if let Some(ref pn) = parent_name {
-            remove_subagent_from_parent(db, pn, agent_id);
+        match common::stop_instance(db, &subagent_name, "subagent", reason) {
+            common::StopOutcome::RetryableError(error) => return block_subagent_stop(error),
+            common::StopOutcome::Stopped | common::StopOutcome::AlreadyStopped => {
+                if let Some(ref pn) = parent_name {
+                    remove_subagent_from_parent(db, pn, agent_id);
+                }
+            }
         }
-        common::stop_instance(db, &subagent_name, "subagent", reason);
     }
 
     (exit_code, stdout)
@@ -5240,6 +5312,16 @@ mod tests {
 
     // ---- Duplicate hook delivery idempotency (SubagentStop) ----
 
+    fn expect_stop_claim<'a>(result: SubagentStopClaimResult<'a>) -> SubagentStopClaim<'a> {
+        match result {
+            SubagentStopClaimResult::Acquired(claim) => claim,
+            SubagentStopClaimResult::Duplicate => panic!("expected claim, got duplicate"),
+            SubagentStopClaimResult::RetryableError(error) => {
+                panic!("expected claim, got retryable error: {error}")
+            }
+        }
+    }
+
     /// Property: the claim key must collapse a byte-identical duplicate
     /// invocation, but must NOT collapse a same-`prompt_id` invocation whose
     /// payload actually differs (SubagentStop legitimately re-fires within
@@ -5280,18 +5362,24 @@ mod tests {
         crate::config::Config::init();
         let (_dir, _guard, db) = make_isolated_test_db();
         let raw = serde_json::json!({"agent_id": "agent-x", "prompt_id": "p1"});
-        let _first_claim = SubagentStopClaim::acquire(&db, "sess-1", "agent-x", &raw)
-            .expect("first claim must succeed");
+        let _first_claim =
+            expect_stop_claim(SubagentStopClaim::acquire(&db, "sess-1", "agent-x", &raw));
         assert!(
-            SubagentStopClaim::acquire(&db, "sess-1", "agent-x", &raw).is_none(),
+            matches!(
+                SubagentStopClaim::acquire(&db, "sess-1", "agent-x", &raw),
+                SubagentStopClaimResult::Duplicate
+            ),
             "duplicate identical invocation must not re-claim while held"
         );
 
         let raw_different_payload =
             serde_json::json!({"agent_id": "agent-x", "prompt_id": "p1", "note": "different"});
-        let _different_claim =
-            SubagentStopClaim::acquire(&db, "sess-1", "agent-x", &raw_different_payload)
-                .expect("same prompt_id but different payload content must be its own claim");
+        let _different_claim = expect_stop_claim(SubagentStopClaim::acquire(
+            &db,
+            "sess-1",
+            "agent-x",
+            &raw_different_payload,
+        ));
     }
 
     /// The claim is a transient concurrency guard, not a session-long
@@ -5312,10 +5400,13 @@ mod tests {
         });
         let key = subagent_stop_inflight_key("sess-1", "agent-x", &raw);
 
-        let first_claim = SubagentStopClaim::acquire(&db, "sess-1", "agent-x", &raw)
-            .expect("first invocation claims");
+        let first_claim =
+            expect_stop_claim(SubagentStopClaim::acquire(&db, "sess-1", "agent-x", &raw));
         assert!(
-            SubagentStopClaim::acquire(&db, "sess-1", "agent-x", &raw).is_none(),
+            matches!(
+                SubagentStopClaim::acquire(&db, "sess-1", "agent-x", &raw),
+                SubagentStopClaimResult::Duplicate
+            ),
             "a concurrent duplicate still in-flight must lose the claim"
         );
         drop(first_claim);
@@ -5323,8 +5414,8 @@ mod tests {
             db.kv_get(&key).unwrap().is_none(),
             "guard drop must release the claim key"
         );
-        let _later_claim = SubagentStopClaim::acquire(&db, "sess-1", "agent-x", &raw)
-            .expect("a later, genuinely distinct stop with a byte-identical payload must re-claim");
+        let _later_claim =
+            expect_stop_claim(SubagentStopClaim::acquire(&db, "sess-1", "agent-x", &raw));
     }
 
     #[test]
@@ -5342,8 +5433,7 @@ mod tests {
         .unwrap();
         db.kv_set(&key, Some(&dead_owner)).unwrap();
 
-        let claim = SubagentStopClaim::acquire(&db, "sess-1", "agent-x", &raw)
-            .expect("a dead process must not leave a permanent tombstone");
+        let claim = expect_stop_claim(SubagentStopClaim::acquire(&db, "sess-1", "agent-x", &raw));
         let replacement = db.kv_get(&key).unwrap().unwrap();
         assert_ne!(replacement, dead_owner);
         assert_eq!(replacement, claim.value);
@@ -5356,8 +5446,7 @@ mod tests {
         let (_dir, _guard, db) = make_isolated_test_db();
         let raw = serde_json::json!({"agent_id": "agent-x", "prompt_id": "p1"});
         let key = subagent_stop_inflight_key("sess-1", "agent-x", &raw);
-        let claim = SubagentStopClaim::acquire(&db, "sess-1", "agent-x", &raw)
-            .expect("first invocation claims");
+        let claim = expect_stop_claim(SubagentStopClaim::acquire(&db, "sess-1", "agent-x", &raw));
 
         let replacement = r#"{"owner_token":"replacement","pid":1,"process_start":"other"}"#;
         db.kv_set(&key, Some(replacement)).unwrap();
@@ -5367,6 +5456,99 @@ mod tests {
             Some(replacement),
             "an old guard must not delete a newer owner's token"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn test_stop_claim_error_blocks_subagent_stop_for_retry() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        db.conn().execute("DROP TABLE kv", []).unwrap();
+        let raw = serde_json::json!({"agent_id": "agent-x", "prompt_id": "p1"});
+
+        let (exit_code, stdout) = subagent_stop(&db, "sess-1", &raw);
+        assert_eq!(exit_code, 0, "JSON decisions are processed only on exit 0");
+        let output: Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(output["decision"], "block");
+        assert!(
+            output["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("Please stop again")),
+            "the blocking decision must tell Claude to retry SubagentStop"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_post_claim_read_error_blocks_subagent_stop_for_retry() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, tool, status, status_context, status_time, created_at)
+                 VALUES ('nova', 'sess-1', 'claude', 'listening', 'start', 0, 1)",
+                [],
+            )
+            .unwrap();
+        insert_subagent_row(&db, "nova_task_1", "agent-x", "nova", "sess-1");
+        db.conn()
+            .execute(
+                "UPDATE instances SET transcript_path = x'80' WHERE agent_id = 'agent-x'",
+                [],
+            )
+            .unwrap();
+        let raw = serde_json::json!({"agent_id": "agent-x", "prompt_id": "p1"});
+
+        let (exit_code, stdout) = subagent_stop(&db, "sess-1", &raw);
+        assert_eq!(exit_code, 0);
+        let output: Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(output["decision"], "block");
+        assert_eq!(
+            db.get_instance_by_agent_id("agent-x").unwrap().as_deref(),
+            Some("nova_task_1")
+        );
+        assert!(db.get_instance_full("nova_task_1").is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn test_stop_finalization_error_keeps_child_and_parent_tracking_retryable() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, tool, status, status_context, status_time, created_at, running_tasks)
+                 VALUES ('nova', 'sess-1', 'claude', 'listening', 'start', 0, 1,
+                         '{\"active\":true,\"subagents\":[{\"agent_id\":\"agent-x\",\"type\":\"general\"}]}')",
+                [],
+            )
+            .unwrap();
+        insert_subagent_row(&db, "nova_task_1", "agent-x", "nova", "sess-1");
+        db.conn()
+            .execute_batch(
+                "CREATE TRIGGER reject_child_stop BEFORE INSERT ON events
+                 WHEN NEW.type = 'life' AND NEW.instance = 'nova_task_1'
+                 BEGIN SELECT RAISE(ABORT, 'injected stop failure'); END;",
+            )
+            .unwrap();
+        let raw = serde_json::json!({"agent_id": "agent-x", "prompt_id": "p1"});
+
+        let (exit_code, stdout) = subagent_stop(&db, "sess-1", &raw);
+        assert_eq!(exit_code, 0);
+        let output: Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(output["decision"], "block");
+        assert!(db.get_instance_by_agent_id("agent-x").unwrap().is_some());
+        let running_tasks: String = db
+            .conn()
+            .query_row(
+                "SELECT running_tasks FROM instances WHERE name = 'nova'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(running_tasks.contains("agent-x"));
     }
 
     /// `subagent_stop` must release its claim so it cannot outlive the
@@ -5438,8 +5620,8 @@ mod tests {
         });
         // Simulate a concurrent duplicate having already claimed this exact
         // invocation (and still in-flight, so the claim is unreleased).
-        let _existing_claim = SubagentStopClaim::acquire(&db, "sess-1", "agent-x", &raw)
-            .expect("the simulated concurrent invocation must hold the claim");
+        let _existing_claim =
+            expect_stop_claim(SubagentStopClaim::acquire(&db, "sess-1", "agent-x", &raw));
 
         let (exit_code, stdout) = subagent_stop(&db, "sess-1", &raw);
         assert_eq!(exit_code, 0);

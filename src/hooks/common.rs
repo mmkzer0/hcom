@@ -913,8 +913,20 @@ pub fn notify_hook_instance_with_db(db: &HcomDb, instance_name: &str) {
 ///
 /// Handles: snapshot capture, session/process/notify/subscription cleanup,
 /// life event logging, and instance deletion.
-pub fn stop_instance(db: &HcomDb, instance_name: &str, initiated_by: &str, reason: &str) {
-    stop_instance_inner(db, instance_name, initiated_by, reason, false, 0);
+pub fn stop_instance(
+    db: &HcomDb,
+    instance_name: &str,
+    initiated_by: &str,
+    reason: &str,
+) -> StopOutcome {
+    stop_instance_inner(db, instance_name, initiated_by, reason, false, 0)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StopOutcome {
+    Stopped,
+    AlreadyStopped,
+    RetryableError(String),
 }
 
 pub(crate) fn stop_placeholder_instance(
@@ -922,13 +934,24 @@ pub(crate) fn stop_placeholder_instance(
     instance_name: &str,
     initiated_by: &str,
     reason: &str,
-) {
-    stop_instance_inner(db, instance_name, initiated_by, reason, true, 0);
+) -> StopOutcome {
+    stop_instance_inner(db, instance_name, initiated_by, reason, true, 0)
 }
 
 /// Max recursion depth for subagent cleanup. Prevents stack overflow if DB
 /// corruption creates a parent_session_id cycle.
 const MAX_STOP_DEPTH: u32 = 10;
+
+fn child_instance_names(db: &HcomDb, column: &str, value: &str) -> Result<Vec<String>> {
+    let sql = match column {
+        "parent_session_id" => "SELECT name FROM instances WHERE parent_session_id = ?",
+        "parent_name" => "SELECT name FROM instances WHERE parent_name = ?",
+        _ => anyhow::bail!("unsupported child relationship: {column}"),
+    };
+    let mut stmt = db.conn().prepare(sql)?;
+    let rows = stmt.query_map(params![value], |row| row.get::<_, String>(0))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
 
 fn stop_instance_inner(
     db: &HcomDb,
@@ -937,7 +960,7 @@ fn stop_instance_inner(
     reason: &str,
     placeholder: bool,
     depth: u32,
-) {
+) -> StopOutcome {
     if depth >= MAX_STOP_DEPTH {
         log::log_warn(
             "core",
@@ -947,12 +970,19 @@ fn stop_instance_inner(
                 MAX_STOP_DEPTH, instance_name
             ),
         );
-        return;
+        return StopOutcome::RetryableError(format!(
+            "recursion limit reached while stopping {instance_name}"
+        ));
     }
 
     let instance_data = match db.get_instance_full(instance_name) {
         Ok(Some(data)) => data,
-        _ => return,
+        Ok(None) => return StopOutcome::AlreadyStopped,
+        Err(e) => {
+            return StopOutcome::RetryableError(format!(
+                "could not read instance {instance_name}: {e}"
+            ));
+        }
     };
 
     // Kill headless processes (background=true)
@@ -1084,86 +1114,68 @@ fn stop_instance_inner(
     // Snapshot both child sets before deleting the parent. Only the teardown
     // winner processes them, but it still needs relationships that may be
     // cascaded or otherwise obscured by the parent deletion.
-    let session_subagents: Vec<String> = instance_data
-        .session_id
-        .as_ref()
-        .map(|session_id| {
-            db.conn()
-                .prepare("SELECT name FROM instances WHERE parent_session_id = ?")
-                .and_then(|mut stmt| {
-                    stmt.query_map(params![session_id], |row| row.get::<_, String>(0))
-                        .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                })
-                .unwrap_or_default()
-        })
-        .unwrap_or_default();
-
-    let native_children: Vec<String> = db
-        .conn()
-        .prepare("SELECT name FROM instances WHERE parent_name = ?")
-        .and_then(|mut stmt| {
-            stmt.query_map(params![instance_name], |row| row.get::<_, String>(0))
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        })
-        .unwrap_or_default();
-
-    // Deleting the row is the ownership CAS for teardown. Concurrent callers
-    // may all have read the same snapshot, but only the caller that actually
-    // removes the row may perform destructive cleanup, publish the stopped
-    // event, or wake listeners. A deletion error leaves all state retryable.
-    match db.delete_instance(instance_name) {
-        Ok(true) => {}
-        Ok(false) => return,
+    let session_subagents = match instance_data.session_id.as_deref() {
+        Some(session_id) => match child_instance_names(db, "parent_session_id", session_id) {
+            Ok(children) => children,
+            Err(e) => {
+                return StopOutcome::RetryableError(format!(
+                    "could not enumerate session children of {instance_name}: {e}"
+                ));
+            }
+        },
+        None => Vec::new(),
+    };
+    let native_children = match child_instance_names(db, "parent_name", instance_name) {
+        Ok(children) => children,
         Err(e) => {
-            log::log_warn(
-                "hooks",
-                "finalize.delete_failed",
-                &format!("delete_instance failed for {instance_name}: {e}"),
-            );
-            return;
+            return StopOutcome::RetryableError(format!(
+                "could not enumerate native children of {instance_name}: {e}"
+            ));
         }
-    }
+    };
 
-    // Clean session and process bindings, then recursively stop subagents for
-    // this session. Some bindings may already be gone through FK cascades.
-    if let Some(ref session_id) = instance_data.session_id {
-        let _ = db.conn().execute(
-            "DELETE FROM session_bindings WHERE session_id = ?",
-            params![session_id],
-        );
-        let _ = db.conn().execute(
-            "DELETE FROM process_bindings WHERE session_id = ?",
-            params![session_id],
-        );
-    }
+    // Finish children first while the parent row keeps the teardown retryable.
+    // Concurrent callers may repeat this work; every child has its own atomic
+    // event/delete gate.
     for sub_name in session_subagents {
-        stop_instance_inner(
+        if let StopOutcome::RetryableError(error) = stop_instance_inner(
             db,
             &sub_name,
             initiated_by,
             "parent_stopped",
             false,
             depth + 1,
-        );
+        ) {
+            log::log_warn(
+                "hooks",
+                "finalize.child_stop_incomplete",
+                &format!("parent={instance_name} child={sub_name} err={error}"),
+            );
+            return StopOutcome::RetryableError(format!(
+                "could not stop child {sub_name}: {error}"
+            ));
+        }
     }
 
     // Native subagent rows carry session_id=NULL and inherit the root session
     // as parent_session_id, so only parent_name links nested children. A row
     // already stopped via the session set is a no-op here.
     for child in native_children {
-        stop_instance_inner(db, &child, initiated_by, "parent_stopped", false, depth + 1);
+        if let StopOutcome::RetryableError(error) =
+            stop_instance_inner(db, &child, initiated_by, "parent_stopped", false, depth + 1)
+        {
+            log::log_warn(
+                "hooks",
+                "finalize.child_stop_incomplete",
+                &format!("parent={instance_name} child={child} err={error}"),
+            );
+            return StopOutcome::RetryableError(format!("could not stop child {child}: {error}"));
+        }
     }
 
-    // These normally disappear through FK cascades; explicit cleanup keeps
-    // the behavior correct for older or partially migrated databases.
-    let _ = db.delete_notify_endpoints(instance_name);
-    let _ = db.conn().execute(
-        "DELETE FROM process_bindings WHERE instance_name = ?",
-        params![instance_name],
-    );
-    let _ = db.cleanup_subscriptions(instance_name);
-
-    // Preserve the winner's pre-delete snapshot in the life event.
+    // Publish the winner's pre-delete snapshot in the same transaction that
+    // deletes the row and its control-plane state. Event failure rolls the
+    // deletion back, so another invocation can retry the whole teardown.
     let mut event_data = serde_json::json!({
         "action": "stopped",
         "by": initiated_by,
@@ -1173,12 +1185,25 @@ fn stop_instance_inner(
     if placeholder {
         event_data["placeholder"] = serde_json::json!(true);
     }
-    if let Err(e) = db.log_event("life", instance_name, &event_data) {
-        log::log_warn(
-            "hooks",
-            "finalize.life_event_failed",
-            &format!("log_life_event failed for {instance_name}: {e}"),
-        );
+    match db.finalize_instance_stop(
+        instance_name,
+        instance_data.created_at,
+        instance_data.session_id.as_deref(),
+        instance_data.agent_id.as_deref(),
+        &event_data,
+    ) {
+        Ok(true) => {}
+        Ok(false) => return StopOutcome::AlreadyStopped,
+        Err(e) => {
+            log::log_warn(
+                "hooks",
+                "finalize.transaction_failed",
+                &format!("instance={instance_name} err={e}"),
+            );
+            return StopOutcome::RetryableError(format!(
+                "could not finalize stop for {instance_name}: {e}"
+            ));
+        }
     }
 
     // Notify remaining listeners AFTER delete (so they see the row is gone)
@@ -1186,6 +1211,7 @@ fn stop_instance_inner(
 
     // Trigger relay push (best-effort)
     crate::relay::spawn_background_push();
+    StopOutcome::Stopped
 }
 
 /// Soft session end for Antigravity: mark inactive without deleting the `instances` row.
@@ -1739,13 +1765,13 @@ mod tests {
             }
         }
 
-        // Stop root — should stop up to depth 10 but leave the deepest 2
+        // Stop root. Hitting the depth guard leaves the full chain retryable;
+        // partial deletion would orphan the surviving descendants.
         stop_instance(&db, "inst0", "test", "test_depth_limit");
 
-        // inst10 and inst11 should survive (depth 10 and 11, beyond limit)
         let remaining: Vec<String> = db
             .conn()
-            .prepare("SELECT name FROM instances ORDER BY name")
+            .prepare("SELECT name FROM instances ORDER BY CAST(SUBSTR(name, 5) AS INTEGER)")
             .unwrap()
             .query_map([], |row| row.get::<_, String>(0))
             .unwrap()
@@ -1753,9 +1779,18 @@ mod tests {
             .collect();
         assert_eq!(
             remaining,
-            vec!["inst10", "inst11"],
-            "instances beyond depth limit should survive"
+            (0..12).map(|i| format!("inst{i}")).collect::<Vec<_>>(),
+            "an incomplete child cascade must leave every ancestor retryable"
         );
+        let stopped: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'life'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stopped, 0, "an incomplete cascade must publish no stops");
     }
 
     #[test]
@@ -1793,6 +1828,88 @@ mod tests {
 
         // Should be a no-op, not panic
         stop_instance(&db, "nonexistent", "test", "test");
+    }
+
+    #[test]
+    fn test_stale_stop_cannot_delete_reused_name() {
+        crate::config::Config::init();
+        let (_dir, db) = make_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, agent_id, tool, status, status_context, status_time, created_at)
+                 VALUES ('inst', 'old-session', 'old-agent', 'claude', 'active', 'running', 0, 1)",
+                [],
+            )
+            .unwrap();
+        let old = db.get_instance_full("inst").unwrap().unwrap();
+        db.delete_instance("inst").unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, agent_id, tool, status, status_context, status_time, created_at)
+                 VALUES ('inst', 'new-session', 'new-agent', 'claude', 'active', 'running', 0, 2)",
+                [],
+            )
+            .unwrap();
+        let event = serde_json::json!({"action": "stopped", "snapshot": {"name": "inst"}});
+
+        let won = db
+            .finalize_instance_stop(
+                "inst",
+                old.created_at,
+                old.session_id.as_deref(),
+                old.agent_id.as_deref(),
+                &event,
+            )
+            .unwrap();
+        assert!(!won, "the stale row incarnation must lose its delete CAS");
+        let current = db.get_instance_full("inst").unwrap().unwrap();
+        assert_eq!(current.session_id.as_deref(), Some("new-session"));
+        let stopped: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'life' AND instance = 'inst'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stopped, 0, "a stale stopper must publish no event");
+    }
+
+    #[test]
+    fn test_child_enumeration_error_keeps_parent_retryable() {
+        crate::config::Config::init();
+        let (_dir, db) = make_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, tool, status, status_context, status_time, created_at)
+                 VALUES ('parent', 'sess-1', 'claude', 'active', 'running', 0, 1)",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, parent_name, tool, status, status_context, status_time, created_at)
+                 VALUES (x'80', 'parent', 'claude', 'active', 'running', 0, 2)",
+                [],
+            )
+            .unwrap();
+
+        let outcome = stop_instance(&db, "parent", "test", "child-read-error");
+        assert!(matches!(outcome, StopOutcome::RetryableError(_)));
+        assert!(db.get_instance("parent").unwrap().is_some());
+        let stopped: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'life' AND instance = 'parent'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stopped, 0);
     }
 
     #[test]
@@ -1836,6 +1953,27 @@ mod tests {
         db.conn()
             .execute_batch("DROP TRIGGER suppress_inst_delete;")
             .unwrap();
+
+        // Event insertion and deletion form one transaction. If publication
+        // fails, SQLite must restore both the row and its binding.
+        db.conn()
+            .execute_batch(
+                "CREATE TRIGGER reject_stopped_event BEFORE INSERT ON events
+                 WHEN NEW.type = 'life' AND NEW.instance = 'inst'
+                 BEGIN SELECT RAISE(ABORT, 'injected event failure'); END;",
+            )
+            .unwrap();
+        stop_instance(&db, "inst", "test", "event-failure");
+        assert!(db.get_instance("inst").unwrap().is_some());
+        assert_eq!(
+            db.get_session_binding("sess-1").unwrap().as_deref(),
+            Some("inst"),
+            "event failure must roll back deletion and cleanup"
+        );
+        db.conn()
+            .execute_batch("DROP TRIGGER reject_stopped_event;")
+            .unwrap();
+
         stop_instance(&db, "inst", "test", "retry");
         assert!(db.get_instance("inst").unwrap().is_none());
         let stopped: i64 = db
