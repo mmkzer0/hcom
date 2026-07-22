@@ -18,7 +18,7 @@
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use rusqlite::Connection;
+use rusqlite::{Connection, Transaction, TransactionBehavior};
 
 use crate::shared::time::now_epoch_f64;
 
@@ -120,6 +120,21 @@ impl HcomDb {
     /// Access the underlying SQLite connection (for direct queries).
     pub fn conn(&self) -> &Connection {
         &self.conn
+    }
+
+    /// Run `f` inside a `BEGIN IMMEDIATE` transaction and commit on success.
+    ///
+    /// The immediate write lock makes read-modify-write sequences atomic
+    /// across the separate database connections used by hook processes.
+    /// Queries inside `f` must use the provided transaction.
+    pub fn with_immediate_transaction<T>(
+        &self,
+        f: impl FnOnce(&Transaction<'_>) -> Result<T>,
+    ) -> Result<T> {
+        let txn = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let result = f(&txn)?;
+        txn.commit()?;
+        Ok(result)
     }
 
     /// Access the filesystem path backing this DB handle.

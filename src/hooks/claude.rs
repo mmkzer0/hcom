@@ -39,6 +39,10 @@ const HOOK_SUBAGENT_STOP: &str = "subagent-stop";
 const HOOK_SESSIONEND: &str = "sessionend";
 const HOOK_POLL: &str = "poll";
 
+fn is_subagent_tool(tool_name: &str) -> bool {
+    matches!(tool_name, "Agent" | "Task")
+}
+
 /// Handle a Claude hook — entry point from router.
 ///
 /// Reads JSON from stdin, builds context, dispatches to appropriate handler.
@@ -235,93 +239,69 @@ fn route_claude_hook(
         return (result.0, result.1, None, timing);
     }
 
-    // Task transitions
+    // Claude identifies the hook's actor with agent_id. All actors share the
+    // root session_id, while running_tasks is lifecycle state rather than
+    // identity, so actor routing must happen before task-state handling.
+    let raw_agent_id = payload
+        .raw
+        .get("agent_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    if let Some(agent_id) = raw_agent_id {
+        // Every Claude subagent carries agent_id on its hooks regardless of
+        // whether its root ever ran `hcom start` — that's a property of
+        // Claude's hook schema, not of hcom participation. Act only if the
+        // shared session_id actually has an hcom root binding; otherwise this
+        // whole branch (including the `hcom start --name ...` hint at
+        // SubagentStart) must be a silent no-op, same as any other
+        // nonparticipant hook.
+        let Ok(Some(root_name)) = db.get_session_binding(&session_id) else {
+            return (0, String::new(), None, timing);
+        };
+        let subagent_check_start = Instant::now();
+        let (exit_code, stdout, delivery_ack) = route_subagent_actor_hook(
+            db,
+            hook_type,
+            payload,
+            &agent_id,
+            &session_id,
+            &root_name,
+            &mut timing,
+        );
+        timing.subagent_check_ms = Some(subagent_check_start.elapsed().as_secs_f64() * 1000.0);
+        return (exit_code, stdout, delivery_ack, timing);
+    }
+
+    // ---- Root/main-thread hook (no agent_id) from here on ----
+
     let tool_name = payload.tool_name.as_str();
-    // Claude Code renamed the Task tool to Agent (Task kept as legacy alias),
-    // so match both to keep subagent lifecycle tracking working across versions (useless change!).
-    let is_task_tool = tool_name == "Task" || tool_name == "Agent";
-    if hook_type == HOOK_PRE && is_task_tool {
+    if hook_type == HOOK_PRE && is_subagent_tool(tool_name) {
         let task_start = Instant::now();
-        let (stdout, exit_code) = start_task(db, &session_id, &payload.raw);
+        let (exit_code, stdout) = match db.get_session_binding(&session_id).ok().flatten() {
+            Some(instance_name) => start_task(db, &instance_name, &session_id, &payload.raw),
+            None => (0, String::new()),
+        };
         timing.task_ms = Some(task_start.elapsed().as_secs_f64() * 1000.0);
         return (exit_code, stdout, None, timing);
     }
-    if hook_type == HOOK_POST && is_task_tool {
+    if hook_type == HOOK_POST && is_subagent_tool(tool_name) {
         let task_start = Instant::now();
-        let stdout = end_task(db, &session_id, &payload.raw, false).unwrap_or_default();
+        let stdout = match db.get_session_binding(&session_id).ok().flatten() {
+            Some(instance_name) => end_task(db, &instance_name, &payload.raw).unwrap_or_default(),
+            None => String::new(),
+        };
         timing.task_ms = Some(task_start.elapsed().as_secs_f64() * 1000.0);
         return (0, stdout, None, timing);
     }
 
-    // Subagent context check
-    let subagent_check_start = Instant::now();
-    let is_in_subagent_ctx = instances::in_subagent_context(db, &session_id);
-    timing.subagent_check_ms = Some(subagent_check_start.elapsed().as_secs_f64() * 1000.0);
-
-    if is_in_subagent_ctx {
-        timing.context = Some("subagent");
-
-        if hook_type == HOOK_USERPROMPTSUBMIT {
-            let transcript_path = payload.transcript_path.as_deref().unwrap_or("");
-            cleanup_dead_subagents(db, &session_id, transcript_path);
-            // Fall through to parent handler for PTY message delivery
-        }
-
-        if hook_type == HOOK_SUBAGENT_START {
-            let agent_id = payload
-                .raw
-                .get("agent_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let agent_type = payload
-                .raw
-                .get("agent_type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            if !agent_id.is_empty() && !agent_type.is_empty() {
-                track_subagent(db, &session_id, agent_id, agent_type);
-                // Eagerly allocate an instance row so the subagent shows up
-                // in the TUI and is a valid `hcom send` target from birth —
-                // without injecting any hcom context into the subagent itself.
-                // The subagent stays dormant (name_announced=0) until either a
-                // message arrives at SubagentStop or it runs `hcom start`.
-                ensure_subagent_row(db, &session_id, agent_id, agent_type);
-            }
-            let output = subagent_start(&payload.raw);
-            if let Some(out) = output {
-                return (
-                    0,
-                    serde_json::to_string(&out).unwrap_or_default(),
-                    None,
-                    timing,
-                );
-            }
-            return (0, String::new(), None, timing);
-        }
-
-        if hook_type == HOOK_SUBAGENT_STOP {
-            let (exit_code, stdout) = subagent_stop(db, &payload.raw, &session_id);
-            return (exit_code, stdout, None, timing);
-        }
-
-        if hook_type == HOOK_NOTIFY {
-            return (0, String::new(), None, timing);
-        }
-
-        if hook_type == HOOK_PRE || hook_type == HOOK_POST {
-            if tool_name == "Bash" {
-                let tool_input = &payload.tool_input;
-                let command = tool_input
-                    .get("command")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                if hook_type == HOOK_POST && extract_name(command).is_some() {
-                    let (exit_code, stdout, delivery_ack) = subagent_posttooluse(db, &payload.raw);
-                    return (exit_code, stdout, delivery_ack, timing);
-                }
-            }
-            return (0, String::new(), None, timing);
-        }
+    if hook_type == HOOK_USERPROMPTSUBMIT {
+        // Reap subagents that died without a clean SubagentStop before root
+        // delivery. This is lifecycle cleanup, not actor identification.
+        let transcript_path = payload.transcript_path.as_deref().unwrap_or("");
+        cleanup_dead_subagents(db, &session_id, transcript_path);
+        // Fall through to parent handler for PTY message delivery
     }
 
     // Resolve parent instance
@@ -395,7 +375,8 @@ fn route_claude_hook(
             handle_userpromptsubmit(db, ctx, payload, instance_name, &updates, &instance_data)
         }
         HOOK_SESSIONEND => {
-            let (code, stdout) = handle_sessionend(db, instance_name, &payload.raw, &updates);
+            let (code, stdout) =
+                handle_sessionend(db, instance_name, &session_id, &payload.raw, &updates);
             (code, stdout, None)
         }
         _ => (0, String::new(), None),
@@ -403,6 +384,138 @@ fn route_claude_hook(
     timing.handler_ms = Some(handler_start.elapsed().as_secs_f64() * 1000.0);
 
     (exit_code, stdout, delivery_ack, timing)
+}
+
+/// Route a hook whose payload carries a non-empty `agent_id` — i.e. one that
+/// fired inside a subagent's own execution context. See the call site in
+/// `route_claude_hook` for why `agent_id`, not `running_tasks.active`, is the
+/// actor signal, and for the participation gate that must run before this
+/// (root_name is already a proven hcom binding by the time we're called).
+///
+/// Returns (exit_code, stdout, delivery_ack).
+fn route_subagent_actor_hook(
+    db: &HcomDb,
+    hook_type: &str,
+    payload: &HookPayload,
+    agent_id: &str,
+    session_id: &str,
+    root_name: &str,
+    timing: &mut DispatchTiming,
+) -> (i32, String, Option<DeliveryAck>) {
+    timing.context = Some("subagent");
+
+    if hook_type == HOOK_SUBAGENT_START {
+        return handle_subagent_start(db, payload, agent_id, session_id, root_name, timing);
+    }
+
+    // SubagentStop resolves its own row and handles a missing row safely.
+    if hook_type == HOOK_SUBAGENT_STOP {
+        let (exit_code, stdout) = subagent_stop(db, session_id, &payload.raw);
+        return (exit_code, stdout, None);
+    }
+
+    // Every other subagent hook requires a known actor row. A missing row is
+    // not proof that the hook belongs to the root, so fail closed.
+    let Ok(Some(subagent_instance)) = db.get_instance_by_agent_id(agent_id) else {
+        timing.result = Some("unknown_subagent_actor");
+        return (0, String::new(), None);
+    };
+
+    if hook_type == HOOK_NOTIFY {
+        return (0, String::new(), None);
+    }
+
+    // Nested Agent/Task calls mutate the acting subagent, not the shared root.
+    let tool_name = payload.tool_name.as_str();
+    if hook_type == HOOK_PRE && is_subagent_tool(tool_name) {
+        let (exit_code, stdout) = start_task(db, &subagent_instance, session_id, &payload.raw);
+        return (exit_code, stdout, None);
+    }
+    if hook_type == HOOK_POST && is_subagent_tool(tool_name) {
+        let stdout = end_task(db, &subagent_instance, &payload.raw).unwrap_or_default();
+        return (0, stdout, None);
+    }
+
+    if (hook_type == HOOK_PRE || hook_type == HOOK_POST) && tool_name == "Bash" {
+        if hook_type == HOOK_POST {
+            let command = payload
+                .tool_input
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            // A subagent may only route its own inbox: the --name it passed
+            // to `hcom start`/hook delivery must match the agent_id Claude
+            // itself stamped on this hook, or one subagent could spoof
+            // another's --name and read its inbox (see subagent_posttooluse).
+            if let Some(name_flag) = extract_name(command)
+                && name_flag == agent_id
+            {
+                let (exit_code, stdout, delivery_ack) = subagent_posttooluse(db, &payload.raw);
+                return (exit_code, stdout, delivery_ack);
+            }
+        }
+        return (0, String::new(), None);
+    }
+
+    (0, String::new(), None)
+}
+
+fn handle_subagent_start(
+    db: &HcomDb,
+    payload: &HookPayload,
+    agent_id: &str,
+    session_id: &str,
+    root_name: &str,
+    timing: &mut DispatchTiming,
+) -> (i32, String, Option<DeliveryAck>) {
+    let agent_type = payload
+        .raw
+        .get("agent_type")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+
+    if !agent_type.is_empty() {
+        let parent_instance =
+            match resolve_spawn_owner(db, &payload.raw, session_id, agent_id, root_name) {
+                SpawnOwner::LegacyRoot(name)
+                | SpawnOwner::Resolved(name)
+                | SpawnOwner::Resumed(name) => name,
+                SpawnOwner::Unresolved => {
+                    log::log_warn(
+                        "hooks",
+                        "subagent.spawn_owner.unresolved",
+                        &format!(
+                            "agent_id={} prompt_id={:?}",
+                            agent_id,
+                            payload
+                                .raw
+                                .get("prompt_id")
+                                .and_then(|value| value.as_str())
+                        ),
+                    );
+                    timing.result = Some("spawn_owner_unresolved");
+                    return (0, String::new(), None);
+                }
+            };
+
+        let _ = db.kv_set(
+            &agent_owner_kv_key(session_id, agent_id),
+            Some(&parent_instance),
+        );
+
+        // Allocate the row first, and only track the child once it has one, so
+        // a tracked actor is always addressable. Tracking a child whose row
+        // allocation failed would leave the parent pointing at a subagent every
+        // one of whose later hooks fails closed as an unknown actor.
+        if ensure_subagent_row(db, &parent_instance, session_id, agent_id, agent_type) {
+            track_subagent(db, &parent_instance, agent_id, agent_type);
+        }
+    }
+
+    let stdout = build_subagent_start_output(&payload.raw)
+        .and_then(|output| serde_json::to_string(&output).ok())
+        .unwrap_or_default();
+    (0, stdout, None)
 }
 
 /// Get correct session_id, handling Claude Code's fork bug.
@@ -667,36 +780,165 @@ fn bind_and_bootstrap(
     Ok(Some(result))
 }
 
-/// PreToolUse Task: enter subagent context.
+/// kv-table key correlating a Task/Agent tool call's `prompt_id` — scoped to
+/// the root session it happened in — with the instance that made it. See
+/// `resolve_spawn_owner`.
 ///
-/// Returns (stdout, exit_code).
-fn start_task(db: &HcomDb, session_id: &str, raw: &Value) -> (String, i32) {
+/// Session-scoped (not just `prompt_id`) because a session's mappings live
+/// for the whole session (see `end_task` / `handle_sessionend` for why they
+/// can't be deleted per-Task-completion), and prompt_id values are only
+/// unique within one Claude conversation.
+fn spawn_owner_kv_key(root_session_id: &str, prompt_id: &str) -> String {
+    format!("spawn_owner:{root_session_id}:{prompt_id}")
+}
+
+/// kv-table key prefix covering every spawn-owner mapping for one root
+/// session. See `handle_sessionend`.
+fn spawn_owner_kv_prefix(root_session_id: &str) -> String {
+    format!("spawn_owner:{root_session_id}:")
+}
+
+/// kv-table key remembering which instance owns a given `agent_id`, scoped
+/// to the root session — independent of any one `prompt_id`. See
+/// `resolve_spawn_owner`'s resume fallback.
+fn agent_owner_kv_key(root_session_id: &str, agent_id: &str) -> String {
+    format!("agent_owner:{root_session_id}:{agent_id}")
+}
+
+/// kv-table key prefix covering every agent-owner mapping for one root
+/// session. See `handle_sessionend`.
+fn agent_owner_kv_prefix(root_session_id: &str) -> String {
+    format!("agent_owner:{root_session_id}:")
+}
+
+/// Outcome of resolving which instance spawned a SubagentStart's child.
+enum SpawnOwner {
+    /// `prompt_id` was absent from the payload entirely — Claude Code
+    /// < 2.1.196, where this correlation doesn't exist on the wire at all.
+    /// Root attribution is the only thing ever knowable without it; this is
+    /// not nested-spawn support, just the honest pre-2.1.196 behavior.
+    LegacyRoot(String),
+    /// `prompt_id` was present and resolved to a live owner that's verified
+    /// to belong to this root session.
+    Resolved(String),
+    /// `prompt_id` was present but didn't resolve, and this `agent_id` was
+    /// already known (see `agent_owner_kv_key`) — Claude resuming a
+    /// previously-spawned subagent under the same `agent_id` stamps a *new*
+    /// `prompt_id` on the resumed SubagentStart with no corresponding
+    /// PreToolUse to map it, so the fresh-`prompt_id` lookup always misses on
+    /// resume. Falling back to this agent_id's own
+    /// remembered owner is safe specifically because the agent_id is
+    /// already known — see `Unresolved` for why an *unknown* agent_id must
+    /// not get the same treatment.
+    Resumed(String),
+    /// `prompt_id` was present but no valid owner resolved by either path,
+    /// and this `agent_id` has never been seen before: no mapping
+    /// (correlation failed or hasn't landed yet), or the mapped instance is
+    /// gone or belongs to a different session (stale/foreign). Root is
+    /// deliberately not used as a fallback here — on a Claude Code version
+    /// that *does* send `prompt_id`, a miss on a genuinely new agent_id
+    /// means something is wrong, not that root is a safe guess.
+    Unresolved,
+}
+
+/// Resolve which instance actually spawned a SubagentStart's child.
+///
+/// Claude stamps the same `prompt_id` on a Task/Agent tool's PreToolUse and
+/// on the SubagentStart(s) it produces, including parallel siblings spawned
+/// by the same call. `start_task` records
+/// `(root_session_id, prompt_id) -> acting instance` for exactly this
+/// lookup, so a SubagentStart spawned by a *nested* subagent resolves to
+/// that subagent, not the session-bound root — parent and every nested
+/// subagent share one Claude session_id, so session_id alone can never tell
+/// them apart.
+///
+/// Falls back to `agent_owner_kv_key(root_session_id, agent_id)` — this
+/// `agent_id`'s own remembered owner from when it was first spawned — when
+/// the `prompt_id` lookup misses; see `SpawnOwner::Resumed`.
+fn resolve_spawn_owner(
+    db: &HcomDb,
+    raw: &Value,
+    root_session_id: &str,
+    agent_id: &str,
+    root_name: &str,
+) -> SpawnOwner {
+    let Some(prompt_id) = raw
+        .get("prompt_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    else {
+        return SpawnOwner::LegacyRoot(root_name.to_string());
+    };
+
+    let by_prompt = db
+        .kv_get(&spawn_owner_kv_key(root_session_id, prompt_id))
+        .ok()
+        .flatten();
+    if let Some(owner) = by_prompt
+        && validate_spawn_owner(db, &owner, root_session_id, root_name)
+    {
+        return SpawnOwner::Resolved(owner);
+    }
+
+    let by_agent = db
+        .kv_get(&agent_owner_kv_key(root_session_id, agent_id))
+        .ok()
+        .flatten();
+    if let Some(owner) = by_agent
+        && validate_spawn_owner(db, &owner, root_session_id, root_name)
+    {
+        return SpawnOwner::Resumed(owner);
+    }
+
+    SpawnOwner::Unresolved
+}
+
+/// Verify a resolved spawn-owner instance actually belongs to this root
+/// session's hierarchy, rather than trusting the kv mapping blindly — a
+/// stale entry could name an instance that's since been deleted or (in
+/// principle) reused for something else.
+fn validate_spawn_owner(db: &HcomDb, owner: &str, root_session_id: &str, root_name: &str) -> bool {
+    if owner == root_name {
+        return true;
+    }
+    match db.get_instance_full(owner) {
+        Ok(Some(data)) => data.parent_session_id.as_deref() == Some(root_session_id),
+        _ => false,
+    }
+}
+
+/// PreToolUse Task: enter subagent context for `instance_name` — the acting
+/// instance's own row (root parent, or the spawning subagent for a nested
+/// Agent/Task call; see the call sites in `route_claude_hook` /
+/// `route_subagent_actor_hook`).
+///
+/// Returns (exit_code, stdout).
+fn start_task(
+    db: &HcomDb,
+    instance_name: &str,
+    root_session_id: &str,
+    raw: &Value,
+) -> (i32, String) {
     log::log_info(
         "hooks",
         "start_task.enter",
-        &format!("session_id={}", session_id),
+        &format!("instance={}", instance_name),
     );
 
-    let instance_name = match db.get_session_binding(session_id) {
-        Ok(Some(name)) => name,
-        _ => return (String::new(), 0),
-    };
-
-    // Set running_tasks.active = true
-    let instance_data = match db.get_instance_full(&instance_name) {
-        Ok(Some(data)) => data,
-        _ => return (String::new(), 0),
-    };
-
-    let mut running_tasks = instances::parse_running_tasks(instance_data.running_tasks.as_deref());
-    running_tasks.active = true;
-    let rt_json = serde_json::json!({
-        "active": running_tasks.active,
-        "subagents": running_tasks.subagents,
+    instances::mutate_running_tasks(db, instance_name, |rt| {
+        rt.active = true;
     });
-    let mut updates = serde_json::Map::new();
-    updates.insert("running_tasks".into(), Value::String(rt_json.to_string()));
-    instances::update_instance_position(db, &instance_name, &updates);
+
+    if let Some(prompt_id) = raw
+        .get("prompt_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        let _ = db.kv_set(
+            &spawn_owner_kv_key(root_session_id, prompt_id),
+            Some(instance_name),
+        );
+    }
 
     let tool_input = raw
         .get("tool_input")
@@ -705,7 +947,7 @@ fn start_task(db: &HcomDb, session_id: &str, raw: &Value) -> (String, i32) {
     let detail = family::extract_tool_detail("claude", "Task", &tool_input);
     lifecycle::set_status(
         db,
-        &instance_name,
+        instance_name,
         ST_ACTIVE,
         "tool:Task",
         lifecycle::StatusUpdate {
@@ -736,37 +978,47 @@ fn start_task(db: &HcomDb, session_id: &str, raw: &Value) -> (String, i32) {
                 "updatedInput": updated,
             }
         });
-        return (serde_json::to_string(&output).unwrap_or_default(), 0);
+        return (0, serde_json::to_string(&output).unwrap_or_default());
     }
 
-    (String::new(), 0)
+    (0, String::new())
 }
 
-/// PostToolUse Task: deliver freeze-period messages.
+/// PostToolUse Task: deliver freeze-period messages for `instance_name` — the
+/// acting instance's own row (see `start_task`).
 ///
 /// Returns Option<String> — JSON stdout if messages were delivered.
 /// Dispatcher writes this to stdout before returning exit code.
-fn end_task(db: &HcomDb, session_id: &str, _raw: &Value, interrupted: bool) -> Option<String> {
-    let instance_name = match db.get_session_binding(session_id) {
-        Ok(Some(name)) => name,
-        _ => return None,
-    };
+fn end_task(db: &HcomDb, instance_name: &str, raw: &Value) -> Option<String> {
+    // Since Claude Code 2.1.198, Agent/Task calls background by default: this
+    // PostToolUse fires immediately with tool_response.status="async_launched"
+    // when the call is merely dispatched to the background, not when the
+    // subagent actually finishes. Treating that as completion would emit a
+    // false "Subagents have finished and are no longer active" summary and
+    // advance last_event_id before the subagent's freeze window is over, so
+    // skip delivery rather than assume anything about how/when completion is
+    // reported — root-scoped messages still flow through the root's own
+    // interleaved PostToolUse hooks regardless (see route_claude_hook).
+    let is_async_launch = raw
+        .get("tool_response")
+        .and_then(|v| v.get("status"))
+        .and_then(|v| v.as_str())
+        == Some("async_launched");
+    if is_async_launch {
+        return None;
+    }
 
-    let instance_data = match db.get_instance_full(&instance_name) {
+    let instance_data = match db.get_instance_full(instance_name) {
         Ok(Some(data)) => data,
         _ => return None,
     };
 
-    if interrupted {
-        return None;
-    }
-
     let freeze_event_id = instance_data.last_event_id;
-    let (last_event_id, stdout) = deliver_freeze_messages(db, &instance_name, freeze_event_id);
+    let (last_event_id, stdout) = deliver_freeze_messages(db, instance_name, freeze_event_id);
 
     let mut updates = serde_json::Map::new();
     updates.insert("last_event_id".into(), serde_json::json!(last_event_id));
-    instances::update_instance_position(db, &instance_name, &updates);
+    instances::update_instance_position(db, instance_name, &updates);
 
     stdout
 }
@@ -1297,6 +1549,7 @@ fn handle_notify(
 fn handle_sessionend(
     db: &HcomDb,
     instance_name: &str,
+    session_id: &str,
     raw: &Value,
     updates: &serde_json::Map<String, Value>,
 ) -> (i32, String) {
@@ -1314,82 +1567,66 @@ fn handle_sessionend(
             Some(updates)
         },
     );
+
+    // Root session is over: no more children can spawn under any of its
+    // prompt_id mappings (see `spawn_owner_kv_key`), no further resumes can
+    // arrive for its agent_ids (see `agent_owner_kv_key`), and no further
+    // SubagentStop invocations can fire for it (see `subagent_stop_claim_key`).
+    // None of these can be cleaned up incrementally as they're used (parallel
+    // siblings sharing one prompt_id would race a later SubagentStart against
+    // an earlier sibling's cleanup — see `end_task`; a resumed agent_id needs
+    // its mapping to *outlive* its own stop; a stop claim needs to survive
+    // exactly as long as its invocation could possibly be duplicated), so the
+    // whole session's worth of each is swept here instead. A session that
+    // ends without this hook firing (crash, `hcom kill`) just leaves harmless
+    // unreachable entries.
+    for (label, prefix) in [
+        ("spawn_owner", spawn_owner_kv_prefix(session_id)),
+        ("agent_owner", agent_owner_kv_prefix(session_id)),
+        (
+            "subagent_stop_claim",
+            subagent_stop_claim_prefix(session_id),
+        ),
+    ] {
+        if let Err(e) = db.kv_delete_prefix(&prefix) {
+            log::log_warn(
+                "hooks",
+                "sessionend.kv_cleanup_failed",
+                &format!("kind={} session_id={} err={}", label, session_id, e),
+            );
+        }
+    }
+
     (0, String::new())
 }
 
-/// Track subagent in parent's running_tasks.
-fn track_subagent(db: &HcomDb, parent_session_id: &str, agent_id: &str, agent_type: &str) {
+/// Track subagent in `parent_instance`'s running_tasks. `parent_instance` is
+/// the already-resolved spawning actor (root or a nested subagent — see
+/// `resolve_spawn_owner`), not derived from session_id here.
+fn track_subagent(db: &HcomDb, parent_instance: &str, agent_id: &str, agent_type: &str) {
     log::log_info(
         "hooks",
         "track_subagent.enter",
         &format!(
-            "session_id={} agent_id={} agent_type={}",
-            parent_session_id, agent_id, agent_type
+            "parent={} agent_id={} agent_type={}",
+            parent_instance, agent_id, agent_type
         ),
     );
 
-    let instance_name = match db.get_session_binding(parent_session_id) {
-        Ok(Some(name)) => name,
-        _ => return,
-    };
-
-    let instance_data = match db.get_instance_full(&instance_name) {
-        Ok(Some(data)) => data,
-        _ => return,
-    };
-
-    let mut running_tasks = instances::parse_running_tasks(instance_data.running_tasks.as_deref());
-    running_tasks.active = true;
-
-    // Add subagent if not already tracked
-    let already_tracked = running_tasks
-        .subagents
-        .iter()
-        .any(|s| s.get("agent_id").and_then(|v| v.as_str()) == Some(agent_id));
-
-    if !already_tracked {
-        running_tasks.subagents.push(serde_json::json!({
-            "agent_id": agent_id,
-            "type": agent_type,
-        }));
-        let rt_json = serde_json::json!({
-            "active": running_tasks.active,
-            "subagents": running_tasks.subagents,
-        });
-        let mut updates = serde_json::Map::new();
-        updates.insert("running_tasks".into(), Value::String(rt_json.to_string()));
-        instances::update_instance_position(db, &instance_name, &updates);
-    }
+    // Dedup-check-and-insert happens inside the transaction (see
+    // `mutate_running_tasks`), so concurrent SubagentStart hooks for sibling
+    // subagents of the same parent (parallel Task calls) cannot race and
+    // silently drop each other's entry.
+    instances::mutate_running_tasks(db, parent_instance, |rt| {
+        rt.track_subagent(agent_id, agent_type);
+    });
 }
 
 /// Remove subagent from parent's running_tasks.
 fn remove_subagent_from_parent(db: &HcomDb, parent_name: &str, agent_id: &str) {
-    let parent_data = match db.get_instance_full(parent_name) {
-        Ok(Some(data)) => data,
-        _ => return,
-    };
-
-    let mut running_tasks = instances::parse_running_tasks(parent_data.running_tasks.as_deref());
-
-    if running_tasks.subagents.is_empty() {
-        return;
-    }
-
-    running_tasks
-        .subagents
-        .retain(|s| s.get("agent_id").and_then(|v| v.as_str()) != Some(agent_id));
-
-    if running_tasks.subagents.is_empty() {
-        running_tasks.active = false;
-    }
-
-    let rt_json = serde_json::json!({
-        "active": running_tasks.active,
-        "subagents": running_tasks.subagents,
+    instances::mutate_running_tasks(db, parent_name, |rt| {
+        rt.remove_subagent(agent_id);
     });
-    let mut updates = serde_json::Map::new();
-    updates.insert("running_tasks".into(), Value::String(rt_json.to_string()));
-    instances::update_instance_position(db, parent_name, &updates);
 }
 
 /// Maximum depth when searching for nested subagent transcripts.
@@ -1583,7 +1820,7 @@ fn cleanup_dead_subagents(db: &HcomDb, session_id: &str, transcript_path: &str) 
 }
 
 /// SubagentStart: surface agent_id to subagent.
-fn subagent_start(raw: &Value) -> Option<Value> {
+fn build_subagent_start_output(raw: &Value) -> Option<Value> {
     let agent_id = raw.get("agent_id").and_then(|v| v.as_str())?;
     if agent_id.is_empty() {
         return None;
@@ -1611,22 +1848,35 @@ fn subagent_start(raw: &Value) -> Option<Value> {
 ///
 /// Idempotent: calls into `allocate_subagent_instance`, which returns the
 /// existing row's name if one already exists for this agent_id.
-fn ensure_subagent_row(db: &HcomDb, parent_session_id: &str, agent_id: &str, agent_type: &str) {
-    let parent_name = match db.get_session_binding(parent_session_id) {
-        Ok(Some(name)) => name,
-        _ => return,
-    };
-    let parent_data = match db.get_instance_full(&parent_name) {
+///
+/// `parent_instance` (the row's `parent_name`) is the already-resolved
+/// spawning actor, which may be a nested subagent — see
+/// `resolve_spawn_owner`. `root_session_id` is always the real Claude
+/// session_id (the root's own), never a subagent's, because subagent rows
+/// never get their own `session_id` (see `allocate_subagent_instance`) — it
+/// is the only value the `parent_session_id` FK column (`REFERENCES
+/// instances(session_id)`) can ever validly point at, at any nesting depth.
+/// Allocate this subagent's `instances` row. Returns `true` once a row exists
+/// and the actor is addressable (allocation is idempotent, so an already-present
+/// row also counts), `false` if the parent is unknown or allocation failed.
+fn ensure_subagent_row(
+    db: &HcomDb,
+    parent_instance: &str,
+    root_session_id: &str,
+    agent_id: &str,
+    agent_type: &str,
+) -> bool {
+    let parent_data = match db.get_instance_full(parent_instance) {
         Ok(Some(data)) => data,
-        _ => return,
+        _ => return false,
     };
     let parent_tag = parent_data.tag.as_deref();
 
     let alloc = instance_names::SubagentAllocation {
         agent_id,
         agent_type,
-        parent_name: &parent_name,
-        parent_session_id: Some(parent_session_id),
+        parent_name: parent_instance,
+        parent_session_id: Some(root_session_id),
         parent_tag,
         status: ST_INACTIVE,
         status_context: Some("subagent:dormant"),
@@ -1639,9 +1889,10 @@ fn ensure_subagent_row(db: &HcomDb, parent_session_id: &str, agent_id: &str, age
                 "subagent.row.ensured",
                 &format!(
                     "name={} parent={} agent_id={} type={}",
-                    name, parent_name, agent_id, agent_type
+                    name, parent_instance, agent_id, agent_type
                 ),
             );
+            true
         }
         Err(e) => {
             log::log_warn(
@@ -1649,7 +1900,84 @@ fn ensure_subagent_row(db: &HcomDb, parent_session_id: &str, agent_id: &str, age
                 "subagent.row.alloc_failed",
                 &format!("agent_id={} err={}", agent_id, e),
             );
+            false
         }
+    }
+}
+
+/// Deterministic, bounded fingerprint of a raw hook payload for use inside a
+/// SQLite key. Payloads can carry unbounded fields (e.g. a transcript
+/// excerpt), so the payload itself must never be embedded directly into a
+/// key — hash it instead. Not for cryptographic use, just content-addressing
+/// two invocations as "the same bytes" or not.
+fn hash_raw_payload(raw: &Value) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(raw.to_string().as_bytes());
+    let hash = hasher.finalize();
+    hash.iter().map(|b| format!("{b:02x}")).take(16).collect()
+}
+
+/// kv-table key claiming exactly-once processing for *one specific*
+/// SubagentStop invocation — not the agent_id alone, and not `prompt_id`
+/// alone either. Claude legitimately re-fires SubagentStop for the same
+/// agent_id (and, as far as we've established, possibly the same
+/// `prompt_id` too — SubagentStop is explicitly designed to fire again after
+/// an exit_code=2 delivery within the same agent prompt/continuation, and we
+/// have not confirmed Claude changes `prompt_id` for that re-fire) across the
+/// message-poll loop and on resume, so a claim keyed on either alone risks
+/// wrongly suppressing a later, genuinely different stop. The full raw
+/// payload is hashed instead: two hook registrations firing the *identical*
+/// event (e.g. hcom installed in both global and repo Claude settings, seen
+/// live) produce byte-identical stdin and collapse onto the same key, while
+/// any real difference between invocations (delivered message content,
+/// background/transcript state) changes the hash and gets its own key.
+/// `prompt_id` is folded in only as a readable, non-load-bearing component.
+fn subagent_stop_claim_key(root_session_id: &str, agent_id: &str, raw: &Value) -> String {
+    let prompt_id = raw.get("prompt_id").and_then(|v| v.as_str()).unwrap_or("");
+    format!(
+        "subagent_stop_claimed:{root_session_id}:{agent_id}:{prompt_id}:{}",
+        hash_raw_payload(raw)
+    )
+}
+
+/// kv-table key prefix covering every SubagentStop claim for one root
+/// session. See `handle_sessionend`.
+fn subagent_stop_claim_prefix(root_session_id: &str) -> String {
+    format!("subagent_stop_claimed:{root_session_id}:")
+}
+
+/// Transient claim that prevents concurrent duplicate SubagentStop hooks from
+/// polling or tearing down the same actor at the same time. The claim is
+/// released on drop so a later, distinct stop with identical content can run.
+struct SubagentStopClaim<'a> {
+    db: &'a HcomDb,
+    key: String,
+}
+
+impl<'a> SubagentStopClaim<'a> {
+    fn acquire(db: &'a HcomDb, root_session_id: &str, agent_id: &str, raw: &Value) -> Option<Self> {
+        let key = subagent_stop_claim_key(root_session_id, agent_id, raw);
+        let claimed = db
+            .conn()
+            .execute(
+                "INSERT OR IGNORE INTO kv (key, value) VALUES (?, '1')",
+                rusqlite::params![key],
+            )
+            // Fail open rather than leave a stopped actor wedged by a DB error.
+            .map(|inserted| inserted > 0)
+            .unwrap_or(true);
+
+        claimed.then_some(Self { db, key })
+    }
+}
+
+impl Drop for SubagentStopClaim<'_> {
+    fn drop(&mut self) {
+        let _ = self
+            .db
+            .conn()
+            .execute("DELETE FROM kv WHERE key = ?", rusqlite::params![self.key]);
     }
 }
 
@@ -1657,7 +1985,7 @@ fn ensure_subagent_row(db: &HcomDb, parent_session_id: &str, agent_id: &str, age
 ///
 /// Returns (exit_code, stdout). exit_code=2 means message delivered
 /// (SubagentStop fires again). exit_code=0 means cleanup and stop.
-fn subagent_stop(db: &HcomDb, raw: &Value, session_id: &str) -> (i32, String) {
+fn subagent_stop(db: &HcomDb, root_session_id: &str, raw: &Value) -> (i32, String) {
     let agent_id = match raw.get("agent_id").and_then(|v| v.as_str()) {
         Some(id) if !id.is_empty() => id,
         _ => return (0, String::new()),
@@ -1683,11 +2011,17 @@ fn subagent_stop(db: &HcomDb, raw: &Value, session_id: &str) -> (i32, String) {
 
     let Some((subagent_name, existing_transcript, parent_name, name_announced)) = row else {
         // No instance = SubagentStart never allocated one (shouldn't happen for
-        // in-ctx subagents, but kept as a defensive fallback). Clean up the
-        // parent's running_tasks entry so it doesn't wedge active.
-        if let Ok(Some(parent)) = db.get_session_binding(session_id) {
-            remove_subagent_from_parent(db, &parent, agent_id);
-        }
+        // in-ctx subagents, but kept as a defensive fallback). The tracking
+        // entry could be on the session-bound root *or* a nested subagent
+        // that spawned this one (see `resolve_spawn_owner`) — scan for
+        // whichever instance actually tracks `agent_id` rather than assuming
+        // root, or the true owner is left wedged active forever.
+        instances::remove_tracked_subagent_by_agent_id(db, agent_id);
+        return (0, String::new());
+    };
+
+    // A duplicate delivery must not enter polling or teardown.
+    let Some(_stop_claim) = SubagentStopClaim::acquire(db, root_session_id, agent_id, raw) else {
         return (0, String::new());
     };
 
@@ -2712,7 +3046,7 @@ mod tests {
     #[test]
     fn test_subagent_start_with_agent_id() {
         let raw = serde_json::json!({"agent_id": "agent-uuid-123"});
-        let result = subagent_start(&raw);
+        let result = build_subagent_start_output(&raw);
         assert!(result.is_some());
         let output = result.unwrap();
         let ctx = output["hookSpecificOutput"]["additionalContext"]
@@ -2724,13 +3058,13 @@ mod tests {
     #[test]
     fn test_subagent_start_no_agent_id() {
         let raw = serde_json::json!({});
-        assert!(subagent_start(&raw).is_none());
+        assert!(build_subagent_start_output(&raw).is_none());
     }
 
     #[test]
     fn test_subagent_start_empty_agent_id() {
         let raw = serde_json::json!({"agent_id": ""});
-        assert!(subagent_start(&raw).is_none());
+        assert!(build_subagent_start_output(&raw).is_none());
     }
 
     #[test]
@@ -3681,5 +4015,1474 @@ mod tests {
         assert!(verify_claude_hooks_installed(Some(&settings_path), true));
 
         drop(_guard);
+    }
+
+    // ---- Hook-actor routing (raw.agent_id, not running_tasks.active) ----
+    //
+    // These are dispatcher-level tests: they drive `route_claude_hook` itself
+    // (the function `dispatch_claude_hook` calls after reading stdin), not the
+    // individual handler functions, because the bug class here is a routing
+    // bug — which branch a given hook payload falls into — not a bug inside
+    // any one handler. They need `isolated_test_env()` because
+    // `route_claude_hook` exercises real log::log_info call sites (start_task,
+    // track_subagent, sessionstart, ...), which resolve the hcom log path
+    // through the global `Config`; without isolation that would touch the
+    // real `~/.hcom` of whatever machine runs the test.
+
+    fn make_ctx() -> HcomContext {
+        HcomContext::from_env(&std::collections::HashMap::new(), PathBuf::from("/tmp"))
+    }
+
+    fn make_isolated_test_db() -> (tempfile::TempDir, EnvGuard, HcomDb) {
+        let (dir, hcom_dir, _test_home, guard) = isolated_test_env();
+        let db = HcomDb::open_raw(&hcom_dir.join("test.db")).unwrap();
+        db.init_db().unwrap();
+        (dir, guard, db)
+    }
+
+    /// Same fixture as `make_delivery_test_db` (instance 'nova' + a pending
+    /// broadcast message from 'luna'), but under `isolated_test_env()` so
+    /// dispatcher-level tests that log are safe to run.
+    fn make_isolated_delivery_test_db() -> (tempfile::TempDir, EnvGuard, HcomDb) {
+        let (dir, guard, db) = make_isolated_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, tool, status, status_context, status_time, created_at, last_event_id)
+                 VALUES ('nova', 'sess-1', 'claude', 'listening', 'start', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO events (type, timestamp, instance, data)
+                 VALUES ('message', '2026-01-01T00:00:00Z', 'luna', '{\"from\":\"luna\",\"text\":\"hello\",\"scope\":\"broadcast\"}')",
+                [],
+            )
+            .unwrap();
+        (dir, guard, db)
+    }
+
+    /// `root_session_id` matches what real `ensure_subagent_row`-created rows
+    /// carry as `parent_session_id` (always the true root session_id, at any
+    /// nesting depth — see its doc comment), so fixtures built with this
+    /// helper pass `validate_spawn_owner`'s hierarchy check the same way a
+    /// real row would.
+    fn insert_subagent_row(
+        db: &HcomDb,
+        name: &str,
+        agent_id: &str,
+        parent_name: &str,
+        root_session_id: &str,
+    ) {
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, status_context, status_time, created_at, last_event_id, agent_id, parent_name, parent_session_id)
+                 VALUES (?, 'claude', 'active', 'subagent', 0, 0, 0, ?, ?, ?)",
+                rusqlite::params![name, agent_id, parent_name, root_session_id],
+            )
+            .unwrap();
+    }
+
+    /// Property: a subagent PostToolUse whose agent_id has no resolvable
+    /// `instances` row (SubagentStart's row allocation is best-effort and may
+    /// not have happened, or the row is gone) must never deliver anything —
+    /// and, critically, must never fall through to root/parent delivery.
+    /// Row absence is identity state, not proof that the actor is the root.
+    #[test]
+    #[serial]
+    fn test_subagent_posttooluse_unknown_row_never_falls_through_to_parent() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_delivery_test_db();
+        db.set_session_binding("sess-1", "nova").unwrap();
+        // Parent tracks an agent_id that never got an instances row.
+        db.conn()
+            .execute(
+                "UPDATE instances SET running_tasks = ? WHERE name = 'nova'",
+                rusqlite::params![
+                    r#"{"active":true,"subagents":[{"agent_id":"ghost-agent","type":"general"}]}"#
+                ],
+            )
+            .unwrap();
+
+        let raw = serde_json::json!({
+            "session_id": "sess-1",
+            "agent_id": "ghost-agent",
+            "tool_name": "Bash",
+            "tool_input": {"command": "hcom send --name ghost-agent -- hi"},
+        });
+        let mut payload = HookPayload::from_claude(raw);
+        let ctx = make_ctx();
+        let (exit_code, stdout, ack, _timing) =
+            route_claude_hook(&db, &ctx, HOOK_POST, &mut payload);
+
+        assert_eq!(exit_code, 0);
+        assert!(
+            stdout.is_empty(),
+            "unknown subagent actor must not deliver anything, got: {stdout}"
+        );
+        assert!(ack.is_none());
+        // nova's own pending broadcast must remain untouched — no fallthrough.
+        assert_eq!(delivery_cursor(&db), 0);
+    }
+
+    /// Property: a subagent-context hook whose row *does* resolve, but which
+    /// doesn't match any actionable branch (e.g. an ordinary Edit tool call),
+    /// stays a silent no-op rather than falling through to parent handling.
+    #[test]
+    #[serial]
+    fn test_subagent_hook_unrelated_tool_stays_silent() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, tool, status, status_context, status_time, created_at, last_event_id)
+                 VALUES ('nova', 'sess-1', 'claude', 'listening', 'start', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        db.set_session_binding("sess-1", "nova").unwrap();
+        insert_subagent_row(&db, "nova_task_1", "sub-agent-1", "nova", "sess-1");
+
+        let raw = serde_json::json!({
+            "session_id": "sess-1",
+            "agent_id": "sub-agent-1",
+            "tool_name": "Edit",
+            "tool_input": {"file_path": "/tmp/x"},
+        });
+        let mut payload = HookPayload::from_claude(raw);
+        let ctx = make_ctx();
+        let (exit_code, stdout, ack, _timing) =
+            route_claude_hook(&db, &ctx, HOOK_POST, &mut payload);
+
+        assert_eq!(exit_code, 0);
+        assert!(stdout.is_empty());
+        assert!(ack.is_none());
+    }
+
+    /// Property: stopping a nested native parent must recursively tear down its
+    /// own children. Native subagent rows carry session_id=NULL and inherit the
+    /// root session as parent_session_id, so the session-keyed teardown cascade
+    /// never links a nested parent to its children — only parent_name does.
+    /// Without the parent_name cascade, stopping parent A would delete A while
+    /// its child B stayed alive, reparented to a reusable name.
+    #[test]
+    #[serial]
+    fn test_stop_nested_parent_cascades_to_children() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, tool, status, status_context, status_time, created_at, last_event_id)
+                 VALUES ('nova', 'sess-1', 'claude', 'listening', 'start', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        db.set_session_binding("sess-1", "nova").unwrap();
+        // A is a native subagent of root nova; B is a native subagent of A.
+        // Both share the root session as parent_session_id and have no session
+        // of their own (session_id=NULL, as insert_subagent_row leaves it).
+        insert_subagent_row(&db, "nova_a_1", "agent-a", "nova", "sess-1");
+        insert_subagent_row(&db, "nova_a_1_b_1", "agent-b", "nova_a_1", "sess-1");
+
+        crate::hooks::stop_instance(&db, "nova_a_1", "test", "task_completed");
+
+        assert!(
+            db.get_instance_by_agent_id("agent-a").unwrap().is_none(),
+            "nested parent A must be torn down"
+        );
+        assert!(
+            db.get_instance_by_agent_id("agent-b").unwrap().is_none(),
+            "child B must be cascaded, not orphaned with parent_name=A"
+        );
+        assert!(
+            db.get_instance_full("nova").unwrap().is_some(),
+            "the still-live root must not be touched"
+        );
+    }
+
+    /// Property: the root's own PostToolUse must deliver even while a
+    /// genuinely live background subagent is tracked active. Since Claude
+    /// Code 2.1.198, Agent calls background by default, so the root can have
+    /// its own interleaved tool calls while a subagent still runs — gating
+    /// root delivery on `running_tasks.active` (the pre-existing design)
+    /// would freeze the parent for that whole window.
+    #[test]
+    #[serial]
+    fn test_root_posttooluse_delivers_while_subagent_active() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_delivery_test_db();
+        db.set_session_binding("sess-1", "nova").unwrap();
+        insert_subagent_row(&db, "nova_task_1", "live-agent-1", "nova", "sess-1");
+        db.conn()
+            .execute(
+                "UPDATE instances SET running_tasks = ? WHERE name = 'nova'",
+                rusqlite::params![
+                    r#"{"active":true,"subagents":[{"agent_id":"live-agent-1","type":"general"}]}"#
+                ],
+            )
+            .unwrap();
+
+        // Root's own PostToolUse — no agent_id: this genuinely is nova's own
+        // tool call, not a hook firing inside the live subagent.
+        let raw = serde_json::json!({
+            "session_id": "sess-1",
+            "tool_name": "Read",
+            "tool_input": {},
+        });
+        let mut payload = HookPayload::from_claude(raw);
+        let ctx = make_ctx();
+        let (_exit_code, stdout, ack, _timing) =
+            route_claude_hook(&db, &ctx, HOOK_POST, &mut payload);
+
+        assert!(
+            !stdout.is_empty(),
+            "root PostToolUse must deliver even while a background subagent is active"
+        );
+        assert!(stdout.contains("hello"));
+        assert!(ack.is_some());
+    }
+
+    /// Property: a nested Agent/Task PreToolUse — one that fires *inside* a
+    /// subagent's own execution context because that subagent itself called
+    /// the Agent tool — must mark the spawning subagent's own running_tasks
+    /// active, not the root parent's. Parent and every nested subagent share
+    /// the same Claude session_id, so resolving the actor via
+    /// `get_session_binding(session_id)` (the pre-existing design) always
+    /// lands on the root regardless of which level actually spawned the call.
+    #[test]
+    #[serial]
+    fn test_nested_task_pre_updates_subagent_not_root() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, tool, status, status_context, status_time, created_at, last_event_id)
+                 VALUES ('nova', 'sess-1', 'claude', 'listening', 'start', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        db.set_session_binding("sess-1", "nova").unwrap();
+        insert_subagent_row(&db, "nova_task_1", "sub-agent-1", "nova", "sess-1");
+
+        let raw = serde_json::json!({
+            "session_id": "sess-1",
+            "agent_id": "sub-agent-1",
+            "tool_name": "Task",
+            "tool_input": {"prompt": "spawn a nested helper"},
+        });
+        let mut payload = HookPayload::from_claude(raw);
+        let ctx = make_ctx();
+        let _ = route_claude_hook(&db, &ctx, HOOK_PRE, &mut payload);
+
+        let sub_rt = instances::parse_running_tasks(
+            db.get_instance_full("nova_task_1")
+                .unwrap()
+                .unwrap()
+                .running_tasks
+                .as_deref(),
+        );
+        assert!(
+            sub_rt.active,
+            "the spawning subagent's own running_tasks must be marked active"
+        );
+
+        let root_rt = instances::parse_running_tasks(
+            db.get_instance_full("nova")
+                .unwrap()
+                .unwrap()
+                .running_tasks
+                .as_deref(),
+        );
+        assert!(
+            !root_rt.active,
+            "the root parent's running_tasks must not be touched by a nested Task call"
+        );
+    }
+
+    /// Property: PostToolUse for the Agent/Task tool fires with
+    /// `tool_response.status == "async_launched"` when Claude merely
+    /// dispatched the call to the background (default since Claude Code
+    /// 2.1.198) — this is not completion, so it must not deliver a
+    /// "Subagents have finished" summary and must not advance the delivery
+    /// cursor. Foreground completion is covered separately by
+    /// `test_task_posttooluse_foreground_completed_delivers`.
+    #[test]
+    #[serial]
+    fn test_task_posttooluse_async_launch_skips_delivery() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_delivery_test_db();
+        db.set_session_binding("sess-1", "nova").unwrap();
+        let ctx = make_ctx();
+
+        let raw_async = serde_json::json!({
+            "session_id": "sess-1",
+            "tool_name": "Agent",
+            "tool_response": {"status": "async_launched"},
+        });
+        let mut payload_async = HookPayload::from_claude(raw_async);
+        let (_exit_code, stdout_async, ack_async, _timing) =
+            route_claude_hook(&db, &ctx, HOOK_POST, &mut payload_async);
+        assert!(
+            stdout_async.is_empty(),
+            "async_launched must not be treated as Task completion, got: {stdout_async}"
+        );
+        assert!(ack_async.is_none());
+        assert_eq!(
+            delivery_cursor(&db),
+            0,
+            "async_launched must not advance the delivery cursor"
+        );
+    }
+
+    /// Property: a foreground (synchronous, non-backgrounded) Agent/Task
+    /// PostToolUse — no `async_launched` status — is a genuine completion and
+    /// must deliver freeze-period messages normally. Independent of the
+    /// async_launched test above: this is not "the same call, later", it's
+    /// the separately-exercised foreground path.
+    #[test]
+    #[serial]
+    fn test_task_posttooluse_foreground_completed_delivers() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_delivery_test_db();
+        db.set_session_binding("sess-1", "nova").unwrap();
+        let ctx = make_ctx();
+
+        let raw_done = serde_json::json!({
+            "session_id": "sess-1",
+            "tool_name": "Agent",
+            "tool_response": {"status": "completed"},
+        });
+        let mut payload_done = HookPayload::from_claude(raw_done);
+        let (_exit_code, stdout_done, _ack, _timing) =
+            route_claude_hook(&db, &ctx, HOOK_POST, &mut payload_done);
+        assert!(
+            stdout_done.contains("hello"),
+            "a foreground Task completion must deliver freeze messages, got: {stdout_done}"
+        );
+        assert!(delivery_cursor(&db) > 0);
+    }
+
+    /// Property: the `--name` a subagent passes to a Bash hcom command must
+    /// match the agent_id Claude itself stamped on this hook (raw.agent_id),
+    /// or one subagent could spoof another's `--name` and read its inbox.
+    #[test]
+    #[serial]
+    fn test_subagent_bash_name_mismatch_does_not_leak_other_inbox() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, tool, status, status_context, status_time, created_at, last_event_id)
+                 VALUES ('nova', 'sess-1', 'claude', 'listening', 'start', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        db.set_session_binding("sess-1", "nova").unwrap();
+        insert_subagent_row(&db, "nova_task_1", "agent-a", "nova", "sess-1");
+        insert_subagent_row(&db, "nova_task_2", "agent-b", "nova", "sess-1");
+        // A direct mention pending for subagent B's inbox only.
+        db.conn()
+            .execute(
+                "INSERT INTO events (type, timestamp, instance, data)
+                 VALUES ('message', '2026-01-01T00:00:00Z', 'luna', '{\"from\":\"luna\",\"text\":\"secret for b\",\"scope\":\"mentions\",\"mentions\":[\"nova_task_2\"]}')",
+                [],
+            )
+            .unwrap();
+        let ctx = make_ctx();
+
+        // Hook fires inside subagent A's own context (agent_id=agent-a), but
+        // the Bash command spoofs --name agent-b.
+        let raw_spoof = serde_json::json!({
+            "session_id": "sess-1",
+            "agent_id": "agent-a",
+            "tool_name": "Bash",
+            "tool_input": {"command": "hcom send --name agent-b -- hi"},
+        });
+        let mut payload_spoof = HookPayload::from_claude(raw_spoof);
+        let (exit_code, stdout, ack, _timing) =
+            route_claude_hook(&db, &ctx, HOOK_POST, &mut payload_spoof);
+        assert_eq!(exit_code, 0);
+        assert!(
+            stdout.is_empty(),
+            "mismatched --name must not deliver another subagent's inbox, got: {stdout}"
+        );
+        assert!(ack.is_none());
+
+        // The legitimate case still works: agent_id and --name match.
+        let raw_ok = serde_json::json!({
+            "session_id": "sess-1",
+            "agent_id": "agent-b",
+            "tool_name": "Bash",
+            "tool_input": {"command": "hcom send --name agent-b -- hi"},
+        });
+        let mut payload_ok = HookPayload::from_claude(raw_ok);
+        let (_exit_code, stdout_ok, ack_ok, _timing) =
+            route_claude_hook(&db, &ctx, HOOK_POST, &mut payload_ok);
+        assert!(
+            stdout_ok.contains("secret for b"),
+            "matching --name must deliver its own inbox, got: {stdout_ok}"
+        );
+        assert!(ack_ok.is_some());
+    }
+
+    /// Property: `running_tasks` is a whole-JSON-blob column mutated by
+    /// separate hook processes (each hook invocation opens its own DB
+    /// connection). Concurrent SubagentStart hooks for sibling subagents of
+    /// the same parent (parallel Task calls) must not race a plain
+    /// read-then-write into a lost update.
+    #[test]
+    #[serial]
+    fn test_mutate_running_tasks_concurrent_tracking_no_lost_updates() {
+        crate::config::Config::init();
+        let (_dir, hcom_dir, _test_home, _guard) = isolated_test_env();
+        let db_path = hcom_dir.join("test.db");
+        let db = HcomDb::open_raw(&db_path).unwrap();
+        db.init_db().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, status_context, status_time, created_at, last_event_id)
+                 VALUES ('nova', 'claude', 'listening', 'start', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+
+        let n: usize = 8;
+        let handles: Vec<_> = (0..n)
+            .map(|i| {
+                let path = db_path.clone();
+                std::thread::spawn(move || {
+                    let db = HcomDb::open_raw(&path).unwrap();
+                    track_subagent(&db, "nova", &format!("agent-{i}"), "general");
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let rt = instances::parse_running_tasks(
+            db.get_instance_full("nova")
+                .unwrap()
+                .unwrap()
+                .running_tasks
+                .as_deref(),
+        );
+        assert_eq!(
+            rt.subagents.len(),
+            n,
+            "concurrent SubagentStart tracking must not lose sibling entries to a read-modify-write race, got {:?}",
+            rt.subagents
+        );
+        assert!(rt.active);
+        for i in 0..n {
+            let want = format!("agent-{i}");
+            assert!(
+                rt.subagents
+                    .iter()
+                    .any(|s| s.get("agent_id").and_then(|v| v.as_str()) == Some(want.as_str())),
+                "missing {want}"
+            );
+        }
+    }
+
+    /// Property: concurrent SubagentStop-driven removals for sibling
+    /// subagents must not race a plain read-then-write into a lost update
+    /// either — an entry silently surviving a lost removal is exactly what
+    /// leaves `running_tasks.active` stuck true (the original stale-freeze
+    /// symptom).
+    #[test]
+    #[serial]
+    fn test_mutate_running_tasks_concurrent_removal_no_lost_updates() {
+        crate::config::Config::init();
+        let (_dir, hcom_dir, _test_home, _guard) = isolated_test_env();
+        let db_path = hcom_dir.join("test.db");
+        let db = HcomDb::open_raw(&db_path).unwrap();
+        db.init_db().unwrap();
+
+        let n: usize = 8;
+        let subagents: Vec<serde_json::Value> = (0..n)
+            .map(|i| serde_json::json!({"agent_id": format!("agent-{i}"), "type": "general"}))
+            .collect();
+        let rt_json = serde_json::json!({"active": true, "subagents": subagents});
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, status_context, status_time, created_at, last_event_id, running_tasks)
+                 VALUES ('nova', 'claude', 'listening', 'start', 0, 0, 0, ?)",
+                rusqlite::params![rt_json.to_string()],
+            )
+            .unwrap();
+
+        let handles: Vec<_> = (0..n)
+            .map(|i| {
+                let path = db_path.clone();
+                std::thread::spawn(move || {
+                    let db = HcomDb::open_raw(&path).unwrap();
+                    remove_subagent_from_parent(&db, "nova", &format!("agent-{i}"));
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let rt = instances::parse_running_tasks(
+            db.get_instance_full("nova")
+                .unwrap()
+                .unwrap()
+                .running_tasks
+                .as_deref(),
+        );
+        assert!(
+            rt.subagents.is_empty(),
+            "concurrent removal must not lose sibling removals to a read-modify-write race, got {:?}",
+            rt.subagents
+        );
+        assert!(!rt.active);
+    }
+
+    /// Property: every Claude subagent carries `agent_id` on its hooks
+    /// regardless of whether its root ever ran `hcom start` — that's a
+    /// property of Claude's hook schema, not of hcom participation.
+    /// SubagentStart must stay a silent no-op (no `hcom start --name ...`
+    /// hint, no allocated row, no running_tasks mutation) when the shared
+    /// session_id has no hcom root binding at all.
+    #[test]
+    #[serial]
+    fn test_subagent_start_nonparticipant_root_stays_silent() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        // No session binding: "sess-1" is not an hcom participant.
+
+        let raw = serde_json::json!({
+            "session_id": "sess-1",
+            "agent_id": "child-1",
+            "agent_type": "general",
+        });
+        let mut payload = HookPayload::from_claude(raw);
+        let ctx = make_ctx();
+        let (exit_code, stdout, ack, _timing) =
+            route_claude_hook(&db, &ctx, HOOK_SUBAGENT_START, &mut payload);
+
+        assert_eq!(exit_code, 0);
+        assert!(
+            stdout.is_empty(),
+            "nonparticipant SubagentStart must not inject an hcom hint, got: {stdout}"
+        );
+        assert!(ack.is_none());
+        assert!(
+            db.get_instance_by_agent_id("child-1").unwrap().is_none(),
+            "nonparticipant SubagentStart must not allocate an instances row"
+        );
+    }
+
+    /// Property: a SubagentStart's own `agent_id` names the *new* child, not
+    /// who spawned it, so a nested spawn (subagent A calling the Agent tool)
+    /// can only be attributed correctly via the `prompt_id` Claude repeats
+    /// across the spawning PreToolUse and the resulting SubagentStart(s) (see
+    /// `resolve_spawn_owner`). Covers the full sequence: nested Pre on A,
+    /// then SubagentStart for child B with a matching prompt_id, must
+    /// attribute B to A (not root) — and a genuinely top-level spawn (root's
+    /// own Pre, no agent_id) must still attribute to root.
+    #[test]
+    #[serial]
+    fn test_nested_subagent_start_resolves_via_prompt_id_not_root() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, tool, status, status_context, status_time, created_at, last_event_id, running_tasks)
+                 VALUES ('nova', 'sess-1', 'claude', 'listening', 'start', 0, 0, 0, ?)",
+                rusqlite::params![
+                    r#"{"active":true,"subagents":[{"agent_id":"agent-a","type":"general"}]}"#
+                ],
+            )
+            .unwrap();
+        db.set_session_binding("sess-1", "nova").unwrap();
+        insert_subagent_row(&db, "nova_task_1", "agent-a", "nova", "sess-1");
+        let ctx = make_ctx();
+
+        // Nested Task PreToolUse fires *inside* subagent A (agent_id=agent-a),
+        // carrying the prompt_id Claude repeats on the SubagentStart for the
+        // child it spawns.
+        let raw_pre = serde_json::json!({
+            "session_id": "sess-1",
+            "agent_id": "agent-a",
+            "prompt_id": "p1",
+            "tool_name": "Task",
+            "tool_input": {"prompt": "spawn a nested helper"},
+        });
+        let mut payload_pre = HookPayload::from_claude(raw_pre);
+        let _ = route_claude_hook(&db, &ctx, HOOK_PRE, &mut payload_pre);
+
+        // SubagentStart for the new child B: its own agent_id names B, not A
+        // — only the shared prompt_id says who spawned it.
+        let raw_start = serde_json::json!({
+            "session_id": "sess-1",
+            "agent_id": "agent-b",
+            "agent_type": "general",
+            "prompt_id": "p1",
+        });
+        let mut payload_start = HookPayload::from_claude(raw_start);
+        let _ = route_claude_hook(&db, &ctx, HOOK_SUBAGENT_START, &mut payload_start);
+
+        let b_name = db.get_instance_by_agent_id("agent-b").unwrap().unwrap();
+        let b_row = db.get_instance_full(&b_name).unwrap().unwrap();
+        assert_eq!(
+            b_row.parent_name.as_deref(),
+            Some("nova_task_1"),
+            "the nested child must be attributed to the spawning subagent, not root"
+        );
+
+        let a_rt = instances::parse_running_tasks(
+            db.get_instance_full("nova_task_1")
+                .unwrap()
+                .unwrap()
+                .running_tasks
+                .as_deref(),
+        );
+        assert!(
+            a_rt.subagents
+                .iter()
+                .any(|s| s.get("agent_id").and_then(|v| v.as_str()) == Some("agent-b")),
+            "the spawning subagent must track its own child"
+        );
+
+        let root_rt = instances::parse_running_tasks(
+            db.get_instance_full("nova")
+                .unwrap()
+                .unwrap()
+                .running_tasks
+                .as_deref(),
+        );
+        assert!(
+            !root_rt
+                .subagents
+                .iter()
+                .any(|s| s.get("agent_id").and_then(|v| v.as_str()) == Some("agent-b")),
+            "root must not be credited with a grandchild it never spawned"
+        );
+        assert_eq!(
+            root_rt.subagents.len(),
+            1,
+            "root's own directly-tracked subagent (A) must be untouched"
+        );
+
+        // A genuinely top-level spawn (root's own Pre, no agent_id) must
+        // still resolve via the same correlation to root itself.
+        let raw_pre2 = serde_json::json!({
+            "session_id": "sess-1",
+            "prompt_id": "p2",
+            "tool_name": "Task",
+            "tool_input": {"prompt": "spawn a top-level helper"},
+        });
+        let mut payload_pre2 = HookPayload::from_claude(raw_pre2);
+        let _ = route_claude_hook(&db, &ctx, HOOK_PRE, &mut payload_pre2);
+
+        let raw_start2 = serde_json::json!({
+            "session_id": "sess-1",
+            "agent_id": "agent-c",
+            "agent_type": "general",
+            "prompt_id": "p2",
+        });
+        let mut payload_start2 = HookPayload::from_claude(raw_start2);
+        let _ = route_claude_hook(&db, &ctx, HOOK_SUBAGENT_START, &mut payload_start2);
+
+        let c_name = db.get_instance_by_agent_id("agent-c").unwrap().unwrap();
+        let c_row = db.get_instance_full(&c_name).unwrap().unwrap();
+        assert_eq!(
+            c_row.parent_name.as_deref(),
+            Some("nova"),
+            "a genuinely top-level spawn must still attribute to root"
+        );
+    }
+
+    /// Property: a SubagentStart with no `prompt_id` field at all (Claude
+    /// Code < 2.1.196, where this correlation doesn't exist on the wire)
+    /// must still attach to root — the pre-2.1.196 legacy behavior, not
+    /// nested-spawn support.
+    #[test]
+    #[serial]
+    fn test_subagent_start_without_prompt_id_uses_legacy_root_attribution() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, tool, status, status_context, status_time, created_at, last_event_id)
+                 VALUES ('nova', 'sess-1', 'claude', 'listening', 'start', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        db.set_session_binding("sess-1", "nova").unwrap();
+
+        let raw = serde_json::json!({
+            "session_id": "sess-1",
+            "agent_id": "agent-legacy",
+            "agent_type": "general",
+        });
+        let mut payload = HookPayload::from_claude(raw);
+        let ctx = make_ctx();
+        let _ = route_claude_hook(&db, &ctx, HOOK_SUBAGENT_START, &mut payload);
+
+        let name = db
+            .get_instance_by_agent_id("agent-legacy")
+            .unwrap()
+            .unwrap();
+        let row = db.get_instance_full(&name).unwrap().unwrap();
+        assert_eq!(row.parent_name.as_deref(), Some("nova"));
+    }
+
+    /// Property: `prompt_id` is present (Claude Code >= 2.1.196) but no
+    /// mapping resolves — start_task's write hasn't landed yet, or never
+    /// will. Correlation failure must fail closed: no allocated row, no
+    /// running_tasks mutation anywhere (root included), no bootstrap hint.
+    /// Root is not a safe fallback here — unlike the no-`prompt_id`-at-all
+    /// case, a version that *does* send `prompt_id` and still misses means
+    /// something is actually wrong.
+    #[test]
+    #[serial]
+    fn test_subagent_start_with_prompt_id_but_no_mapping_fails_closed() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, tool, status, status_context, status_time, created_at, last_event_id)
+                 VALUES ('nova', 'sess-1', 'claude', 'listening', 'start', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        db.set_session_binding("sess-1", "nova").unwrap();
+        let ctx = make_ctx();
+
+        // No preceding Task/Agent PreToolUse ever recorded this prompt_id.
+        let raw = serde_json::json!({
+            "session_id": "sess-1",
+            "agent_id": "orphan-1",
+            "agent_type": "general",
+            "prompt_id": "p-missing",
+        });
+        let mut payload = HookPayload::from_claude(raw);
+        let (exit_code, stdout, ack, _timing) =
+            route_claude_hook(&db, &ctx, HOOK_SUBAGENT_START, &mut payload);
+
+        assert_eq!(exit_code, 0);
+        assert!(
+            stdout.is_empty(),
+            "an unresolved prompt_id must not inject an hcom hint, got: {stdout}"
+        );
+        assert!(ack.is_none());
+        assert!(
+            db.get_instance_by_agent_id("orphan-1").unwrap().is_none(),
+            "an unresolved prompt_id must not allocate an instances row"
+        );
+        let root_rt = instances::parse_running_tasks(
+            db.get_instance_full("nova")
+                .unwrap()
+                .unwrap()
+                .running_tasks
+                .as_deref(),
+        );
+        assert!(
+            root_rt.subagents.is_empty(),
+            "an unresolved prompt_id must not fall back to crediting root"
+        );
+    }
+
+    /// Property: multiple children spawned in parallel by one actor within
+    /// one turn share the same `prompt_id`. If an earlier sibling's own
+    /// Task/Agent PostToolUse completes *before* a later sibling's
+    /// SubagentStart arrives, the shared mapping must survive — completion
+    /// of one sibling must not delete a mapping the others still need (the
+    /// interleaving race `end_task` used to be vulnerable to when it deleted
+    /// the mapping per-completion; see `spawn_owner_kv_key`).
+    #[test]
+    #[serial]
+    fn test_parallel_siblings_survive_interleaved_sibling_completion() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, tool, status, status_context, status_time, created_at, last_event_id)
+                 VALUES ('nova', 'sess-1', 'claude', 'listening', 'start', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        db.set_session_binding("sess-1", "nova").unwrap();
+        let ctx = make_ctx();
+
+        // Root issues (what will become) two parallel Task calls in one
+        // turn — Claude stamps both with the same prompt_id.
+        let raw_pre = serde_json::json!({
+            "session_id": "sess-1",
+            "prompt_id": "p1",
+            "tool_name": "Task",
+            "tool_input": {"prompt": "spawn two parallel helpers"},
+        });
+        let mut payload_pre = HookPayload::from_claude(raw_pre);
+        let _ = route_claude_hook(&db, &ctx, HOOK_PRE, &mut payload_pre);
+
+        // First sibling starts.
+        let raw_start1 = serde_json::json!({
+            "session_id": "sess-1",
+            "agent_id": "agent-1",
+            "agent_type": "general",
+            "prompt_id": "p1",
+        });
+        let mut payload_start1 = HookPayload::from_claude(raw_start1);
+        let _ = route_claude_hook(&db, &ctx, HOOK_SUBAGENT_START, &mut payload_start1);
+
+        // That Task tool_use's own PostToolUse completes — interleaved
+        // *before* the second sibling's SubagentStart arrives.
+        let raw_post = serde_json::json!({
+            "session_id": "sess-1",
+            "prompt_id": "p1",
+            "tool_name": "Task",
+            "tool_response": {"status": "completed"},
+        });
+        let mut payload_post = HookPayload::from_claude(raw_post);
+        let _ = route_claude_hook(&db, &ctx, HOOK_POST, &mut payload_post);
+
+        // Second sibling starts, same shared prompt_id.
+        let raw_start2 = serde_json::json!({
+            "session_id": "sess-1",
+            "agent_id": "agent-2",
+            "agent_type": "general",
+            "prompt_id": "p1",
+        });
+        let mut payload_start2 = HookPayload::from_claude(raw_start2);
+        let _ = route_claude_hook(&db, &ctx, HOOK_SUBAGENT_START, &mut payload_start2);
+
+        let name1 = db.get_instance_by_agent_id("agent-1").unwrap().unwrap();
+        let name2 = db.get_instance_by_agent_id("agent-2").unwrap();
+        assert!(
+            name2.is_some(),
+            "the second sibling must still resolve its owner after the first sibling's PostToolUse completed"
+        );
+        let row1 = db.get_instance_full(&name1).unwrap().unwrap();
+        let row2 = db.get_instance_full(&name2.unwrap()).unwrap().unwrap();
+        assert_eq!(row1.parent_name.as_deref(), Some("nova"));
+        assert_eq!(
+            row2.parent_name.as_deref(),
+            Some("nova"),
+            "both siblings must attach to the same true owner despite the interleaved completion"
+        );
+    }
+
+    /// Property: spawn-owner mappings are cleaned up per-session at
+    /// SessionEnd (see `handle_sessionend`), not per-Task-completion — must
+    /// remove only the ending session's own keys, never another session's.
+    #[test]
+    #[serial]
+    fn test_sessionend_cleans_only_its_own_session_spawn_owner_keys() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, tool, status, status_context, status_time, created_at, last_event_id)
+                 VALUES ('nova', 'sess-1', 'claude', 'listening', 'start', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        db.set_session_binding("sess-1", "nova").unwrap();
+        let ctx = make_ctx();
+
+        db.kv_set(&spawn_owner_kv_key("sess-1", "p1"), Some("nova"))
+            .unwrap();
+        db.kv_set(&spawn_owner_kv_key("sess-other", "p1"), Some("other-root"))
+            .unwrap();
+
+        let raw = serde_json::json!({
+            "session_id": "sess-1",
+            "reason": "clear",
+        });
+        let mut payload = HookPayload::from_claude(raw);
+        let _ = route_claude_hook(&db, &ctx, HOOK_SESSIONEND, &mut payload);
+
+        assert!(
+            db.kv_get(&spawn_owner_kv_key("sess-1", "p1"))
+                .unwrap()
+                .is_none(),
+            "SessionEnd must clean up its own session's spawn-owner mappings"
+        );
+        assert_eq!(
+            db.kv_get(&spawn_owner_kv_key("sess-other", "p1")).unwrap(),
+            Some("other-root".to_string()),
+            "SessionEnd must not touch a different session's spawn-owner mappings"
+        );
+    }
+
+    #[test]
+    fn test_spawn_owner_kv_key_is_session_scoped() {
+        assert_eq!(spawn_owner_kv_key("sess-1", "p1"), "spawn_owner:sess-1:p1");
+        assert_ne!(
+            spawn_owner_kv_key("sess-1", "p1"),
+            spawn_owner_kv_key("sess-2", "p1")
+        );
+        assert!(spawn_owner_kv_key("sess-1", "p1").starts_with(&spawn_owner_kv_prefix("sess-1")));
+    }
+
+    /// Property: when SubagentStop's own `instances` row is missing, the
+    /// stale running_tasks entry could be on the session-bound root *or* a
+    /// nested subagent that actually spawned it — removal must find and
+    /// clear it wherever it really is, not assume root.
+    #[test]
+    #[serial]
+    fn test_subagent_stop_missing_row_removes_from_actual_nested_owner() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, status_context, status_time, created_at, last_event_id, running_tasks)
+                 VALUES ('nova', 'claude', 'listening', 'start', 0, 0, 0, ?)",
+                rusqlite::params![
+                    r#"{"active":true,"subagents":[{"agent_id":"agent-a","type":"general"}]}"#
+                ],
+            )
+            .unwrap();
+        db.set_session_binding("sess-1", "nova").unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, status_context, status_time, created_at, last_event_id, agent_id, parent_name, running_tasks)
+                 VALUES ('nova_task_1', 'claude', 'active', 'subagent', 0, 0, 0, 'agent-a', 'nova', ?)",
+                rusqlite::params![
+                    r#"{"active":true,"subagents":[{"agent_id":"agent-b","type":"general"}]}"#
+                ],
+            )
+            .unwrap();
+        // B (agent-b) has no instances row at all — allocation never
+        // happened, or the row is gone.
+
+        let raw = serde_json::json!({
+            "session_id": "sess-1",
+            "agent_id": "agent-b",
+        });
+        let mut payload = HookPayload::from_claude(raw);
+        let ctx = make_ctx();
+        let _ = route_claude_hook(&db, &ctx, HOOK_SUBAGENT_STOP, &mut payload);
+
+        let a_rt = instances::parse_running_tasks(
+            db.get_instance_full("nova_task_1")
+                .unwrap()
+                .unwrap()
+                .running_tasks
+                .as_deref(),
+        );
+        assert!(
+            a_rt.subagents.is_empty(),
+            "the actual nested owner (A) must have the dead child reaped"
+        );
+        assert!(!a_rt.active);
+
+        let root_rt = instances::parse_running_tasks(
+            db.get_instance_full("nova")
+                .unwrap()
+                .unwrap()
+                .running_tasks
+                .as_deref(),
+        );
+        assert_eq!(
+            root_rt.subagents.len(),
+            1,
+            "root must be untouched — it never tracked the nested child directly"
+        );
+    }
+
+    // ---- Resumed-agent correlation (agent_owner) ----
+
+    /// Property: a resumed subagent — Claude re-firing SubagentStart for a
+    /// previously-known `agent_id` under a *new* `prompt_id` with no
+    /// corresponding PreToolUse to map it — must reattach to its
+    /// original owner via the session-scoped agent_owner memory, not fail
+    /// closed. Sequential: the original subagent fully spawns and stops
+    /// (row deleted) before the resume fires.
+    #[test]
+    #[serial]
+    fn test_resumed_agent_id_reattaches_via_agent_owner_after_original_stopped() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, tool, status, status_context, status_time, created_at, last_event_id)
+                 VALUES ('nova', 'sess-1', 'claude', 'listening', 'start', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        db.set_session_binding("sess-1", "nova").unwrap();
+        let ctx = make_ctx();
+
+        // Original spawn.
+        let raw_pre = serde_json::json!({
+            "session_id": "sess-1",
+            "prompt_id": "p1",
+            "tool_name": "Task",
+            "tool_input": {"prompt": "do a thing"},
+        });
+        let mut payload_pre = HookPayload::from_claude(raw_pre);
+        let _ = route_claude_hook(&db, &ctx, HOOK_PRE, &mut payload_pre);
+
+        let raw_start = serde_json::json!({
+            "session_id": "sess-1",
+            "agent_id": "agent-x",
+            "agent_type": "general",
+            "prompt_id": "p1",
+        });
+        let mut payload_start = HookPayload::from_claude(raw_start);
+        let _ = route_claude_hook(&db, &ctx, HOOK_SUBAGENT_START, &mut payload_start);
+        let original_name = db.get_instance_by_agent_id("agent-x").unwrap().unwrap();
+        assert_eq!(
+            db.get_instance_full(&original_name)
+                .unwrap()
+                .unwrap()
+                .parent_name
+                .as_deref(),
+            Some("nova")
+        );
+
+        // It stops (dormant + no direct message => immediate idle stop).
+        let raw_stop = serde_json::json!({
+            "session_id": "sess-1",
+            "agent_id": "agent-x",
+            "prompt_id": "p1",
+        });
+        let mut payload_stop = HookPayload::from_claude(raw_stop);
+        let _ = route_claude_hook(&db, &ctx, HOOK_SUBAGENT_STOP, &mut payload_stop);
+        assert!(
+            db.get_instance_by_agent_id("agent-x").unwrap().is_none(),
+            "row must be gone after stop"
+        );
+
+        // Resume: same agent_id, new prompt_id, no PreToolUse for it.
+        let raw_resume = serde_json::json!({
+            "session_id": "sess-1",
+            "agent_id": "agent-x",
+            "agent_type": "general",
+            "prompt_id": "p2",
+        });
+        let mut payload_resume = HookPayload::from_claude(raw_resume);
+        let _ = route_claude_hook(&db, &ctx, HOOK_SUBAGENT_START, &mut payload_resume);
+
+        let resumed_name = db.get_instance_by_agent_id("agent-x").unwrap();
+        assert!(
+            resumed_name.is_some(),
+            "resume must not fail closed just because its new prompt_id has no mapping"
+        );
+        let resumed_row = db
+            .get_instance_full(&resumed_name.unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            resumed_row.parent_name.as_deref(),
+            Some("nova"),
+            "resume must reattach to the true original owner via agent_owner memory"
+        );
+    }
+
+    /// Property: the resumed subagent's next PostToolUse must resolve its
+    /// identity (not the reported `unknown_subagent_actor` fail-closed path)
+    /// once resume has reattached it — otherwise `hcom list`/`send` can't see
+    /// a subagent Claude's own TUI still shows as live.
+    #[test]
+    #[serial]
+    fn test_resumed_agent_posttooluse_resolves_actor_not_unknown() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, tool, status, status_context, status_time, created_at, last_event_id)
+                 VALUES ('nova', 'sess-1', 'claude', 'listening', 'start', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        db.set_session_binding("sess-1", "nova").unwrap();
+        // Pre-seed agent_owner as if this agent_id was spawned + stopped
+        // once already (see the sequential test above for the full path).
+        db.kv_set(&agent_owner_kv_key("sess-1", "agent-x"), Some("nova"))
+            .unwrap();
+        let ctx = make_ctx();
+
+        let raw_resume = serde_json::json!({
+            "session_id": "sess-1",
+            "agent_id": "agent-x",
+            "agent_type": "general",
+            "prompt_id": "p2",
+        });
+        let mut payload_resume = HookPayload::from_claude(raw_resume);
+        let _ = route_claude_hook(&db, &ctx, HOOK_SUBAGENT_START, &mut payload_resume);
+        assert!(db.get_instance_by_agent_id("agent-x").unwrap().is_some());
+
+        let raw_post = serde_json::json!({
+            "session_id": "sess-1",
+            "agent_id": "agent-x",
+            "tool_name": "Read",
+            "tool_input": {},
+        });
+        let mut payload_post = HookPayload::from_claude(raw_post);
+        let (exit_code, _stdout, _ack, timing) =
+            route_claude_hook(&db, &ctx, HOOK_POST, &mut payload_post);
+        assert_eq!(exit_code, 0);
+        assert_ne!(
+            timing.result,
+            Some("unknown_subagent_actor"),
+            "the resumed agent's own row must resolve, not fail closed as unknown"
+        );
+    }
+
+    /// Property: concurrent duplicate hook delivery (the other live finding)
+    /// combined with a resume must still converge on the one true owner —
+    /// no split attribution, no lost row allocation.
+    #[test]
+    #[serial]
+    fn test_concurrent_resumed_subagent_start_resolves_to_same_owner() {
+        crate::config::Config::init();
+        let (_dir, hcom_dir, _test_home, _guard) = isolated_test_env();
+        let db_path = hcom_dir.join("test.db");
+        let db = HcomDb::open_raw(&db_path).unwrap();
+        db.init_db().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, tool, status, status_context, status_time, created_at, last_event_id)
+                 VALUES ('nova', 'sess-1', 'claude', 'listening', 'start', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        db.set_session_binding("sess-1", "nova").unwrap();
+        db.kv_set(&agent_owner_kv_key("sess-1", "agent-x"), Some("nova"))
+            .unwrap();
+
+        let n = 4;
+        let handles: Vec<_> = (0..n)
+            .map(|_| {
+                let path = db_path.clone();
+                std::thread::spawn(move || {
+                    let db = HcomDb::open_raw(&path).unwrap();
+                    let ctx = make_ctx();
+                    let raw = serde_json::json!({
+                        "session_id": "sess-1",
+                        "agent_id": "agent-x",
+                        "agent_type": "general",
+                        "prompt_id": "p-resume",
+                    });
+                    let mut payload = HookPayload::from_claude(raw);
+                    route_claude_hook(&db, &ctx, HOOK_SUBAGENT_START, &mut payload)
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let name = db.get_instance_by_agent_id("agent-x").unwrap();
+        assert!(
+            name.is_some(),
+            "concurrent resumed SubagentStart must not fail closed"
+        );
+        let row = db.get_instance_full(&name.unwrap()).unwrap().unwrap();
+        assert_eq!(row.parent_name.as_deref(), Some("nova"));
+    }
+
+    // ---- Duplicate hook delivery idempotency (SubagentStop) ----
+
+    /// Property: the claim key must collapse a byte-identical duplicate
+    /// invocation, but must NOT collapse a same-`prompt_id` invocation whose
+    /// payload actually differs (SubagentStop legitimately re-fires within
+    /// one prompt/continuation after an exit_code=2 delivery — we have not
+    /// established Claude changes `prompt_id` for that re-fire), and must
+    /// not collapse a genuinely different `prompt_id` either.
+    #[test]
+    fn test_subagent_stop_claim_key_semantics() {
+        let raw = serde_json::json!({"agent_id": "a1", "prompt_id": "p1", "x": 1});
+        let raw_dup = serde_json::json!({"agent_id": "a1", "prompt_id": "p1", "x": 1});
+        assert_eq!(
+            subagent_stop_claim_key("sess-1", "a1", &raw),
+            subagent_stop_claim_key("sess-1", "a1", &raw_dup),
+            "byte-identical payloads must collapse to the same key"
+        );
+
+        let raw_same_prompt_diff_payload =
+            serde_json::json!({"agent_id": "a1", "prompt_id": "p1", "x": 2});
+        assert_ne!(
+            subagent_stop_claim_key("sess-1", "a1", &raw),
+            subagent_stop_claim_key("sess-1", "a1", &raw_same_prompt_diff_payload),
+            "same prompt_id with different payload content must not collapse"
+        );
+
+        let raw_diff_prompt = serde_json::json!({"agent_id": "a1", "prompt_id": "p2", "x": 1});
+        assert_ne!(
+            subagent_stop_claim_key("sess-1", "a1", &raw),
+            subagent_stop_claim_key("sess-1", "a1", &raw_diff_prompt),
+            "different prompt_id must not collapse"
+        );
+    }
+
+    /// Property: while a claim is held, an identical repeat loses (concurrency
+    /// guard), and a same-prompt-but-different payload gets its own claim.
+    #[test]
+    #[serial]
+    fn test_claim_subagent_stop_collapses_duplicate_invocation() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        let raw = serde_json::json!({"agent_id": "agent-x", "prompt_id": "p1"});
+        let _first_claim = SubagentStopClaim::acquire(&db, "sess-1", "agent-x", &raw)
+            .expect("first claim must succeed");
+        assert!(
+            SubagentStopClaim::acquire(&db, "sess-1", "agent-x", &raw).is_none(),
+            "duplicate identical invocation must not re-claim while held"
+        );
+
+        let raw_different_payload =
+            serde_json::json!({"agent_id": "agent-x", "prompt_id": "p1", "note": "different"});
+        let _different_claim =
+            SubagentStopClaim::acquire(&db, "sess-1", "agent-x", &raw_different_payload)
+                .expect("same prompt_id but different payload content must be its own claim");
+    }
+
+    /// The claim is a transient concurrency guard, not a session-long
+    /// tombstone. Two distinct SubagentStop invocations can carry identical
+    /// payloads. While one is
+    /// in-flight the identical duplicate must lose (concurrency dedup), but
+    /// once `SubagentStopClaim` releases it, a later identical stop must be able
+    /// to re-claim and be processed — not suppressed forever.
+    #[test]
+    #[serial]
+    fn test_stop_claim_released_lets_later_identical_stop_reclaim() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        let raw = serde_json::json!({
+            "agent_id": "agent-x",
+            "prompt_id": "p1",
+            "last_assistant_message": "Done.",
+        });
+        let key = subagent_stop_claim_key("sess-1", "agent-x", &raw);
+
+        let first_claim = SubagentStopClaim::acquire(&db, "sess-1", "agent-x", &raw)
+            .expect("first invocation claims");
+        assert!(
+            SubagentStopClaim::acquire(&db, "sess-1", "agent-x", &raw).is_none(),
+            "a concurrent duplicate still in-flight must lose the claim"
+        );
+        drop(first_claim);
+        assert!(
+            db.kv_get(&key).unwrap().is_none(),
+            "guard drop must release the claim key"
+        );
+        let _later_claim = SubagentStopClaim::acquire(&db, "sess-1", "agent-x", &raw)
+            .expect("a later, genuinely distinct stop with a byte-identical payload must re-claim");
+    }
+
+    /// `subagent_stop` must release its claim so it cannot outlive the
+    /// invocation. Uses
+    /// a zero timeout so the poll returns immediately without blocking.
+    #[test]
+    #[serial]
+    fn test_subagent_stop_releases_its_claim_on_completion() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, tool, status, status_context, status_time, created_at, last_event_id, subagent_timeout)
+                 VALUES ('nova', 'sess-1', 'claude', 'listening', 'start', 0, 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        // name_announced=1 -> skip the dormant idle gate and go straight to the
+        // poll, which returns immediately (timeout 0) with no message.
+        insert_subagent_row(&db, "nova_task_1", "agent-x", "nova", "sess-1");
+        db.conn()
+            .execute(
+                "UPDATE instances SET name_announced = 1 WHERE name = 'nova_task_1'",
+                [],
+            )
+            .unwrap();
+
+        let raw = serde_json::json!({
+            "session_id": "sess-1",
+            "agent_id": "agent-x",
+            "prompt_id": "p1",
+            "last_assistant_message": "Done.",
+        });
+        let _ = subagent_stop(&db, "sess-1", &raw);
+
+        assert!(
+            db.kv_get(&subagent_stop_claim_key("sess-1", "agent-x", &raw))
+                .unwrap()
+                .is_none(),
+            "subagent_stop must not leave its claim behind as a permanent tombstone"
+        );
+    }
+
+    /// Property: `subagent_stop` must check the claim *before* the idle gate
+    /// and before `poll_messages` — a duplicate invocation must skip all
+    /// processing, not just the final teardown. This is what the live
+    /// teardown-window failure traced back to: with duplicate hook
+    /// registrations, one invocation could receive a delivered message
+    /// (exit_code=2) while the other, unclaimed, independently timed out and
+    /// deleted the row out from under it.
+    #[test]
+    #[serial]
+    fn test_subagent_stop_skips_all_processing_when_already_claimed() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, tool, status, status_context, status_time, created_at, last_event_id)
+                 VALUES ('nova', 'sess-1', 'claude', 'listening', 'start', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        insert_subagent_row(&db, "nova_task_1", "agent-x", "nova", "sess-1");
+
+        let raw = serde_json::json!({
+            "session_id": "sess-1",
+            "agent_id": "agent-x",
+            "prompt_id": "p1",
+        });
+        // Simulate a concurrent duplicate having already claimed this exact
+        // invocation (and still in-flight, so the claim is unreleased).
+        let _existing_claim = SubagentStopClaim::acquire(&db, "sess-1", "agent-x", &raw)
+            .expect("the simulated concurrent invocation must hold the claim");
+
+        let (exit_code, stdout) = subagent_stop(&db, "sess-1", &raw);
+        assert_eq!(exit_code, 0);
+        assert!(stdout.is_empty());
+        assert!(
+            db.get_instance_by_agent_id("agent-x").unwrap().is_some(),
+            "an already-claimed duplicate must not delete the row"
+        );
+        let stopped_events: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'life'
+                 AND json_extract(data, '$.action') = 'stopped'
+                 AND json_extract(data, '$.snapshot.agent_id') = 'agent-x'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stopped_events, 0,
+            "an already-claimed duplicate must not log a second life.stopped event"
+        );
+    }
+
+    /// Property: genuinely concurrent duplicate SubagentStop hook delivery
+    /// (separate DB connections, as separate hook processes would be) for
+    /// the same dormant subagent must produce exactly one teardown — one
+    /// life.stopped event, one row deletion — not one per invocation.
+    #[test]
+    #[serial]
+    fn test_concurrent_duplicate_subagent_stop_produces_one_teardown() {
+        crate::config::Config::init();
+        let (_dir, hcom_dir, _test_home, _guard) = isolated_test_env();
+        let db_path = hcom_dir.join("test.db");
+        let db = HcomDb::open_raw(&db_path).unwrap();
+        db.init_db().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, tool, status, status_context, status_time, created_at, last_event_id)
+                 VALUES ('nova', 'sess-1', 'claude', 'listening', 'start', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        insert_subagent_row(&db, "nova_task_1", "agent-x", "nova", "sess-1");
+
+        let n = 4;
+        let handles: Vec<_> = (0..n)
+            .map(|_| {
+                let path = db_path.clone();
+                std::thread::spawn(move || {
+                    let db = HcomDb::open_raw(&path).unwrap();
+                    // Identical payload from every "duplicate hook registration".
+                    let raw = serde_json::json!({
+                        "session_id": "sess-1",
+                        "agent_id": "agent-x",
+                        "prompt_id": "p1",
+                    });
+                    subagent_stop(&db, "sess-1", &raw)
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert!(
+            db.get_instance_by_agent_id("agent-x").unwrap().is_none(),
+            "the subagent must end up stopped exactly like a single invocation would"
+        );
+        let stopped_events: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'life'
+                 AND json_extract(data, '$.action') = 'stopped'
+                 AND json_extract(data, '$.snapshot.agent_id') = 'agent-x'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stopped_events, 1,
+            "concurrent duplicate delivery must log exactly one life.stopped event, not {n}"
+        );
+    }
+
+    /// Property: SessionEnd sweeps agent_owner and subagent_stop_claim
+    /// entries the same way it sweeps spawn_owner — only for its own
+    /// session.
+    #[test]
+    #[serial]
+    fn test_sessionend_cleans_agent_owner_and_stop_claim_keys_too() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, tool, status, status_context, status_time, created_at, last_event_id)
+                 VALUES ('nova', 'sess-1', 'claude', 'listening', 'start', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        db.set_session_binding("sess-1", "nova").unwrap();
+        let ctx = make_ctx();
+
+        db.kv_set(&agent_owner_kv_key("sess-1", "agent-x"), Some("nova"))
+            .unwrap();
+        db.kv_set(&agent_owner_kv_key("sess-other", "agent-x"), Some("other"))
+            .unwrap();
+        let stop_raw = serde_json::json!({"agent_id": "agent-x", "prompt_id": "p1"});
+        db.kv_set(
+            &subagent_stop_claim_key("sess-1", "agent-x", &stop_raw),
+            Some("1"),
+        )
+        .unwrap();
+        db.kv_set(
+            &subagent_stop_claim_key("sess-other", "agent-x", &stop_raw),
+            Some("1"),
+        )
+        .unwrap();
+
+        let raw = serde_json::json!({"session_id": "sess-1", "reason": "clear"});
+        let mut payload = HookPayload::from_claude(raw);
+        let _ = route_claude_hook(&db, &ctx, HOOK_SESSIONEND, &mut payload);
+
+        assert!(
+            db.kv_get(&agent_owner_kv_key("sess-1", "agent-x"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.kv_get(&subagent_stop_claim_key("sess-1", "agent-x", &stop_raw))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            db.kv_get(&agent_owner_kv_key("sess-other", "agent-x"))
+                .unwrap(),
+            Some("other".to_string()),
+            "a different session's agent_owner keys must survive"
+        );
+        assert_eq!(
+            db.kv_get(&subagent_stop_claim_key("sess-other", "agent-x", &stop_raw))
+                .unwrap(),
+            Some("1".to_string()),
+            "a different session's stop-claim keys must survive"
+        );
     }
 }
