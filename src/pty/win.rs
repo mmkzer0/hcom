@@ -355,6 +355,7 @@ impl Proxy {
                         notify_port.clone(),
                         current_name.clone(),
                         current_status.clone(),
+                        None,
                     ) {
                         Ok(shared::DeliveryStart::Started(h)) => {
                             *delivery_handle.lock().unwrap_or_else(|e| e.into_inner()) = Some(h);

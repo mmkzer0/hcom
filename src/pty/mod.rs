@@ -32,7 +32,7 @@ use nix::pty::openpty;
 #[cfg(unix)]
 use nix::sys::signal::{Signal, kill};
 #[cfg(unix)]
-use nix::unistd::{Pid, read, write};
+use nix::unistd::{Pid, pipe, read, write};
 #[cfg(unix)]
 use std::io;
 #[cfg(unix)]
@@ -628,6 +628,10 @@ pub struct Proxy {
     current_name: Arc<RwLock<String>>,
     /// Current status (shared with delivery thread, updated on status change)
     current_status: Arc<RwLock<String>>,
+    /// Read side used to interrupt the proxy poll when title state changes.
+    title_notify_read: OwnedFd,
+    /// Write side shared with the delivery thread's title wake callback.
+    title_notify_write: Arc<OwnedFd>,
 }
 
 #[cfg(unix)]
@@ -741,6 +745,9 @@ impl Proxy {
         };
         let current_name = Arc::new(RwLock::new(initial_display_name));
         let current_status = Arc::new(RwLock::new("listening".to_string()));
+        let (title_notify_read, title_notify_write) = pipe().context("title notify pipe failed")?;
+        set_nonblocking(&title_notify_read)?;
+        set_nonblocking(&title_notify_write)?;
 
         Ok(Self {
             config,
@@ -758,6 +765,8 @@ impl Proxy {
             notify_port: Arc::new(AtomicU16::new(0)),
             current_name,
             current_status,
+            title_notify_read,
+            title_notify_write: Arc::new(title_notify_write),
         })
     }
 
@@ -858,6 +867,12 @@ impl Proxy {
                 poll_fds.push(PollFd::new(stdin_borrowed, PollFlags::POLLIN));
             }
 
+            let title_notify_idx = poll_fds.len();
+            poll_fds.push(PollFd::new(
+                self.title_notify_read.as_fd(),
+                PollFlags::POLLIN,
+            ));
+
             // Include the inject listener unless we're in backoff (macOS spurious POLLIN).
             // Reset backoff here so it applies for exactly one iteration.
             let include_listener = !listener_backoff;
@@ -922,6 +937,7 @@ impl Proxy {
                             self.notify_port.clone(),
                             self.current_name.clone(),
                             self.current_status.clone(),
+                            Some(title_wake_callback(self.title_notify_write.clone())),
                         )? {
                             shared::DeliveryStart::Started(h) => {
                                 self.delivery_handle = Some(h);
@@ -1090,6 +1106,7 @@ impl Proxy {
                                     self.notify_port.clone(),
                                     self.current_name.clone(),
                                     self.current_status.clone(),
+                                    Some(title_wake_callback(self.title_notify_write.clone())),
                                 )? {
                                     shared::DeliveryStart::Started(h) => {
                                         self.delivery_handle = Some(h);
@@ -1242,6 +1259,22 @@ impl Proxy {
                             }
                         },
                         inject::InjectResult::Pending => {}
+                    }
+                }
+            }
+
+            // Drain title notifications. The shared status is read below; the
+            // pipe only interrupts poll and coalesces repeated transitions.
+            if poll_fds[title_notify_idx]
+                .revents()
+                .is_some_and(|events| events.contains(PollFlags::POLLIN))
+            {
+                let mut title_notifications = [0u8; 64];
+                loop {
+                    match read(&self.title_notify_read, &mut title_notifications) {
+                        Ok(0) | Err(Errno::EAGAIN) => break,
+                        Ok(_) | Err(Errno::EINTR) => continue,
+                        Err(error) => bail!("read title notification failed: {error}"),
                     }
                 }
             }
@@ -1529,6 +1562,15 @@ fn set_nonblocking<Fd: AsFd>(fd: &Fd) -> Result<()> {
     fcntl(fd.as_fd(), FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))
         .context("fcntl F_SETFL failed")?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn title_wake_callback(write_fd: Arc<OwnedFd>) -> crate::delivery::TitleWake {
+    Arc::new(move || {
+        // A full pipe means a wake is already pending. The proxy always reads
+        // the authoritative shared title state after it wakes.
+        let _ = write(write_fd.as_ref(), &[1]);
+    })
 }
 
 #[cfg(unix)]

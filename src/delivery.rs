@@ -15,6 +15,12 @@ use crate::log::{log_error, log_info, log_warn};
 use crate::notify::NotifyServer;
 use crate::shared::{ST_ACTIVE, ST_BLOCKED, ST_INACTIVE, ST_LISTENING};
 
+/// Wakes the PTY proxy after the delivery thread changes title state.
+///
+/// The proxy remains the sole writer to the terminal. This callback only
+/// interrupts its I/O poll so it can serialize the new OSC title promptly.
+pub type TitleWake = Arc<dyn Fn() + Send + Sync>;
+
 /// Whether the wrapped child exited because hcom killed it (vs. closed on its
 /// own). Set by the PTY proxy (Unix) and read here during delivery cleanup to
 /// choose the exit status context. Lives here rather than in `pty` so the
@@ -81,13 +87,13 @@ pub(crate) fn refresh_binding(
     }
 }
 
-/// Refresh shared status from DB. Updates current_status if changed.
+/// Refresh both delivery-local and PTY-shared status from the database.
 pub(crate) fn refresh_status(
     db: &HcomDb,
     current_name: &str,
     current_status: &mut String,
     shared_status: &Option<Arc<std::sync::RwLock<String>>>,
-) {
+) -> bool {
     let new_status = match db.get_status(current_name) {
         Ok(Some((status, _))) => status,
         Ok(None) => "stopped".to_string(),
@@ -101,13 +107,30 @@ pub(crate) fn refresh_status(
             "stopped".to_string()
         }
     };
-    if new_status != *current_status {
-        if let Some(shared) = shared_status
-            && let Ok(mut s) = shared.write()
-        {
-            *s = new_status.clone();
-        }
-        *current_status = new_status;
+    let local_changed = new_status != *current_status;
+    let mut shared_changed = false;
+    if let Some(shared) = shared_status
+        && let Ok(mut status) = shared.write()
+        && *status != new_status
+    {
+        *status = new_status.clone();
+        shared_changed = true;
+    }
+    *current_status = new_status;
+    local_changed || shared_changed
+}
+
+fn refresh_status_and_wake(
+    db: &HcomDb,
+    current_name: &str,
+    current_status: &mut String,
+    shared_status: &Option<Arc<std::sync::RwLock<String>>>,
+    title_wake: &Option<TitleWake>,
+) {
+    if refresh_status(db, current_name, current_status, shared_status)
+        && let Some(wake) = title_wake
+    {
+        wake();
     }
 }
 
@@ -138,6 +161,7 @@ struct TitleRefresh<'a> {
     current_status: &'a mut String,
     shared_name: &'a Option<Arc<std::sync::RwLock<String>>>,
     shared_status: &'a Option<Arc<std::sync::RwLock<String>>>,
+    title_wake: &'a Option<TitleWake>,
     tool: &'a str,
     host_label: &'a mut host_label::HostLabel,
 }
@@ -152,11 +176,12 @@ fn refresh_title_state(args: TitleRefresh<'_>) {
         current_status,
         shared_name,
         shared_status,
+        title_wake,
         tool,
         host_label,
     } = args;
     refresh_binding(db, process_id, current_name, shared_name);
-    refresh_status(db, current_name, current_status, shared_status);
+    refresh_status_and_wake(db, current_name, current_status, shared_status, title_wake);
     refresh_display_name(db, current_name, shared_name);
     host_label.sync(db, current_name, current_status, tool);
 }
@@ -1116,6 +1141,7 @@ pub fn run_delivery_loop(
     config: &ToolConfig,
     shared_name: Option<Arc<std::sync::RwLock<String>>>,
     shared_status: Option<Arc<std::sync::RwLock<String>>>,
+    title_wake: Option<TitleWake>,
 ) {
     // Resolve authoritative instance name from process binding.
     // The instance_name parameter is a fallback - the binding is the source of truth
@@ -1221,6 +1247,7 @@ pub fn run_delivery_loop(
                 current_status: &mut current_status,
                 shared_name: &shared_name,
                 shared_status: &shared_status,
+                title_wake: &title_wake,
                 tool: &config.tool,
                 host_label: &mut host_label,
             });
@@ -1316,6 +1343,7 @@ pub fn run_delivery_loop(
                 current_status: &mut current_status,
                 shared_name: &shared_name,
                 shared_status: &shared_status,
+                title_wake: &title_wake,
                 tool: &config.tool,
                 host_label: &mut host_label,
             });
@@ -2111,6 +2139,56 @@ mod tests {
             last_prompt_submit: None,
             approval_scrape_latched: false,
         }
+    }
+
+    #[test]
+    fn status_refresh_repairs_codex_approval_cache_divergence() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = HcomDb::open_raw(&db_path).unwrap();
+        db.init_db().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, tool, status, status_context, status_time, created_at)
+                 VALUES ('halo', 'codex', 'active', 'tool:Bash', 0, 0)",
+                [],
+            )
+            .unwrap();
+
+        let shared_status = Arc::new(std::sync::RwLock::new(ST_BLOCKED.to_string()));
+        let wake_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let wake_count_for_callback = wake_count.clone();
+        let title_wake: TitleWake = Arc::new(move || {
+            wake_count_for_callback.fetch_add(1, Ordering::Relaxed);
+        });
+        // Codex approval detection updates the PTY-owned shared status directly.
+        // The delivery loop's private cache can therefore still say active when
+        // the approval clears and the database returns to active.
+        let mut current_status = ST_ACTIVE.to_string();
+
+        refresh_status_and_wake(
+            &db,
+            "halo",
+            &mut current_status,
+            &Some(shared_status.clone()),
+            &Some(title_wake.clone()),
+        );
+
+        assert_eq!(current_status, ST_ACTIVE);
+        assert_eq!(*shared_status.read().unwrap(), ST_ACTIVE);
+        assert_eq!(wake_count.load(Ordering::Relaxed), 1);
+
+        // A context/detail-only status event does not change the title icon and
+        // must not create redundant proxy wakeups.
+        refresh_status_and_wake(
+            &db,
+            "halo",
+            &mut current_status,
+            &Some(shared_status),
+            &Some(title_wake),
+        );
+        assert_eq!(wake_count.load(Ordering::Relaxed), 1);
     }
 
     #[test]

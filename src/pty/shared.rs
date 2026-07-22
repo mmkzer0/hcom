@@ -313,6 +313,7 @@ pub(super) fn start_delivery_thread(
     notify_port: Arc<AtomicU16>,
     current_name: Arc<RwLock<String>>,
     current_status: Arc<RwLock<String>>,
+    title_wake: Option<crate::delivery::TitleWake>,
 ) -> Result<DeliveryStart> {
     let instance_name = match instance_name_cfg {
         Some(name) => name.to_string(),
@@ -423,6 +424,7 @@ pub(super) fn start_delivery_thread(
             &config,
             Some(current_name),
             Some(current_status),
+            title_wake,
         );
 
         log_info(
