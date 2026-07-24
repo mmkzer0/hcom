@@ -780,6 +780,7 @@ fn is_fresh_claude_process_placeholder(
     db: &HcomDb,
     process_session_id: Option<&str>,
     process_owner: Option<&str>,
+    expected_session_id: Option<&str>,
 ) -> bool {
     process_session_id.is_none()
         && process_owner.is_some_and(|owner| {
@@ -787,8 +788,14 @@ fn is_fresh_claude_process_placeholder(
                 .ok()
                 .flatten()
                 .is_some_and(|instance| {
-                    instance.session_id.is_none()
-                        && (instances::is_launching_placeholder(&instance)
+                    let resumed_generation = expected_session_id.is_some_and(|session_id| {
+                        instance.session_id.as_deref() == Some(session_id)
+                    });
+                    (instance.session_id.is_none() || resumed_generation)
+                        && (resumed_generation
+                            || instances::is_launching_placeholder(&instance)
+                            || (instance.status == ST_BLOCKED
+                                && instance.status_context == "launch_blocked")
                             || (instance.status == ST_LISTENING
                                 && matches!(
                                     instance.status_context.as_str(),
@@ -822,6 +829,7 @@ fn should_use_fork_env_session_id(db: &HcomDb, ctx: &HcomContext, raw: &Value) -
         db,
         process_session_id.as_deref(),
         Some(process_owner.as_str()),
+        None,
     );
     let source = raw.get("source").and_then(Value::as_str).unwrap_or("");
     if matches!(source, "fork" | "startup" | "resume") {
@@ -874,6 +882,7 @@ fn handle_sessionstart(
                 db,
                 evidence.process_session_id.as_deref(),
                 evidence.process_owner.as_deref(),
+                Some(session_id),
             );
             should_scan_sessionstart_lineage(
                 ctx.is_fork && fresh_process_placeholder,
@@ -901,6 +910,7 @@ fn handle_sessionstart(
         db,
         evidence.process_session_id.as_deref(),
         evidence.process_owner.as_deref(),
+        Some(session_id),
     );
     let fresh_hcom_fork_launch = ctx.is_fork && fresh_process_placeholder;
     let native_lineage_source = matches!(source, "fork" | "startup" | "resume");
@@ -3717,6 +3727,88 @@ mod tests {
             db.get_process_binding_full("process-fresh").unwrap(),
             Some((Some("sess-fresh".to_string()), "nova".to_string()))
         );
+    }
+
+    #[test]
+    #[serial]
+    fn launch_blocked_placeholder_binds_on_sessionstart() {
+        crate::config::Config::init();
+        let (_dir, hcom_dir, _test_home, _guard) = isolated_test_env();
+        let db = HcomDb::open_raw(&hcom_dir.join("test.db")).unwrap();
+        db.init_db().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, tool, status, status_context, status_time, created_at, last_event_id)
+                 VALUES ('nova', 'claude', 'blocked', 'launch_blocked', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        db.set_process_binding("process-blocked", "", "nova")
+            .unwrap();
+
+        let transcript = hcom_dir.join("launch-blocked-start.jsonl");
+        std::fs::write(&transcript, "").unwrap();
+        let mut env = std::collections::HashMap::new();
+        env.insert("HCOM_PROCESS_ID".to_string(), "process-blocked".to_string());
+        env.insert("HCOM_LAUNCHED".to_string(), "1".to_string());
+        env.insert(
+            "HCOM_DIR".to_string(),
+            hcom_dir.to_string_lossy().to_string(),
+        );
+        let ctx = HcomContext::from_env(&env, PathBuf::from("/tmp"));
+        let raw = serde_json::json!({
+            "source": "startup",
+            "session_id": "sess-blocked",
+            "transcript_path": transcript.to_string_lossy(),
+        });
+
+        let _ = handle_sessionstart(
+            &db,
+            &ctx,
+            "sess-blocked",
+            raw["transcript_path"].as_str(),
+            &raw,
+        );
+
+        assert_eq!(
+            db.get_session_binding("sess-blocked").unwrap().as_deref(),
+            Some("nova")
+        );
+        assert_eq!(
+            db.get_validated_claude_session_owner("sess-blocked")
+                .unwrap()
+                .as_deref(),
+            Some("nova")
+        );
+    }
+
+    #[test]
+    fn resumed_generation_with_fresh_process_binding_is_fresh() {
+        let (_dir, db) = make_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, tool, status, status_context, status_time, created_at, last_event_id)
+                 VALUES ('nova', 'sess-resume', 'claude', 'pending', 'new', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        db.set_process_binding("process-resume", "", "nova")
+            .unwrap();
+
+        assert!(is_fresh_claude_process_placeholder(
+            &db,
+            None,
+            Some("nova"),
+            Some("sess-resume"),
+        ));
+        assert!(!is_fresh_claude_process_placeholder(
+            &db,
+            None,
+            Some("nova"),
+            None,
+        ));
     }
 
     #[test]
