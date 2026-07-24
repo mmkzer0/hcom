@@ -82,6 +82,12 @@ pub(super) fn update_delivery_state(
         }
         state.prompt_empty = new_prompt_empty;
         state.input_text = input_text;
+        // Claude only: defer injection while a nav overlay is focused (subagent
+        // navigator or `←` session switcher) — the wake trigger would land in the
+        // overlay's shared-PTY input box, not the session's root prompt.
+        state.nav_overlay = matches!(target.known_tool(), Some(Tool::Claude))
+            && (screen.is_claude_subagent_nav_visible()
+                || screen.is_claude_session_switcher_visible());
         // visible_tail is only consumed by the launch-blocked heuristic;
         // skip the screen walk + allocation once launch phase is over.
         state.visible_tail = if launch_phase_active.load(Ordering::Acquire) {

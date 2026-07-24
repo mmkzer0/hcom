@@ -443,6 +443,57 @@ impl ScreenTracker {
         has_question && has_footer
     }
 
+    /// Claude native subagent-navigator detection.
+    ///
+    /// Claude Code (v2.1.2xx+) has an in-session subagent navigator: a bottom
+    /// panel listing the `main` conversation plus sub-sessions, each on a row
+    /// like `<glyph> <type>  <task>   <age> · ↓ 26.7k tokens`, above a key-hint
+    /// line ("Enter to view · …"). A human can navigate into a subagent to view
+    /// or type into ITS input box, which shares the parent's single PTY. hcom
+    /// delivers by writing the `<hcom>` wake trigger to that one stdin, and the
+    /// tool routes stdin to whichever view is focused — so a trigger meant for
+    /// the root prompt lands in the focused subagent's box instead. There is one
+    /// stdin; we cannot target a specific box. The only safe move is to defer
+    /// injection while the navigator has focus (the message stays pending and the
+    /// trigger fires once the human exits — the panel collapses back to the plain
+    /// footer, so this never blocks delivery permanently).
+    ///
+    /// Detection requires two co-occurring markers in the bottom rows, both taken
+    /// from real v2.1.218 captures (the exact chrome varies across builds, so
+    /// these are the version-stable, semantic parts):
+    ///   - an agent/token row: contains "tokens" AND a `↑`/`↓` direction arrow.
+    ///     The plain footer's session counter renders a bare "47899 tokens" with
+    ///     no arrow, so it does not match.
+    ///   - a nav key-hint line containing "Enter to view".
+    ///
+    /// The hint is present only while the navigator has keyboard focus (the states
+    /// where injection would misdeliver), and absent from the passive auto-peek
+    /// shown right after a background launch — where the ROOT input box still
+    /// holds focus, so injecting there is correct and must NOT be gated. Requiring
+    /// both markers keeps that safe peek delivering while blocking the focused
+    /// states. The asymmetry is deliberate: a false positive here blocks ALL
+    /// delivery (an outage), worse than the misdelivery it prevents, so the gate
+    /// stays tight rather than eager.
+    pub fn is_claude_subagent_nav_visible(&self) -> bool {
+        let screen = self.parser.screen();
+        let (rows, cols) = screen.size();
+        // The navigator is pinned to the bottom; restrict the scan there so
+        // scrollback that happens to contain these phrases can't trip the gate.
+        const TAIL_ROWS: u16 = 12;
+        let start = rows.saturating_sub(TAIL_ROWS) as usize;
+        let mut has_agent_row = false;
+        let mut has_nav_hint = false;
+        for line in screen.rows(0, cols).skip(start) {
+            if line.contains("tokens") && (line.contains('↑') || line.contains('↓')) {
+                has_agent_row = true;
+            }
+            if line.contains("Enter to view") {
+                has_nav_hint = true;
+            }
+        }
+        has_agent_row && has_nav_hint
+    }
+
     /// Check if output has been stable for N milliseconds
     /// Note: ms=0 returns true (always stable), which is valid for tools that skip stability check
     pub fn is_output_stable(&self, ms: u64) -> bool {
@@ -599,7 +650,7 @@ impl ScreenTracker {
     /// Uses vt100's cell-level dim attribute to distinguish placeholder from user input.
     /// This enables 0.5s user_activity_cooldown (same as Gemini/Codex) instead of the
     /// previous 3s workaround needed when using text heuristics.
-    fn get_claude_input_text(&self) -> Option<String> {
+    fn get_claude_input_box(&self) -> Option<(String, bool)> {
         let lines = self.get_screen_lines();
         let num_lines = lines.len();
 
@@ -617,13 +668,11 @@ impl ScreenTracker {
                 continue;
             };
 
-            // Check for borders above and below (input box frame)
             let line_above = &lines[row_idx - 1];
             if !line_above.contains('─') {
                 continue;
             }
 
-            // Check for ─ border below (may be 1-3 rows down for multi-line input box)
             let mut has_border_below = false;
             for offset in 1..=3 {
                 if row_idx + offset >= num_lines {
@@ -638,27 +687,36 @@ impl ScreenTracker {
                 continue;
             }
 
-            // Extract text after the prompt char (trim NBSP too - Claude uses \xa0 after prompt)
             let prompt_pos = line.find(prompt_char)?;
             let after_prompt = &line[prompt_pos + prompt_char.len_utf8()..];
-            let text = trim_with_nbsp(after_prompt);
-
+            let text = trim_with_nbsp(after_prompt).to_string();
             if text.is_empty() {
-                return Some(String::new());
+                return Some((text, false));
             }
 
-            // Dim text = placeholder, not real input
             let is_placeholder = self
                 .is_dim_after_prompt(row_idx as u16, &prompt_char.to_string())
-                .unwrap_or(true); // Can't find prompt cell = treat as placeholder
-            if is_placeholder {
-                return Some(String::new());
-            } else {
-                return Some(text.to_string());
-            }
+                .unwrap_or(true);
+            return Some((text, is_placeholder));
         }
 
-        None // Prompt not found
+        None
+    }
+
+    /// True when Claude's live input box is the native new-session dispatcher.
+    /// This inspects the raw placeholder before normal input extraction discards
+    /// dim text as an empty prompt.
+    pub fn is_claude_session_switcher_visible(&self) -> bool {
+        self.get_claude_input_box()
+            .is_some_and(|(text, _)| text == "describe a task for a new session")
+    }
+
+    fn get_claude_input_text(&self) -> Option<String> {
+        self.get_claude_input_box().map(
+            |(text, is_placeholder)| {
+                if is_placeholder { String::new() } else { text }
+            },
+        )
     }
 
     /// Extract Gemini input text.
@@ -1335,6 +1393,165 @@ mod tests {
         let mut t = make_tracker(24, 80, "");
         t.process(b"> hello world\r\nrunning a build\r\n");
         assert!(!t.is_cursor_approval_visible());
+    }
+
+    // ---- Claude subagent navigator detection ----
+    // Fixtures are faithful bottom-of-screen captures from Claude Code v2.1.218.
+
+    /// Render `lines` top-to-bottom onto the screen (index i -> row i).
+    fn render_rows(t: &mut ScreenTracker, lines: &[&str]) {
+        t.process(lines.join("\r\n").as_bytes());
+    }
+
+    #[test]
+    fn claude_subagent_nav_detected_when_focused_in() {
+        // Danger state: navigated into the subagent — its own input box is shown
+        // (labeled with the task, not the session) with the navigator focused.
+        let mut t = make_tracker(31, 67, "");
+        let mut lines = vec![""; 24];
+        lines.extend_from_slice(&[
+            "───────────────────────────────────────────── Run echo and sleep ──",
+            "❯",
+            "───────────────────────────────────────────────────────────────────",
+            "  Enter to view · x to clear                                   /rc",
+            "",
+            "  ◯ main",
+            "❯ ⏺ general-purpose  Run echo and sleep        16s · ↓ 26.7k tokens",
+        ]);
+        render_rows(&mut t, &lines);
+        assert!(t.is_claude_subagent_nav_visible());
+    }
+
+    #[test]
+    fn claude_subagent_nav_detected_while_browsing_list() {
+        // Navigator has focus, browsing the list (a different build's hint line).
+        let mut t = make_tracker(31, 67, "");
+        let mut lines = vec![""; 26];
+        lines.extend_from_slice(&[
+            "  ↑/↓ to select · Enter to view                                /rc",
+            "",
+            "❯ ⏺ main",
+            "  ◯ general-purpose  Run echo and sleep         9s · ↓ 26.6k tokens",
+        ]);
+        render_rows(&mut t, &lines);
+        assert!(t.is_claude_subagent_nav_visible());
+    }
+
+    #[test]
+    fn claude_passive_peek_with_root_focused_is_not_gated() {
+        // Auto-peek right after a background launch: the agent/token row is
+        // present but there is NO "Enter to view" hint and the ROOT box holds
+        // focus — injecting there is correct, so this must NOT be gated.
+        let mut t = make_tracker(31, 67, "");
+        let mut lines = vec![""; 26];
+        lines.extend_from_slice(&[
+            "  ⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent · esc to inter…",
+            "                                                               /rc",
+            "  ⏺ main",
+            "  ◯ general-purpose  Run echo and sleep         2s · ↑ 26.1k tokens",
+        ]);
+        render_rows(&mut t, &lines);
+        assert!(!t.is_claude_subagent_nav_visible());
+    }
+
+    #[test]
+    fn claude_collapsed_footer_after_subagent_done_is_not_gated() {
+        // Subagent finished and the navigator collapsed to the plain footer:
+        // no agent/token row, no hint. Proves gating cannot outlast the nav.
+        let mut t = make_tracker(31, 67, "");
+        let mut lines = vec![""; 26];
+        lines.extend_from_slice(&[
+            "─────────────────────────────────────── set-default-model-sonnet ──",
+            "❯",
+            "───────────────────────────────────────────────────────────────────",
+            "  ⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent             /rc",
+        ]);
+        render_rows(&mut t, &lines);
+        assert!(!t.is_claude_subagent_nav_visible());
+    }
+
+    #[test]
+    fn claude_plain_footer_token_counter_is_not_gated() {
+        // The plain footer's session token counter ("47408 tokens") has no
+        // direction arrow, so the agent-row anchor must not match it.
+        let mut t = make_tracker(31, 67, "");
+        let mut lines = vec![""; 26];
+        lines.extend_from_slice(&[
+            "                                                       47408 tokens",
+            "─────────────────────────────────────────────────────── claude ──",
+            "❯",
+            "  ⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent             /rc",
+        ]);
+        render_rows(&mut t, &lines);
+        assert!(!t.is_claude_subagent_nav_visible());
+    }
+
+    #[test]
+    fn claude_subagent_nav_in_scrollback_is_ignored() {
+        // Both markers present, but only near the TOP (older scrollback that has
+        // scrolled up); the live navigator is pinned to the bottom, so a settled
+        // root prompt below it must not be gated.
+        let mut t = make_tracker(30, 80, "");
+        let mut lines = vec![
+            "❯ ⏺ general-purpose  old task    9s · ↓ 5.2k tokens",
+            "  Enter to view · x to clear",
+        ];
+        lines.extend(std::iter::repeat_n("", 26));
+        lines.push("╭──────────────────────────────────────────────╮");
+        lines.push("│ ❯                                              │");
+        render_rows(&mut t, &lines);
+        assert!(!t.is_claude_subagent_nav_visible());
+    }
+
+    #[test]
+    fn claude_session_switcher_placeholder_is_parsed_from_input_box() {
+        let mut t = make_tracker(31, 67, "");
+        let mut lines = vec![""; 27];
+        lines.extend_from_slice(&[
+            "───────────────────────────────────────────────────────────────────",
+            "❯ describe a task for a new session",
+            "───────────────────────────────────────────────────────────────────",
+            "  ⏵⏵ auto mode · enter to collapse · ? for shortcuts",
+        ]);
+        render_rows(&mut t, &lines);
+        assert_eq!(
+            t.get_input_box_text("claude").as_deref(),
+            Some("describe a task for a new session")
+        );
+        assert!(t.is_claude_session_switcher_visible());
+    }
+
+    #[test]
+    fn claude_dim_session_switcher_placeholder_is_detected_before_discard() {
+        let mut t = make_tracker(24, 80, "");
+        t.process(format!("{}\r\n", "─".repeat(80)).as_bytes());
+        let mut data = Vec::new();
+        data.extend_from_slice("❯ ".as_bytes());
+        data.extend_from_slice(b"\x1b[2m");
+        data.extend_from_slice(b"describe a task for a new session");
+        data.extend_from_slice(b"\x1b[0m\r\n");
+        t.process(&data);
+        t.process(format!("{}\r\n", "─".repeat(80)).as_bytes());
+
+        assert_eq!(t.get_input_box_text("claude"), Some(String::new()));
+        assert!(t.is_claude_session_switcher_visible());
+    }
+
+    #[test]
+    fn claude_session_switcher_markers_in_scrolled_chat_do_not_replace_input_text() {
+        // Ordinary conversation, scrolled mid-screen, that discusses/quotes the
+        // switcher UI must not be mistaken for the input-box placeholder.
+        let mut t = make_tracker(31, 67, "");
+        let mut lines = vec![""; 10];
+        lines.push("⏺ The header shows \"2 awaiting input · 0 working · 1 completed\"");
+        lines.push("  and the box placeholder reads \"describe a task for a new session\".");
+        lines.resize(27, "");
+        lines.push("───────────────────────────────────────────────────────────────────");
+        lines.push("❯");
+        lines.push("───────────────────────────────────────────────────────────────────");
+        lines.push("  ⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent             /rc");
+        render_rows(&mut t, &lines);
+        assert_eq!(t.get_input_box_text("claude"), Some(String::new()));
     }
 
     // ---- Codex input extraction ----
